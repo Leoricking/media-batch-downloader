@@ -1,5 +1,0 @@
-pip install -U instaloader yt-dlp
-pip install instaloader
-pip install yt-dlp
-pip show instaloader
-pip show yt-dlp
