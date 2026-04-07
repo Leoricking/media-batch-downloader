@@ -1,0 +1,6 @@
+downloads/
+temp_insta_dl/
+pre-processing/output/
+__pycache__/
+*.txt
+!pre-processing/*.txt
