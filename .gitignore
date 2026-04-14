@@ -1,6 +1,13 @@
+# 排除下載目錄
 downloads/
 temp_insta_dl/
 pre-processing/output/
 __pycache__/
+
+
+# 忽略執行過程產生的紀錄檔
+*.log
+*.txt
+cookies.txt
 *.txt
 !pre-processing/*.txt
