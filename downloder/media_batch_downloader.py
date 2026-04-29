@@ -362,7 +362,7 @@ def main():
             processed.add(url)
             fail_streak = 0
             count_success += 1
-            time.sleep(random.uniform(10, 20))
+            time.sleep(random.uniform(20, 40))
         else:
             fail_streak += 1
             sleep_time = min(base_fail_sleep * (2 ** (fail_streak - 1)), 300)
