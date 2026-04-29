@@ -1,0 +1,271 @@
+Media Batch Downloader 安裝與建置說明
+====================================
+
+--------------------------------
+一、需求環境
+--------------------------------
+
+建議環境：
+- Windows 10 / 11
+- Python 3.10 以上
+- 已安裝 pip
+- 網路可連線
+
+--------------------------------
+二、原始碼模式安裝
+--------------------------------
+
+進入 downloader_v5 資料夾後，安裝必要套件：
+
+python -m pip install --upgrade pip
+python -m pip install instaloader opencc-python-reimplemented tkinterdnd2 pyinstaller
+python -m pip install -U yt-dlp instaloader playwright requests
+playwright install chromium
+python -m pip install -U pycryptodome
+python -m pip install -U keyring
+
+如果你只想執行、不需要拖放功能：
+tkinterdnd2 可以不裝
+但 GUI 拖放 txt 會失效
+
+--------------------------------
+三、測試執行
+--------------------------------
+
+直接執行：
+
+python main.py
+
+或用：
+
+run.bat
+
+若 GUI 能正常開啟，代表安裝成功。
+
+--------------------------------
+四、建置 EXE
+--------------------------------
+
+直接雙擊：
+
+build.bat
+
+或手動執行：
+
+python -m PyInstaller --noconfirm --onefile --noconsole ^
+--name MediaBatchDownloader ^
+--hidden-import=instaloader ^
+--hidden-import=yt_dlp ^
+--hidden-import=opencc ^
+--hidden-import=tkinterdnd2 ^
+--add-data "accounts.json;." ^
+--add-data "cookies.txt;." ^
+--add-data "data;data" ^
+--add-data "..\pre-processing;pre-processing" ^
+main.py
+
+--------------------------------
+五、打包結果
+--------------------------------
+
+build.bat 完成後會建立：
+
+release\MediaBatchDownloader.exe
+
+以及：
+release\data\
+release\downloads\
+
+之後直接執行：
+
+release\MediaBatchDownloader.exe
+
+--------------------------------
+六、accounts.json 設定
+--------------------------------
+
+格式如下：
+
+[
+  {
+    "username": "你的IG帳號",
+    "password": "你的IG密碼"
+  }
+]
+
+注意：
+- 若使用 2FA，仍可能遇到 IG 額外驗證
+- 建議 cookies.txt 優先
+
+--------------------------------
+七、cookies.txt 說明
+--------------------------------
+
+cookies.txt 是 Instagram / Facebook 的登入 cookie。
+
+用途：
+- 提高可下載成功率
+- 減少 2FA 登入不穩問題
+- 遇到 BLOCKED 時通常比帳密登入更穩
+
+建議：
+- 使用你平常能正常瀏覽 IG / FB 的瀏覽器帳號匯出 cookies
+- 定期更新 cookies.txt
+
+重要：
+若你已確認同一帳號在瀏覽器能看到內容，但程式仍無法下載，
+請優先檢查：
+1. cookies.txt 是否是最新匯出的
+2. cookies.txt 是否真的來自同一個帳號
+3. cookies 是否匯出完整
+4. 程式目前讀取的是不是正確那份 cookies.txt
+
+--------------------------------
+八、pre-processing 使用方式
+--------------------------------
+
+專案結構：
+
+pre-processing\
+    20260420.txt
+    link_sorter.py
+    output\
+        undownload_link.txt
+
+你可以把一堆原始分享文字放進：
+pre-processing\20260420.txt
+
+然後在 GUI 內按：
+「📂 匯入 txt（自動預處理）」
+
+程式會自動：
+1. 執行 link_sorter.py
+2. 產生 download_link.txt / undownload_link.txt
+3. 自動載入 download_link.txt
+
+--------------------------------
+九、Facebook share 連結說明
+--------------------------------
+
+現在以下類型的 Facebook 連結也會視為可下載：
+- facebook.com/share/...
+- facebook.com/share/r/...
+- facebook.com/share/v/...
+- facebook.com/watch/...
+- facebook.com/reel/...
+- facebook.com/.../videos/...
+- facebook.com/.../posts/...
+- facebook.com/story.php...
+- fb.watch/...
+
+也就是說：
+
+https://www.facebook.com/share/1BJ5cEzosx/
+
+這類連結現在會先進入 download_link.txt，
+再由 Facebook 下載器處理。
+
+--------------------------------
+十、已下載跳過 / 斷點續跑
+--------------------------------
+
+程式使用：
+
+data\processed_links.log
+
+記錄已成功下載的 URL。
+
+若同一個連結之後再次加入任務：
+- 不會重複下載
+- 會直接略過
+
+這樣可以避免重跑大量清單時重複下載已完成內容。
+
+--------------------------------
+十一、failed / unavailable / retry 紀錄
+--------------------------------
+
+程式會寫出：
+
+data\failed_links.log
+data\retry_needed.txt
+data\unavailable_links.txt
+
+用途：
+- failed_links.log：完整失敗事件紀錄
+- retry_needed.txt：建議之後可重試
+- unavailable_links.txt：已失效或受限內容
+
+--------------------------------
+十二、暫停 / 繼續 / 停止
+--------------------------------
+
+目前 GUI 支援：
+
+⏸ 暫停
+- 暫停新的下載流程
+- 若正在冷卻，會停在冷卻流程中
+
+▶ 繼續
+- 從暫停狀態繼續
+
+⏹ 停止
+- 停止整體下載流程
+- 正在下載中的那一筆不保證會立刻強制中斷
+- 會在目前任務安全收尾後停止
+
+--------------------------------
+十三、常見問題排除
+--------------------------------
+
+1. build.bat 失敗
+可能原因：
+- Python 沒加到 PATH
+- pip 套件未安裝成功
+- 被防毒阻擋
+
+2. EXE 打開沒反應
+先回到原始碼模式測試：
+
+python main.py
+
+若原始碼都跑不起來，EXE 也不會正常。
+
+3. Instagram 無法下載
+先確認：
+- cookies.txt 是否有效
+- 該內容是否需要登入
+- 該內容是否有年齡 / 受眾限制
+
+4. Facebook 無法下載
+先確認：
+- cookies.txt 是否有效
+- 該分享連結是否實際可在瀏覽器打開
+- 是否為受限制內容
+
+5. 顯示 BLOCKED
+代表平台限制，不一定是程式 bug
+
+6. 2FA 驗證碼正確卻失敗
+這是 IG 驗證流程不穩定造成
+建議改用 cookies.txt
+
+7. 我已確認瀏覽器看得到，但程式抓不到
+優先檢查：
+- cookies 是否最新
+- cookies 是否同一帳號
+- 是否有平台風控
+- 是否為程式用到的實際 cookie 狀態與瀏覽器不同
+
+--------------------------------
+十四、推薦日常使用方式
+--------------------------------
+
+開發 / 測試：
+run.bat
+
+正式打包：
+build.bat
+
+正式使用：
+release\MediaBatchDownloader.exe

@@ -1,13 +1,58 @@
-# 排除下載目錄
+# =========================
+# Runtime / local state
+# =========================
+.claude/
+data/
+logs/
 downloads/
 temp_insta_dl/
-pre-processing/output/
 __pycache__/
-
-
-# 忽略執行過程產生的紀錄檔
+*.pyc
 *.log
-*.txt
+
+# =========================
+# Downloader GUI runtime
+# =========================
+downloader_GUI/data/
+downloader_GUI/downloads/
+downloader_GUI/logs/
+downloader_GUI/temp_insta_dl/
+downloader_GUI/__pycache__/
+downloader_GUI/cookies.txt
+downloader_GUI/accounts.json
+
+# =========================
+# Pre-processing generated files
+# =========================
+pre-processing/output/
+pre-processing/link.txt
+
+# =========================
+# Credentials / secrets
+# =========================
 cookies.txt
+accounts.json
+
+# =========================
+# Local shortcuts / screenshots
+# =========================
+*.lnk
+*.JPG
+*.jpg
+*.jpeg
+*.png
+
+# =========================
+# Text files
+# =========================
+# Ignore root/local txt dumps by default.
 *.txt
+
+# Keep documentation and curated text files.
+!README.txt
+!downloader_GUI/How to use.txt
+!downloader_GUI/install.txt
+
+# Keep sample input txt files in pre-processing, except personal working input.
 !pre-processing/*.txt
+pre-processing/link.txt
