@@ -49,6 +49,7 @@ _STATUS_COLORS = {
     "BLOCKED": "#FF9800",
     "RETRY": "#9C27B0",
     "UNAVAILABLE": "#795548",
+    "MISSING": "#607D8B",
 }
 
 _PLACEHOLDER = "在此貼上 URL（每行一個），或拖入 txt 檔案..."
@@ -91,16 +92,22 @@ class App:
         self._login_in_progress = False
         self._failed_window = None
 
-        self._elapsed_start_ts = None
+        # Treeview row id -> full task url.
+        # The visible URL column is shortened for readability, but right-click copy
+        # and Ctrl+C must copy the original full URL.
+        self._tree_url_by_iid = {}
+        self._tree_context_iid = None
+        self._tree_context_url_snapshot = ""
+        self._tree_context_status_snapshot = ""
+        self._tree_context_retry_snapshot = ""
+        self._tree_context_menu = None
 
-        # v5.1 completion popup state
-        # 下載批次完成後只彈一次，避免 _refresh_table 每秒重複彈出。
-        self._completion_notified = False
-        self._last_total_for_completion = 0
+        self._elapsed_start_ts = None
+        self._worker_stopped_by_user = False
 
         self._build_ui()
         queue_manager.load_checkpoint()
-        worker.start()
+        self._safe_worker_start("startup")
 
         self.root.after(300, self._init_session)
         self.root.after(600, self._refresh_table)
@@ -349,6 +356,12 @@ class App:
         for status, color in _STATUS_COLORS.items():
             self.tree.tag_configure(status, foreground=color)
 
+        self._build_tree_context_menu()
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
+        self.tree.bind("<Control-c>", self._copy_selected_url)
+        self.tree.bind("<Control-C>", self._copy_selected_url)
+        self.tree.bind("<Double-Button-1>", self._copy_selected_url)
+
         ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=8, pady=(4, 0))
 
         bot = tk.Frame(self.root, padx=10, pady=6)
@@ -362,6 +375,7 @@ class App:
             ("SUCCESS", "SUCCESS"),
             ("FAILED", "FAILED"),
             ("BLOCKED", "BLOCKED"),
+            ("MISSING", "MISSING"),
             ("DOWNLOADING", "DOWNLOADING"),
         ]
         for label, key in filter_defs:
@@ -388,6 +402,19 @@ class App:
             text="📄 查看失敗",
             command=self._show_failed_links_window,
             bg="#6D4C41",
+            fg="white",
+            padx=10,
+            pady=5,
+            font=("Microsoft JhengHei UI", 10),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(
+            act_frame,
+            text="🚫 複製BLOCKED",
+            command=lambda: self._copy_status_urls("BLOCKED"),
+            bg="#EF6C00",
             fg="white",
             padx=10,
             pady=5,
@@ -475,6 +502,169 @@ class App:
             fg="#333333",
             padx=6,
         ).pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _build_tree_context_menu(self):
+        """建立任務清單右鍵選單。"""
+        self._tree_context_menu = tk.Menu(self.root, tearoff=0)
+        self._tree_context_menu.add_command(
+            label="複製連結",
+            command=self._copy_context_url,
+        )
+        self._tree_context_menu.add_command(
+            label="複製選取列狀態",
+            command=self._copy_context_row,
+        )
+        self._tree_context_menu.add_separator()
+        self._tree_context_menu.add_command(
+            label="查看完整連結",
+            command=self._show_context_url,
+        )
+        self._tree_context_menu.add_separator()
+        self._tree_context_menu.add_command(
+            label="複製目前篩選 URL",
+            command=self._copy_current_filtered_urls,
+        )
+
+    def _on_tree_right_click(self, event):
+        """右鍵點擊任務列時，立即保存完整 URL 快照並顯示選單。"""
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return "break"
+
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self._tree_context_iid = iid
+
+        vals = self.tree.item(iid, "values") or ("", "", "")
+        self._tree_context_url_snapshot = self._tree_url_by_iid.get(iid, "") or (vals[0] if len(vals) > 0 else "")
+        self._tree_context_status_snapshot = vals[1] if len(vals) > 1 else ""
+        self._tree_context_retry_snapshot = vals[2] if len(vals) > 2 else ""
+
+        try:
+            self._tree_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._tree_context_menu.grab_release()
+
+        return "break"
+
+    def _get_selected_tree_iid(self):
+        """取得目前選取的 Treeview row iid。"""
+        sel = self.tree.selection()
+        if sel:
+            return sel[0]
+        focus = self.tree.focus()
+        return focus or None
+
+    def _copy_to_clipboard(self, text: str, status_message: str):
+        """安全複製文字到剪貼簿並更新狀態列。"""
+        if text is None:
+            text = ""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update_idletasks()
+        self.status_var.set(status_message)
+
+    def _copy_context_url(self):
+        """右鍵選單：複製完整 URL。右鍵瞬間已保存快照，不怕表格刷新。"""
+        url = self._tree_context_url_snapshot or ""
+        if not url:
+            iid = self._tree_context_iid or self._get_selected_tree_iid()
+            if iid:
+                url = self._tree_url_by_iid.get(iid, "")
+                if not url:
+                    vals = self.tree.item(iid, "values")
+                    url = vals[0] if vals else ""
+        if not url:
+            self.status_var.set("沒有可複製的連結")
+            return
+        self._copy_to_clipboard(url, "已複製連結")
+
+    def _copy_context_row(self):
+        """右鍵選單：複製該列 URL / 狀態 / Retry。"""
+        url = self._tree_context_url_snapshot or ""
+        status = self._tree_context_status_snapshot or ""
+        retry = self._tree_context_retry_snapshot or ""
+
+        if not url:
+            iid = self._tree_context_iid or self._get_selected_tree_iid()
+            if not iid:
+                return
+            vals = self.tree.item(iid, "values")
+            url = self._tree_url_by_iid.get(iid, "")
+            status = vals[1] if len(vals) > 1 else ""
+            retry = vals[2] if len(vals) > 2 else ""
+
+        text = f"{url}\t{status}\t{retry}"
+        self._copy_to_clipboard(text, "已複製選取列狀態")
+
+    def _show_context_url(self):
+        """右鍵選單：顯示完整 URL。"""
+        url = self._tree_context_url_snapshot or ""
+        if not url:
+            iid = self._tree_context_iid or self._get_selected_tree_iid()
+            if iid:
+                url = self._tree_url_by_iid.get(iid, "")
+                if not url:
+                    vals = self.tree.item(iid, "values")
+                    url = vals[0] if vals else ""
+        messagebox.showinfo("完整連結", url or "沒有可顯示的連結", parent=self.root)
+
+    def _copy_selected_url(self, _event=None):
+        """Ctrl+C / 雙擊：複製目前選取列完整 URL。"""
+        iid = self._get_selected_tree_iid()
+        if not iid:
+            return "break"
+
+        url = self._tree_url_by_iid.get(iid, "")
+        if not url:
+            vals = self.tree.item(iid, "values")
+            url = vals[0] if vals else ""
+
+        if url:
+            self._copy_to_clipboard(url, "已複製連結")
+        else:
+            self.status_var.set("沒有可複製的連結")
+        return "break"
+
+    def _copy_current_filtered_urls(self):
+        """複製目前表格篩選結果的完整 URL。"""
+        snapshot = queue_manager.get_snapshot()
+        if self._active_filter != "ALL":
+            snapshot = [t for t in snapshot if t.get("status") == self._active_filter]
+        urls = [t.get("url", "") for t in snapshot if t.get("url")]
+        if not urls:
+            self.status_var.set("目前篩選結果沒有 URL 可複製")
+            return
+        self._copy_to_clipboard("\n".join(urls), f"已複製目前篩選 URL：{len(urls)} 筆")
+
+    def _copy_status_urls(self, status: str):
+        """一鍵複製指定狀態 URL，例如 BLOCKED / MISSING / FAILED。"""
+        status = (status or "").upper()
+        urls = queue_manager.get_urls_by_status(status)
+        if not urls:
+            self.status_var.set(f"目前沒有 {status} URL")
+            return
+        self._copy_to_clipboard("\n".join(urls), f"已複製 {status} URL：{len(urls)} 筆")
+
+    def _safe_worker_start(self, reason: str = "") -> bool:
+        """安全啟動 / 重新喚醒 worker，避免 stop 後 resume 沒有 thread 繼續跑。"""
+        try:
+            worker.start()
+            return True
+        except RuntimeError as e:
+            logger.warning(f"worker.start 已在執行或不可重複啟動 ({reason}): {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"worker.start 失敗 ({reason}): {e}")
+            return False
+
+    def _safe_worker_resume(self, reason: str = "") -> None:
+        """解除暫停並確保 worker 存活。"""
+        try:
+            worker.resume()
+        except Exception as e:
+            logger.warning(f"worker.resume 失敗 ({reason}): {e}")
+        self._safe_worker_start(reason or "resume")
 
     def _init_session(self):
         if os.path.exists(COOKIES_FILE):
@@ -631,14 +821,18 @@ class App:
         if snapshot and self._elapsed_start_ts is None:
             self._elapsed_start_ts = time.time()
 
-        # 新增任務後重置完成提示狀態
-        self._completion_notified = False
-        self._last_total_for_completion = 0
+        added = int(result.get("added", 0) or 0)
+        skipped_processed = int(result.get("skipped_processed", result.get("skipped", 0)) or 0)
+        skipped_duplicate = int(result.get("skipped_duplicate", result.get("duplicated", 0)) or 0)
+
+        # stop 後重新貼連結 / 再按開始時，必須解除暫停並確保 worker thread 存活。
+        self._worker_stopped_by_user = False
+        self._safe_worker_resume("start_download")
 
         self.status_var.set(
-            f"新增 {result['added']} 筆  |  "
-            f"略過已下載 {result['skipped_processed']} 筆  |  "
-            f"略過重複 {result['skipped_duplicate']} 筆"
+            f"新增 {added} 筆  |  "
+            f"略過已下載 {skipped_processed} 筆  |  "
+            f"略過重複 {skipped_duplicate} 筆"
         )
         self._refresh_table()
 
@@ -807,23 +1001,62 @@ class App:
         self.status_var.set(f"已開啟預處理 output：{PREPROCESS_OUTPUT_DIR}")
 
     def _pause_downloads(self):
-        worker.pause()
-        self.status_var.set("已暫停下載")
+        try:
+            worker.pause()
+            self.status_var.set("已暫停下載")
+        except Exception as e:
+            logger.warning(f"pause 失敗: {e}")
+            self.status_var.set(f"暫停失敗：{e}")
 
     def _resume_downloads(self):
-        worker.resume()
-        self.status_var.set("已繼續下載")
+        # 使用者常見操作是「停止」後又按「繼續」。
+        # 此時舊 worker thread 可能已退出，所以 resume 之外還要 start。
+        try:
+            reset_count = queue_manager.reset_interrupted_downloads()
+        except AttributeError:
+            reset_count = 0
+        except Exception as e:
+            logger.warning(f"reset_interrupted_downloads 失敗: {e}")
+            reset_count = 0
+
+        self._worker_stopped_by_user = False
+        self._safe_worker_resume("resume_button")
+
+        if reset_count > 0:
+            self.status_var.set(f"已繼續下載，已恢復中斷任務 {reset_count} 筆")
+        else:
+            self.status_var.set("已繼續下載")
+
+        self._schedule_refresh(0)
 
     def _stop_downloads(self):
         if not messagebox.askyesno("確認停止", "停止下載？\n正在下載中的這一筆會先安全收尾。", parent=self.root):
             return
-        worker.stop()
-        self.status_var.set("停止中，等待目前任務安全收尾...")
+
+        self._worker_stopped_by_user = True
+
+        try:
+            worker.stop()
+        except Exception as e:
+            logger.warning(f"stop 失敗: {e}")
+            self.status_var.set(f"停止失敗：{e}")
+            return
+
+        # 若 worker 在 DOWNLOADING 狀態中被停止，避免下一次按「繼續」時表格永遠卡在 DOWNLOADING。
+        try:
+            queue_manager.mark_stop_requested()
+        except AttributeError:
+            pass
+        except Exception as e:
+            logger.warning(f"mark_stop_requested 失敗: {e}")
+
+        self.status_var.set("停止中，等待目前任務安全收尾；若要繼續，請按 ▶ 繼續重新喚醒 worker。")
+        self._schedule_refresh(0)
 
     def _retry_failed(self):
         queue_manager.retry_failed()
-        self._completion_notified = False
-        self._last_total_for_completion = 0
+        self._worker_stopped_by_user = False
+        self._safe_worker_resume("retry_failed")
         self.status_var.set("已重置失敗任務，重新下載中...")
         self._schedule_refresh(0)
 
@@ -834,8 +1067,6 @@ class App:
         queue_manager.clear_tasks()
         self._blocked_warned = False
         self._elapsed_start_ts = None
-        self._completion_notified = False
-        self._last_total_for_completion = 0
         self._schedule_refresh(0)
         self.status_var.set("任務已清空，日誌已儲存至 data/")
 
@@ -847,17 +1078,68 @@ class App:
             return
 
         self._failed_window = tk.Toplevel(self.root)
-        self._failed_window.title("失敗連結清單")
-        self._failed_window.geometry("900x520")
+        self._failed_window.title("失敗 / 封鎖 / Missing URL 清單")
+        self._failed_window.geometry("980x620")
 
         top = tk.Frame(self._failed_window, padx=10, pady=10)
         top.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(
             top,
-            text="失敗 / 封鎖 / 不可用 連結",
+            text="失敗 / 封鎖 / Missing / 不可用 連結",
             font=("Microsoft JhengHei UI", 14, "bold"),
         ).pack(anchor="w", pady=(0, 8))
+
+        filter_row = tk.Frame(top)
+        filter_row.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(filter_row, text="狀態篩選：", font=("Microsoft JhengHei UI", 10)).pack(side=tk.LEFT)
+        self.failed_filter_var = tk.StringVar(value="ALL")
+        self.failed_filter_combo = ttk.Combobox(
+            filter_row,
+            textvariable=self.failed_filter_var,
+            values=("ALL", "FAILED", "BLOCKED", "MISSING", "UNAVAILABLE", "RETRY"),
+            state="readonly",
+            width=16,
+        )
+        self.failed_filter_combo.pack(side=tk.LEFT, padx=(4, 10))
+        self.failed_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_failed_window_text())
+
+        tk.Button(
+            filter_row,
+            text="複製 BLOCKED URL",
+            command=lambda: self._copy_status_urls("BLOCKED"),
+            bg="#EF6C00",
+            fg="white",
+            padx=10,
+            pady=3,
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(
+            filter_row,
+            text="複製 MISSING URL",
+            command=lambda: self._copy_status_urls("MISSING"),
+            bg="#607D8B",
+            fg="white",
+            padx=10,
+            pady=3,
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(
+            filter_row,
+            text="開啟 data 資料夾",
+            command=lambda: self._open_path(DATA_DIR),
+            bg="#455A64",
+            fg="white",
+            padx=10,
+            pady=3,
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=3)
 
         self.failed_text = tk.Text(
             top,
@@ -885,9 +1167,21 @@ class App:
 
         tk.Button(
             btns,
-            text="📋 複製全部",
+            text="📋 複製目前清單",
             command=self._copy_failed_text,
             bg="#6A1B9A",
+            fg="white",
+            padx=10,
+            pady=4,
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(
+            btns,
+            text="📋 只複製目前 URL",
+            command=self._copy_failed_urls_only,
+            bg="#00897B",
             fg="white",
             padx=10,
             pady=4,
@@ -907,10 +1201,16 @@ class App:
 
         self._refresh_failed_window_text()
 
+    def _get_failed_filter_key(self) -> str:
+        if hasattr(self, "failed_filter_var"):
+            return self.failed_filter_var.get() or "ALL"
+        return "ALL"
+
     def _refresh_failed_window_text(self):
         if not hasattr(self, "failed_text"):
             return
-        content = queue_manager.get_failed_links_text()
+        status_filter = self._get_failed_filter_key()
+        content = queue_manager.get_failed_links_text(status_filter=status_filter, urls_only=False)
         self.failed_text.delete("1.0", tk.END)
         self.failed_text.insert("1.0", content)
 
@@ -918,9 +1218,24 @@ class App:
         if not hasattr(self, "failed_text"):
             return
         content = self.failed_text.get("1.0", tk.END).strip()
+        if not content:
+            self.status_var.set("目前清單沒有內容可複製")
+            return
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
-        self.status_var.set("已複製失敗連結清單")
+        self.root.update_idletasks()
+        self.status_var.set("已複製目前失敗清單")
+
+    def _copy_failed_urls_only(self):
+        status_filter = self._get_failed_filter_key()
+        content = queue_manager.get_failed_links_text(status_filter=status_filter, urls_only=True)
+        if not content.strip():
+            self.status_var.set(f"目前沒有 {status_filter} URL 可複製")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content.strip())
+        self.root.update_idletasks()
+        self.status_var.set(f"已複製目前 URL 清單：{status_filter}")
 
     def _set_filter(self, key: str):
         self._active_filter = key
@@ -932,130 +1247,6 @@ class App:
             self._refresh_id = None
         self._refresh_id = self.root.after(delay, self._refresh_table)
 
-    def _maybe_show_completion_popup(self, total: int, done: int, counts: dict, elapsed: float, phase: str = ""):
-        """批次完成後彈出一次完成視窗。"""
-        if total <= 0:
-            self._completion_notified = False
-            self._last_total_for_completion = 0
-            return
-
-        # 如果這批任務數量變了，視為新批次，允許再次提示。
-        if total != self._last_total_for_completion:
-            self._last_total_for_completion = total
-            self._completion_notified = False
-
-        if self._completion_notified:
-            return
-
-        active_states = (
-            counts.get("PENDING", 0)
-            + counts.get("DOWNLOADING", 0)
-        )
-        # v5.2: 不在 DOWNLOADING/COOLDOWN 階段彈窗，避免干擾 worker 冷卻或造成 GUI 看似卡住。
-        if done < total or active_states > 0 or phase in ("DOWNLOADING", "COOLDOWN", "PAUSED"):
-            return
-
-        self._completion_notified = True
-        self.root.after(100, lambda: self._show_completion_popup(total, counts, elapsed))
-
-    def _show_completion_popup(self, total: int, counts: dict, elapsed: float):
-        """顯示下載完成摘要視窗。"""
-        if not self.root.winfo_exists():
-            return
-
-        success = counts.get("SUCCESS", 0)
-        failed = counts.get("FAILED", 0)
-        blocked = counts.get("BLOCKED", 0)
-        unavailable = counts.get("UNAVAILABLE", 0)
-        retry = counts.get("RETRY", 0)
-
-        msg = (
-            "下載批次已完成。\n\n"
-            f"總任務：{total}\n"
-            f"成功：{success}\n"
-            f"失敗：{failed}\n"
-            f"封鎖：{blocked}\n"
-            f"不可用：{unavailable}\n"
-            f"待重試：{retry}\n"
-            f"耗時：{_format_seconds(elapsed)}"
-        )
-
-        win = tk.Toplevel(self.root)
-        win.title("下載完成")
-        win.geometry("420x300")
-        win.resizable(False, False)
-        # v5.2: 非 modal 視窗，不 grab_set，避免彈窗搶焦點造成主程式看似 hang。
-        win.transient(self.root)
-        try:
-            win.attributes("-topmost", True)
-            win.after(1500, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
-        except Exception:
-            pass
-
-        frame = tk.Frame(win, padx=20, pady=18)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        title_color = "#2E7D32" if failed == 0 and blocked == 0 and unavailable == 0 and retry == 0 else "#E65100"
-
-        tk.Label(
-            frame,
-            text="✅ 下載完成",
-            font=("Microsoft JhengHei UI", 18, "bold"),
-            fg=title_color,
-        ).pack(anchor="w", pady=(0, 12))
-
-        tk.Label(
-            frame,
-            text=msg,
-            font=("Microsoft JhengHei UI", 11),
-            justify=tk.LEFT,
-            anchor="w",
-        ).pack(fill=tk.X)
-
-        btn_row = tk.Frame(frame)
-        btn_row.pack(fill=tk.X, pady=(18, 0))
-
-        tk.Button(
-            btn_row,
-            text="📁 開啟下載資料夾",
-            command=lambda: self._open_path(DOWNLOAD_DIR),
-            bg="#1976D2",
-            fg="white",
-            padx=12,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
-        if failed or blocked or unavailable or retry:
-            tk.Button(
-                btn_row,
-                text="📄 查看失敗",
-                command=self._show_failed_links_window,
-                bg="#6D4C41",
-                fg="white",
-                padx=12,
-                pady=6,
-                relief=tk.FLAT,
-                cursor="hand2",
-            ).pack(side=tk.LEFT, padx=(0, 8))
-
-        tk.Button(
-            btn_row,
-            text="關閉",
-            command=win.destroy,
-            padx=14,
-            pady=6,
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.RIGHT)
-
-        win.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
-        win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        win.focus_force()
-
     def _refresh_table(self):
         self._refresh_id = None
         snapshot = queue_manager.get_snapshot()
@@ -1064,14 +1255,18 @@ class App:
 
         display = snapshot if self._active_filter == "ALL" else [t for t in snapshot if t["status"] == self._active_filter]
 
+        self._tree_url_by_iid.clear()
+
         for row in self.tree.get_children():
             self.tree.delete(row)
 
         for t in display:
-            url_short = t["url"][:120] + ("…" if len(t["url"]) > 120 else "")
+            full_url = t.get("url", "")
+            url_short = full_url[:120] + ("…" if len(full_url) > 120 else "")
             status = t["status"]
             tag = status if status in _STATUS_COLORS else "PENDING"
-            self.tree.insert("", tk.END, values=(url_short, status, t["retry"]), tags=(tag,))
+            iid = self.tree.insert("", tk.END, values=(url_short, status, t["retry"]), tags=(tag,))
+            self._tree_url_by_iid[iid] = full_url
 
         total = runtime.get("total", 0)
         done = runtime.get("done", 0)
@@ -1123,11 +1318,9 @@ class App:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
 
         parts = [f"共 {len(snapshot)} 筆", f"已下載紀錄 {processed_count} 筆"]
-        for s in ("DOWNLOADING", "PENDING", "SUCCESS", "FAILED", "BLOCKED", "RETRY", "UNAVAILABLE"):
+        for s in ("DOWNLOADING", "PENDING", "SUCCESS", "FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE"):
             if counts.get(s, 0):
                 parts.append(f"{s}: {counts[s]}")
-
-        self._maybe_show_completion_popup(total, done, counts, elapsed, phase)
 
         blocked_n = counts.get("BLOCKED", 0)
         if blocked_n > 0 and not self._blocked_warned:
@@ -1204,7 +1397,10 @@ def main():
 
 
 def _on_close(root: tk.Tk):
-    worker.stop()
+    try:
+        worker.stop()
+    except Exception:
+        pass
     queue_manager.write_logs()
     root.destroy()
 

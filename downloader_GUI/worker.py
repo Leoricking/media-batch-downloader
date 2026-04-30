@@ -142,7 +142,7 @@ def _worker_loop():
                 error = str(e)
                 status = queue_manager.map_status(error)
 
-            if status in ("SUCCESS", "UNAVAILABLE", "BLOCKED"):
+            if status in ("SUCCESS", "UNAVAILABLE", "MISSING", "BLOCKED"):
                 break
 
             if attempt < max_attempts - 1:
@@ -187,6 +187,9 @@ def _worker_loop():
 
         elif status == "BLOCKED":
             _cooldown_sleep(5, url)
+
+        elif status == "MISSING":
+            _cooldown_sleep(2, url)
 
     queue_manager.update_runtime(
         phase="STOPPED",

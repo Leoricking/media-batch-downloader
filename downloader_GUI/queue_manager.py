@@ -1,20 +1,23 @@
 import os
 import threading
-from datetime import datetime
+import time
+from typing import Optional
 
 from config import (
-    CHECKPOINT_FILE,
     DATA_DIR,
+    CHECKPOINT_FILE,
     FAILED_LOG_FILE,
     RETRY_NEEDED_FILE,
     UNAVAILABLE_FILE,
 )
 
-tasks: list[dict] = []
-_lock = threading.Lock()
+_LOCK = threading.RLock()
+_TASKS: list[dict] = []
+_PROCESSED: set[str] = set()
+_FAILED_EVENTS: list[dict] = []
 
-_runtime = {
-    "phase": "IDLE",              # IDLE / DOWNLOADING / COOLDOWN / PAUSED / STOPPED
+_RUNTIME = {
+    "phase": "IDLE",
     "message": "就緒",
     "active_url": "",
     "cooldown_remaining": 0,
@@ -22,367 +25,408 @@ _runtime = {
     "done": 0,
 }
 
-_processed_cache: set[str] = set()
+_TERMINAL_STATUSES = {"SUCCESS", "FAILED", "BLOCKED", "MISSING", "UNAVAILABLE"}
+_RETRYABLE_STATUSES = {"RETRY"}
+_FAILURE_STATUSES = {"FAILED", "BLOCKED", "MISSING", "UNAVAILABLE", "RETRY"}
 
 
-def _ensure_data_dir():
+def _ensure_dirs():
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def load_checkpoint() -> set[str]:
-    """
-    讀取已成功下載過的 URL。
-    """
-    global _processed_cache
-    _ensure_data_dir()
-
-    if not os.path.exists(CHECKPOINT_FILE):
-        _processed_cache = set()
-        return _processed_cache
-
-    with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-        _processed_cache = {line.strip() for line in f if line.strip()}
-
-    return _processed_cache
-
-
-def rewrite_checkpoint():
-    """
-    以目前 _processed_cache 全量重寫 processed_links.log
-    """
-    _ensure_data_dir()
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        for url in sorted(_processed_cache):
-            f.write(url + "\n")
-
-
-def clear_checkpoint():
-    """
-    清空 processed_links.log 與記憶體快取。
-    """
-    global _processed_cache
-    _ensure_data_dir()
-    _processed_cache = set()
-
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        f.write("")
-
-    return True
-
-
-def save_checkpoint(url: str):
-    """
-    標記此 URL 已成功下載。
-    """
-    global _processed_cache
-    if not _processed_cache:
-        load_checkpoint()
-
-    if url in _processed_cache:
+def _append_unique_line(path: str, line: str):
+    if not line:
         return
-
-    _processed_cache.add(url)
-    rewrite_checkpoint()
-
-
-def remove_from_checkpoint(url: str):
-    """
-    若某 URL 被誤判成功，可從 processed_links.log 移除。
-    """
-    global _processed_cache
-    if not _processed_cache:
-        load_checkpoint()
-
-    if url in _processed_cache:
-        _processed_cache.remove(url)
-        rewrite_checkpoint()
+    _ensure_dirs()
+    existing = set()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                existing = {x.strip() for x in f if x.strip()}
+        except Exception:
+            existing = set()
+    if line in existing:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
-def get_processed_links() -> set[str]:
-    if not _processed_cache:
-        load_checkpoint()
-    return set(_processed_cache)
+def _append_line(path: str, line: str):
+    if not line:
+        return
+    _ensure_dirs()
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def _normalize_status(status: str) -> str:
+    status = (status or "").upper().strip()
+    aliases = {
+        "OK": "SUCCESS",
+        "DONE": "SUCCESS",
+        "INVALID": "UNAVAILABLE",
+        "MISSING_PAGE": "MISSING",
+        "NOT_FOUND": "MISSING",
+    }
+    return aliases.get(status, status or "FAILED")
+
+
+def _find_task(url: str) -> Optional[dict]:
+    for task in _TASKS:
+        if task.get("url") == url:
+            return task
+    return None
+
+
+def _recompute_runtime_counts_locked():
+    total = len(_TASKS)
+    done = sum(1 for t in _TASKS if t.get("status") in _TERMINAL_STATUSES)
+    _RUNTIME["total"] = total
+    _RUNTIME["done"] = done
+
+
+def load_checkpoint():
+    _ensure_dirs()
+    with _LOCK:
+        _PROCESSED.clear()
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                with open(CHECKPOINT_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                    _PROCESSED.update(x.strip() for x in f if x.strip())
+            except Exception:
+                pass
+        _recompute_runtime_counts_locked()
 
 
 def get_processed_count() -> int:
-    if not _processed_cache:
-        load_checkpoint()
-    return len(_processed_cache)
+    with _LOCK:
+        return len(_PROCESSED)
+
+
+def clear_checkpoint():
+    _ensure_dirs()
+    with _LOCK:
+        _PROCESSED.clear()
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                os.remove(CHECKPOINT_FILE)
+            except Exception:
+                open(CHECKPOINT_FILE, "w", encoding="utf-8").close()
+        for task in _TASKS:
+            if task.get("status") == "SUCCESS":
+                task["status"] = "PENDING"
+                task["error"] = ""
+        _recompute_runtime_counts_locked()
 
 
 def add_tasks(urls: list[str]) -> dict:
-    """
-    回傳：
-    {
-        "added": int,
-        "skipped_processed": int,
-        "skipped_duplicate": int,
-    }
-    """
-    global _processed_cache
-    if not _processed_cache:
-        load_checkpoint()
-
-    with _lock:
-        existing = {t["url"] for t in tasks}
-        added = 0
-        skipped_processed = 0
-        skipped_duplicate = 0
-
-        for url in urls:
-            url = url.strip()
+    added = 0
+    skipped = 0
+    duplicated = 0
+    with _LOCK:
+        existing = {t.get("url") for t in _TASKS}
+        for raw in urls or []:
+            url = (raw or "").strip()
             if not url:
                 continue
-
-            if url in _processed_cache:
-                skipped_processed += 1
-                continue
-
             if url in existing:
-                skipped_duplicate += 1
+                duplicated += 1
                 continue
-
-            tasks.append({
-                "url": url,
-                "status": "PENDING",
-                "retry": 0,
-                "error": "",
-            })
+            if url in _PROCESSED:
+                skipped += 1
+                _TASKS.append({
+                    "url": url,
+                    "status": "SUCCESS",
+                    "retry": 0,
+                    "error": "已在 processed_links.log 中",
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                })
+            else:
+                added += 1
+                _TASKS.append({
+                    "url": url,
+                    "status": "PENDING",
+                    "retry": 0,
+                    "error": "",
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                })
             existing.add(url)
-            added += 1
+        _recompute_runtime_counts_locked()
+    # 相容舊版 / 新版 GUI 鍵名：
+    # - 舊 queue_manager 回傳 skipped / duplicated
+    # - 部分 main.py 版本讀 skipped_processed / skipped_duplicate
+    # 同時保留兩組鍵，避免 GUI 因 KeyError 閃退。
+    return {
+        "added": added,
+        "skipped": skipped,
+        "duplicated": duplicated,
+        "skipped_processed": skipped,
+        "skipped_duplicate": duplicated,
+        "total": len(_TASKS),
+    }
 
-        _update_runtime_counts_locked()
 
-        return {
-            "added": added,
-            "skipped_processed": skipped_processed,
-            "skipped_duplicate": skipped_duplicate,
-        }
-
-
-def get_task():
-    with _lock:
-        for t in tasks:
-            if t["status"] == "PENDING":
-                t["status"] = "DOWNLOADING"
-                _update_runtime_counts_locked()
-                return t
+def get_task() -> Optional[dict]:
+    with _LOCK:
+        # RETRY 需要人工按「重試失敗」或下一輪才重排；這裡只取 PENDING。
+        for task in _TASKS:
+            if task.get("status") == "PENDING":
+                task["status"] = "DOWNLOADING"
+                task["updated_at"] = time.time()
+                _recompute_runtime_counts_locked()
+                return dict(task)
     return None
+
+
+def set_task_result(url: str, status: str, error: str = ""):
+    status = _normalize_status(status)
+    error = error or ""
+    _ensure_dirs()
+    with _LOCK:
+        task = _find_task(url)
+        if task is None:
+            task = {
+                "url": url,
+                "status": status,
+                "retry": 0,
+                "error": error,
+                "created_at": time.time(),
+                "updated_at": time.time(),
+            }
+            _TASKS.append(task)
+        else:
+            if status == "RETRY":
+                task["retry"] = int(task.get("retry") or 0) + 1
+            task["status"] = status
+            task["error"] = error
+            task["updated_at"] = time.time()
+
+        if status == "SUCCESS":
+            _PROCESSED.add(url)
+            _append_unique_line(CHECKPOINT_FILE, url)
+        elif status == "RETRY":
+            _append_unique_line(RETRY_NEEDED_FILE, url)
+            _append_unique_line(FAILED_LOG_FILE, f"[RETRY]\t{url}\t{error}")
+        elif status in {"MISSING", "UNAVAILABLE"}:
+            _append_unique_line(UNAVAILABLE_FILE, url)
+            _append_unique_line(FAILED_LOG_FILE, f"[{status}]\t{url}\t{error}")
+        elif status in {"FAILED", "BLOCKED"}:
+            _append_unique_line(FAILED_LOG_FILE, f"[{status}]\t{url}\t{error}")
+        _recompute_runtime_counts_locked()
+
+
+def append_failed_event(url: str, reason: str = ""):
+    reason = reason or ""
+    status = map_status(reason)
+    with _LOCK:
+        task = _find_task(url)
+        if task and task.get("status") in _FAILURE_STATUSES:
+            status = task.get("status")
+        event = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "url": url,
+            "status": status,
+            "reason": reason,
+        }
+        _FAILED_EVENTS.append(event)
+    _append_line(os.path.join(DATA_DIR, "failed_history.log"), f"{event['ts']}\t[{status}]\t{url}\t{reason}")
+
+
+def get_snapshot() -> list[dict]:
+    with _LOCK:
+        return [dict(t) for t in _TASKS]
+
+
+def get_urls_by_status(status: str) -> list[str]:
+    status = _normalize_status(status)
+    with _LOCK:
+        return [t.get("url", "") for t in _TASKS if t.get("status") == status and t.get("url")]
+
+
+def get_tasks_by_status(status: str = "ALL") -> list[dict]:
+    """
+    取得指定狀態任務。
+    status="ALL" 回傳所有失敗類任務：FAILED / BLOCKED / MISSING / UNAVAILABLE / RETRY。
+    """
+    status = (status or "ALL").upper().strip()
+    with _LOCK:
+        if status == "ALL":
+            return [dict(t) for t in _TASKS if t.get("status") in _FAILURE_STATUSES]
+        return [dict(t) for t in _TASKS if t.get("status") == status]
+
+
+def get_failed_statuses() -> tuple[str, ...]:
+    return ("ALL", "FAILED", "BLOCKED", "MISSING", "UNAVAILABLE", "RETRY")
+
+
+def get_failed_links_text(status_filter: str = "ALL", url_only: bool = False, urls_only: bool | None = None) -> str:
+    if urls_only is not None:
+        url_only = bool(urls_only)
+    status_filter = (status_filter or "ALL").upper().strip()
+    rows = []
+    with _LOCK:
+        for t in _TASKS:
+            status = t.get("status", "")
+            if status not in _FAILURE_STATUSES:
+                continue
+            if status_filter != "ALL" and status != status_filter:
+                continue
+            url = t.get("url", "")
+            if not url:
+                continue
+            if url_only:
+                rows.append(url)
+            else:
+                retry = t.get("retry", 0)
+                error = (t.get("error") or "").replace("\n", " ").strip()
+                rows.append(f"[{status}] retry={retry}\t{url}" + (f"\t{error}" if error else ""))
+
+    if rows:
+        return "\n".join(rows)
+
+    # fallback：若 GUI 重新啟動後記憶體沒有任務，仍可直接看 failed_links.log。
+    if os.path.exists(FAILED_LOG_FILE):
+        try:
+            with open(FAILED_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().strip()
+            if content:
+                if status_filter == "ALL":
+                    return content
+                lines = [line for line in content.splitlines() if f"[{status_filter}]" in line]
+                return "\n".join(lines) if lines else f"目前沒有 {status_filter} 紀錄。"
+        except Exception:
+            pass
+
+    return "目前沒有失敗 / BLOCKED / MISSING 紀錄。"
+
+
+def get_runtime() -> dict:
+    with _LOCK:
+        _recompute_runtime_counts_locked()
+        return dict(_RUNTIME)
+
+
+def update_runtime(**kwargs):
+    with _LOCK:
+        _RUNTIME.update(kwargs)
+        _recompute_runtime_counts_locked()
+
+
+def mark_stop_requested():
+    """
+    GUI 按下停止時記錄狀態，並把尚未真正完成的 DOWNLOADING 任務轉成 RETRY。
+
+    原因：worker.stop() 可能讓背景 thread 在目前下載流程中安全收尾；
+    但若下載函式卡在網路 / Playwright / yt-dlp 等待，GUI 再按「繼續」時，
+    該任務可能仍停在 DOWNLOADING，導致 queue 不會再取下一筆。
+    轉為 RETRY 可讓畫面不再假裝仍在下載，並保留人工重試紀錄。
+    """
+    with _LOCK:
+        changed = 0
+        for task in _TASKS:
+            if task.get("status") == "DOWNLOADING":
+                task["status"] = "RETRY"
+                task["error"] = task.get("error") or "使用者按下停止，中斷任務；可按繼續或重試失敗重新排程"
+                task["updated_at"] = time.time()
+                changed += 1
+        if changed:
+            _RUNTIME.update({
+                "phase": "STOPPED",
+                "message": "已停止；可按繼續重新喚醒 worker",
+                "active_url": "",
+                "cooldown_remaining": 0,
+            })
+        _recompute_runtime_counts_locked()
+        return changed
+
+
+def reset_interrupted_downloads():
+    """
+    按「繼續」時，把 STOP 造成的 RETRY 任務放回 PENDING。
+    只重排本函式產生的停止中斷任務，不碰一般失敗 / BLOCKED / MISSING。
+    """
+    with _LOCK:
+        changed = 0
+        for task in _TASKS:
+            if task.get("status") == "DOWNLOADING":
+                task["status"] = "PENDING"
+                task["error"] = ""
+                task["updated_at"] = time.time()
+                changed += 1
+            elif task.get("status") == "RETRY" and "使用者按下停止" in (task.get("error") or ""):
+                task["status"] = "PENDING"
+                task["error"] = ""
+                task["updated_at"] = time.time()
+                changed += 1
+        if changed:
+            _RUNTIME.update({
+                "phase": "RUNNING",
+                "message": "繼續下載中",
+                "cooldown_remaining": 0,
+            })
+        _recompute_runtime_counts_locked()
+        return changed
+
+
+def has_pending_tasks() -> bool:
+    with _LOCK:
+        return any(t.get("status") == "PENDING" for t in _TASKS)
+
+
+def retry_failed():
+    with _LOCK:
+        for task in _TASKS:
+            if task.get("status") in {"FAILED", "RETRY"}:
+                task["status"] = "PENDING"
+                task["error"] = ""
+                task["updated_at"] = time.time()
+        _recompute_runtime_counts_locked()
+
+
+def clear_tasks():
+    with _LOCK:
+        _TASKS.clear()
+        _FAILED_EVENTS.clear()
+        _RUNTIME.update({
+            "phase": "IDLE",
+            "message": "就緒",
+            "active_url": "",
+            "cooldown_remaining": 0,
+            "total": 0,
+            "done": 0,
+        })
+
+
+def write_logs():
+    _ensure_dirs()
+    snapshot_path = os.path.join(DATA_DIR, "tasks_snapshot.tsv")
+    with _LOCK:
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            f.write("status\tretry\turl\terror\n")
+            for task in _TASKS:
+                f.write(
+                    f"{task.get('status','')}\t{task.get('retry',0)}\t{task.get('url','')}\t{(task.get('error') or '').replace(chr(10), ' ')}\n"
+                )
 
 
 def map_status(error: str) -> str:
     e = (error or "").lower()
-
     if any(k in e for k in [
-        "please wait a few minutes",
-        "rate limit",
-        "too many requests",
-        "temporarily blocked",
-        "try again later",
-        "429",
-        "timeout",
-        "timed out",
+        "missing", "page not found", "not found", "404", "已遭移除", "頁面無法使用", "此頁面無法使用", "link may be broken", "page may have been removed",
     ]):
-        return "RETRY"
-
+        return "MISSING"
     if any(k in e for k in [
-        "403",
-        "login",
-        "age",
-        "restricted",
-        "only available to",
-        "not available to everyone",
-        "sign in",
-        "private",
-        "特定受眾無法查看此內容",
-        "此內容並未開放所有人查看",
-        "only available for registered users",
+        "blocked", "private", "permission", "not available to everyone", "特定受眾", "無法查看", "requires login", "login required", "checkpoint", "challenge",
     ]):
         return "BLOCKED"
-
     if any(k in e for k in [
-        "not found",
-        "404",
-        "unavailable",
-        "deleted",
-        "this content isn't available",
-        "page not found",
-        "內容不存在",
+        "rate limit", "too many requests", "please wait", "429", "timeout", "timed out",
+    ]):
+        return "RETRY"
+    if any(k in e for k in [
+        "deleted", "unavailable", "內容不存在", "內容已刪除",
     ]):
         return "UNAVAILABLE"
-
     return "FAILED"
-
-
-def retry_failed():
-    with _lock:
-        for t in tasks:
-            if t["status"] in ("FAILED", "BLOCKED", "RETRY", "UNAVAILABLE"):
-                t["status"] = "PENDING"
-                t["retry"] += 1
-                t["error"] = ""
-        _update_runtime_counts_locked()
-
-    rewrite_status_files()
-
-
-def clear_tasks():
-    with _lock:
-        tasks.clear()
-        _runtime["phase"] = "IDLE"
-        _runtime["message"] = "就緒"
-        _runtime["active_url"] = ""
-        _runtime["cooldown_remaining"] = 0
-        _runtime["total"] = 0
-        _runtime["done"] = 0
-
-    rewrite_status_files()
-
-
-def get_snapshot() -> list[dict]:
-    with _lock:
-        return [dict(t) for t in tasks]
-
-
-def update_runtime(
-    *,
-    phase: str | None = None,
-    message: str | None = None,
-    active_url: str | None = None,
-    cooldown_remaining: int | None = None,
-):
-    with _lock:
-        if phase is not None:
-            _runtime["phase"] = phase
-        if message is not None:
-            _runtime["message"] = message
-        if active_url is not None:
-            _runtime["active_url"] = active_url
-        if cooldown_remaining is not None:
-            _runtime["cooldown_remaining"] = cooldown_remaining
-        _update_runtime_counts_locked()
-
-
-def get_runtime() -> dict:
-    with _lock:
-        return dict(_runtime)
-
-
-def _update_runtime_counts_locked():
-    _runtime["total"] = len(tasks)
-    _runtime["done"] = sum(
-        1 for t in tasks
-        if t["status"] in ("SUCCESS", "FAILED", "BLOCKED", "UNAVAILABLE")
-    )
-
-
-def set_task_result(url: str, status: str, error: str = ""):
-    """
-    統一更新任務結果：
-    - SUCCESS -> 寫入 processed checkpoint
-    - 非 SUCCESS -> 從 checkpoint 移除（避免誤判成功後被跳過）
-    - 每次更新後重寫 failed / retry / unavailable 檔案
-    """
-    found = False
-
-    with _lock:
-        for t in tasks:
-            if t["url"] == url:
-                t["status"] = status
-                t["error"] = error or ""
-                found = True
-                break
-        _update_runtime_counts_locked()
-
-    if not found:
-        return
-
-    if status == "SUCCESS":
-        save_checkpoint(url)
-    else:
-        remove_from_checkpoint(url)
-
-    rewrite_status_files()
-
-
-def append_failed_event(url: str, reason: str):
-    """
-    保留歷史事件流水帳。
-    這個檔案是 append 模式，用來追蹤所有失敗事件。
-    """
-    _ensure_data_dir()
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    history_file = os.path.join(DATA_DIR, "failed_history.log")
-    with open(history_file, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}] {url}\n")
-        f.write(f"原因: {reason or '未知錯誤'}\n\n")
-
-
-def rewrite_status_files():
-    """
-    依『目前任務快照』重寫：
-    - failed_links.log
-    - retry_needed.txt
-    - unavailable_links.txt
-
-    這樣成功後就會自動從這三個檔案消失，不殘留舊狀態。
-    """
-    _ensure_data_dir()
-
-    snapshot = get_snapshot()
-
-    failed_items = [t for t in snapshot if t["status"] == "FAILED"]
-    retry_items = [t for t in snapshot if t["status"] == "RETRY"]
-    unavailable_items = [t for t in snapshot if t["status"] in ("BLOCKED", "UNAVAILABLE")]
-
-    with open(FAILED_LOG_FILE, "w", encoding="utf-8") as f:
-        if failed_items:
-            f.write("=== CURRENT FAILED TASKS ===\n\n")
-            for i, t in enumerate(failed_items, 1):
-                f.write(f"[{i}] FAILED\n")
-                f.write(f"{t['url']}\n")
-                f.write(f"原因: {t.get('error') or '未知錯誤'}\n\n")
-        else:
-            f.write("目前沒有 FAILED 任務。\n")
-
-    with open(RETRY_NEEDED_FILE, "w", encoding="utf-8") as f:
-        if retry_items:
-            f.write("=== CURRENT RETRY TASKS ===\n\n")
-            for i, t in enumerate(retry_items, 1):
-                f.write(f"[{i}] RETRY\n")
-                f.write(f"{t['url']}\n")
-                f.write(f"原因: {t.get('error') or '未知錯誤'}\n\n")
-        else:
-            f.write("目前沒有 RETRY 任務。\n")
-
-    with open(UNAVAILABLE_FILE, "w", encoding="utf-8") as f:
-        if unavailable_items:
-            f.write("=== CURRENT BLOCKED / UNAVAILABLE TASKS ===\n\n")
-            for i, t in enumerate(unavailable_items, 1):
-                f.write(f"[{i}] {t['status']}\n")
-                f.write(f"{t['url']}\n")
-                f.write(f"原因: {t.get('error') or '未知錯誤'}\n\n")
-        else:
-            f.write("目前沒有 BLOCKED / UNAVAILABLE 任務。\n")
-
-
-def write_logs():
-    rewrite_status_files()
-
-
-def get_failed_links_text() -> str:
-    snapshot = get_snapshot()
-    failed_items = [t for t in snapshot if t["status"] in ("FAILED", "BLOCKED", "RETRY", "UNAVAILABLE")]
-
-    if not failed_items:
-        return "目前沒有失敗連結。"
-
-    lines = []
-    for i, t in enumerate(failed_items, 1):
-        lines.append(f"[{i}] {t['status']}")
-        lines.append(t["url"])
-        if t.get("error"):
-            lines.append(f"原因: {t['error']}")
-        lines.append("")
-
-    return "\n".join(lines)

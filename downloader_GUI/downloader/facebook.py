@@ -625,19 +625,56 @@ def _cleanup_fb_debug_capture() -> None:
 
 
 def move_files(title: str) -> bool:
+    """
+    Move validated Facebook temp outputs into DOWNLOAD_DIR.
+
+    v11.24 safety guard:
+    - 多圖 / 相簿任務不允許把一堆 .mp4 串流候選搬成 Facebook_Post/1.mp4...
+    - 若 title 仍是 Facebook_Post 且暫存內有多檔，視為 metadata / scope 失敗，回傳 False。
+    - 多檔中若同時有圖片與影片，優先保留圖片，丟棄影片候選，避免推薦影片污染。
+    """
     files = _list_media_files(TEMP_DIR)
 
     if not files:
         return False
 
     name = _clean_fb_post_title_for_path(title, fallback="Facebook_Post")
+    image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    video_exts = {".mp4", ".m4v", ".mov"}
+
+    image_files = [p for p in files if os.path.splitext(p)[1].lower() in image_exts]
+    video_files = [p for p in files if os.path.splitext(p)[1].lower() in video_exts]
+
+    # 多檔 + 預設標題 = 高風險污染，不可正式輸出 Facebook_Post/1.mp4...
+    if len(files) > 1 and name == "Facebook_Post":
+        logger.warning("FB move_files blocked: multi-file output still has fallback title Facebook_Post; clear temp and retry/failed")
+        clear_temp()
+        return False
+
+    # 多檔全是影片時，通常代表 yt-dlp / network 捕捉到多段串流候選，不能當作相簿輸出。
+    if len(files) > 1 and video_files and len(video_files) == len(files):
+        logger.warning(f"FB move_files blocked: multi-video candidates detected ({len(video_files)} mp4/mov files); clear temp")
+        clear_temp()
+        return False
+
+    # 多檔混合時，若圖片數量足夠，影片多半是推薦/廣告/串流污染，直接丟棄影片候選。
+    if len(files) > 1 and image_files and video_files:
+        logger.warning(
+            f"FB move_files photo-post cleanup: drop {len(video_files)} video candidates, keep {len(image_files)} images"
+        )
+        for p in video_files:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        files = image_files
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     if len(files) == 1:
         src = files[0]
         ext = os.path.splitext(src)[1].lower()
-        final_ext = ".mp4" if ext in {".mp4", ".m4v", ".mov"} else ".jpg"
+        final_ext = ".mp4" if ext in video_exts else ".jpg"
 
         dst = os.path.join(DOWNLOAD_DIR, f"{name}{final_ext}")
 
@@ -657,7 +694,7 @@ def move_files(title: str) -> bool:
 
         for i, src in enumerate(files, 1):
             ext = os.path.splitext(src)[1].lower()
-            final_ext = ".mp4" if ext in {".mp4", ".m4v", ".mov"} else ".jpg"
+            final_ext = ".mp4" if ext in video_exts else ".jpg"
 
             if FB_FILENAME_WITH_TITLE:
                 file_title = name[:70].strip(" ._-，,。") or "Facebook_Post"
@@ -675,7 +712,6 @@ def move_files(title: str) -> bool:
     _cleanup_fb_debug_capture()
     clear_temp()
     return True
-
 
 def _get_fb_title(page):
     candidates = []
