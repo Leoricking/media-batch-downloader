@@ -37,10 +37,10 @@ accounts.json
 # Local shortcuts / screenshots
 # =========================
 *.lnk
-*.JPG
-*.jpg
-*.jpeg
-*.png
+# *.JPG
+# *.jpg
+# *.jpeg
+# *.png
 
 # =========================
 # Text files

@@ -5,7 +5,7 @@ import sys
 def get_base_dir() -> str:
     """
     唯讀資源目錄：
-    - 原始碼模式：downloader_v5/
+    - 原始碼模式：downloader_GUI/
     - PyInstaller：_MEIPASS
     """
     if getattr(sys, "frozen", False):
@@ -16,7 +16,7 @@ def get_base_dir() -> str:
 def get_runtime_dir() -> str:
     """
     可寫入目錄：
-    - 原始碼模式：downloader_v5/
+    - 原始碼模式：downloader_GUI/
     - PyInstaller：exe 所在目錄
     """
     if getattr(sys, "frozen", False):
@@ -24,8 +24,41 @@ def get_runtime_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def find_project_root(runtime_dir: str) -> str:
+    """
+    尋找專案根目錄。
+
+    支援：
+    - media-batch-downloader/downloader_GUI/
+    - media-batch-downloader/downloader_v5/
+    - media-batch-downloader/downloder/
+    - PyInstaller exe 放在 downloader_GUI/
+    - 從不同工作目錄啟動
+    """
+    cur = os.path.abspath(runtime_dir)
+
+    # 先從 runtime_dir 往上找 pre-processing/link_sorter.py
+    for _ in range(6):
+        candidate = os.path.join(cur, "pre-processing", "link_sorter.py")
+        if os.path.exists(candidate):
+            return cur
+
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    # fallback：常見資料夾名稱
+    base_name = os.path.basename(os.path.abspath(runtime_dir)).lower()
+    if base_name in {"downloader_gui", "downloader_v5", "downloder"}:
+        return os.path.dirname(os.path.abspath(runtime_dir))
+
+    return os.path.abspath(runtime_dir)
+
+
 _RES = get_base_dir()
 _RT = get_runtime_dir()
+PROJECT_ROOT = find_project_root(_RT)
 
 ACCOUNTS_FILE = os.path.join(_RES, "accounts.json")
 COOKIES_FILE = os.path.join(_RES, "cookies.txt")
@@ -39,22 +72,13 @@ FAILED_LOG_FILE = os.path.join(DATA_DIR, "failed_links.log")
 RETRY_NEEDED_FILE = os.path.join(DATA_DIR, "retry_needed.txt")
 UNAVAILABLE_FILE = os.path.join(DATA_DIR, "unavailable_links.txt")
 
-PROJECT_ROOT = os.path.dirname(_RT) if os.path.basename(_RT).lower() == "downloader_v5" else _RT
 PREPROCESS_DIR = os.path.join(PROJECT_ROOT, "pre-processing")
 PREPROCESS_OUTPUT_DIR = os.path.join(PREPROCESS_DIR, "output")
 PREPROCESS_DEFAULT_DOWNLOAD = os.path.join(PREPROCESS_OUTPUT_DIR, "download_link.txt")
 PREPROCESS_DEFAULT_UNDOWNLOAD = os.path.join(PREPROCESS_OUTPUT_DIR, "undownload_link.txt")
 
 MAX_WORKERS = 1
-# 想維持原本： 1.jpg / 2.jpg / 3.jpg, 就在 config.py
 FB_FILENAME_WITH_TITLE = False
-
-# Facebook Playwright settings
-# False = 顯示瀏覽器視窗；True = 背景執行
-FB_HEADLESS = False
-
-# True = 額外保存 FB harvest/debug 圖，方便檢查是否有抓到但未搬出
-FB_DEBUG_CAPTURE = True
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
