@@ -216,6 +216,31 @@ def clear_temp():
     os.makedirs(TEMP_DIR, exist_ok=True)
 
 
+
+
+def _clear_temp_after_terminal_failure(status: str, reason: str = ""):
+    """Clean TEMP_DIR after terminal non-success Instagram results.
+
+    每筆 IG 任務開始前會清理上一筆殘留；任務若以 FAILED / BLOCKED /
+    MISSING / RETRY 結束，也會清空 post/ 暫存。SUCCESS 不在這裡清，
+    仍由 move_files() 在成功搬移後負責清理，避免誤刪正在搬移的媒體。
+    """
+    if (status or "").upper() == "SUCCESS":
+        return
+
+    try:
+        leftover = _list_media_files(TEMP_DIR)
+    except Exception:
+        leftover = []
+
+    if leftover:
+        logger.info(
+            f"IG 清理暫存 post/：status={status}, "
+            f"leftover={len(leftover)}, reason={reason or 'n/a'}"
+        )
+
+    clear_temp()
+
 def _extract_shortcode(url: str):
     m = re.search(r"/(?:p|reel|reels)/([^/?#&]+)", url)
     return m.group(1) if m else None
@@ -1608,6 +1633,10 @@ def download(url: str):
     if _L is None:
         setup()
 
+    # 每筆 IG 任務開始前清理上一筆失敗 / 中斷殘留的 post/ 暫存檔。
+    # 注意：SUCCESS 的清理由 move_files() 負責，避免誤刪正在搬移中的媒體。
+    clear_temp()
+
     result_box = [(None, None)]
 
     def _run():
@@ -1684,4 +1713,10 @@ def download(url: str):
         clear_temp()
         return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
 
-    return result_box[0] or ("FAILED", "未知錯誤")
+    result = result_box[0] or ("FAILED", "未知錯誤")
+    status, reason = result
+
+    if status != "SUCCESS":
+        _clear_temp_after_terminal_failure(status, reason)
+
+    return result

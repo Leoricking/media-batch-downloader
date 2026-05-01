@@ -1,6 +1,13 @@
 Media Batch Downloader 安裝與建置說明
 ====================================
 
+版本備註：v11.25 Stable Cleanup / Completion Notify
+- 修正 Instagram / Facebook 任務失敗、MISSING、BLOCKED、RETRY 後 post/ 暫存殘留問題。
+- Instagram 每筆任務開始前會清理上一筆殘留暫存；非 SUCCESS 結束時也會清理 post/。
+- GUI 批次下載完成後會跳出結果摘要視窗，顯示 SUCCESS / FAILED / BLOCKED / MISSING / RETRY / UNAVAILABLE 統計。
+- 完成視窗採非阻塞設計，不會卡住 Worker 或 GUI refresh。
+- build.bat 已更新 Playwright / requests / pycryptodome / keyring 套件與 Chromium 安裝步驟。
+
 --------------------------------
 一、需求環境
 --------------------------------
@@ -15,18 +22,15 @@ Media Batch Downloader 安裝與建置說明
 二、原始碼模式安裝
 --------------------------------
 
-進入 downloader_v5 資料夾後，安裝必要套件：
+進入 downloader_GUI 資料夾後，安裝必要套件：
 
 python -m pip install --upgrade pip
-python -m pip install instaloader opencc-python-reimplemented tkinterdnd2 pyinstaller
-python -m pip install -U yt-dlp instaloader playwright requests
-playwright install chromium
-python -m pip install -U pycryptodome
-python -m pip install -U keyring
+python -m pip install -U instaloader yt-dlp opencc-python-reimplemented tkinterdnd2 playwright requests pycryptodome keyring pyinstaller
+python -m playwright install chromium
 
 如果你只想執行、不需要拖放功能：
 tkinterdnd2 可以不裝
-但 GUI 拖放 txt 會失效
+但 GUI 拖放 txt 會失效。
 
 --------------------------------
 三、測試執行
@@ -58,6 +62,9 @@ python -m PyInstaller --noconfirm --onefile --noconsole ^
 --hidden-import=yt_dlp ^
 --hidden-import=opencc ^
 --hidden-import=tkinterdnd2 ^
+--hidden-import=playwright ^
+--hidden-import=requests ^
+--collect-all playwright ^
 --add-data "accounts.json;." ^
 --add-data "cookies.txt;." ^
 --add-data "data;data" ^
@@ -147,7 +154,7 @@ pre-processing\20260420.txt
 九、Facebook share 連結說明
 --------------------------------
 
-現在以下類型的 Facebook 連結也會視為可下載：
+以下類型的 Facebook 連結會視為可下載：
 - facebook.com/share/...
 - facebook.com/share/r/...
 - facebook.com/share/v/...
@@ -161,9 +168,9 @@ pre-processing\20260420.txt
 也就是說：
 
 https://www.facebook.com/share/1BJ5cEzosx/
+https://www.facebook.com/share/r/1BUMhWkqV3/
 
-這類連結現在會先進入 download_link.txt，
-再由 Facebook 下載器處理。
+這類連結會先進入 download_link.txt，再由 Facebook 下載器處理。
 
 --------------------------------
 十、已下載跳過 / 斷點續跑
@@ -177,7 +184,7 @@ data\processed_links.log
 
 若同一個連結之後再次加入任務：
 - 不會重複下載
-- 會直接略過
+- 會直接略過或顯示已在 processed_links.log 中
 
 這樣可以避免重跑大量清單時重複下載已完成內容。
 
@@ -208,6 +215,7 @@ data\unavailable_links.txt
 
 ▶ 繼續
 - 從暫停狀態繼續
+- 若先前按過停止，會嘗試喚醒 Worker 並恢復中斷任務
 
 ⏹ 停止
 - 停止整體下載流程
@@ -215,13 +223,72 @@ data\unavailable_links.txt
 - 會在目前任務安全收尾後停止
 
 --------------------------------
-十三、常見問題排除
+十三、post/ 暫存資料夾說明
+--------------------------------
+
+post/ 是 TEMP_DIR 暫存下載資料夾，不是正式輸出資料夾。
+
+正常流程：
+下載媒體 → 寫入 post/ → move_files() 搬到 downloads/ → 清空 post/
+
+v11.25 已加強：
+- 每筆 Instagram 任務開始前會清空上一筆殘留 post/
+- Instagram 任務若以 FAILED / BLOCKED / MISSING / RETRY 結束，會自動清空 post/
+- SUCCESS 由 move_files() 負責清理，避免誤刪已準備搬移的有效媒體
+
+若你手動看到 post/ 內有大量殘留檔，可以在關閉程式後刪除：
+
+rmdir /s /q post
+
+下次程式會自動重建。
+
+--------------------------------
+十四、下載完成通知
+--------------------------------
+
+批次任務完成後，GUI 會跳出一次摘要視窗，包含：
+- 總任務
+- SUCCESS
+- FAILED
+- BLOCKED
+- MISSING
+- RETRY
+- UNAVAILABLE
+- 耗時
+
+若有失敗或受限任務，視窗會提供「查看失敗」按鈕。
+
+--------------------------------
+十五、狀態定義
+--------------------------------
+
+SUCCESS
+- 已成功輸出有效媒體檔案
+
+MISSING
+- 貼文不存在、頁面已移除、連結失效
+
+BLOCKED
+- 需要登入、checkpoint、challenge、私人帳號或權限限制
+
+RETRY
+- 暫時性錯誤，例如 timeout、429、rate limit
+
+FAILED
+- 下載流程失敗，但不屬於以上分類
+
+UNAVAILABLE
+- 舊版不可用狀態，部分流程仍保留相容
+
+--------------------------------
+十六、常見問題排除
 --------------------------------
 
 1. build.bat 失敗
 可能原因：
 - Python 沒加到 PATH
 - pip 套件未安裝成功
+- Playwright Chromium 未安裝成功
 - 被防毒阻擋
 
 2. EXE 打開沒反應
@@ -236,21 +303,26 @@ python main.py
 - cookies.txt 是否有效
 - 該內容是否需要登入
 - 該內容是否有年齡 / 受眾限制
+- post/ 是否有舊版殘留，可先關閉程式後刪除 post/
 
 4. Facebook 無法下載
 先確認：
 - cookies.txt 是否有效
 - 該分享連結是否實際可在瀏覽器打開
 - 是否為受限制內容
+- 若是 Reel，確認是否被推薦影片 / 預載片段污染
 
 5. 顯示 BLOCKED
-代表平台限制，不一定是程式 bug
+代表平台限制，不一定是程式 bug。
 
-6. 2FA 驗證碼正確卻失敗
-這是 IG 驗證流程不穩定造成
-建議改用 cookies.txt
+6. 顯示 MISSING
+代表頁面不存在、貼文已移除、分享連結失效，通常不需要重試。
 
-7. 我已確認瀏覽器看得到，但程式抓不到
+7. 2FA 驗證碼正確卻失敗
+這是 IG 驗證流程不穩定造成。
+建議改用 cookies.txt。
+
+8. 我已確認瀏覽器看得到，但程式抓不到
 優先檢查：
 - cookies 是否最新
 - cookies 是否同一帳號
@@ -258,7 +330,7 @@ python main.py
 - 是否為程式用到的實際 cookie 狀態與瀏覽器不同
 
 --------------------------------
-十四、推薦日常使用方式
+十七、推薦日常使用方式
 --------------------------------
 
 開發 / 測試：

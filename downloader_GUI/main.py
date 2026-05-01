@@ -103,11 +103,12 @@ class App:
         self._tree_context_menu = None
 
         self._elapsed_start_ts = None
-        self._worker_stopped_by_user = False
+        self._completion_notified = False
+        self._last_completion_signature = ""
 
         self._build_ui()
         queue_manager.load_checkpoint()
-        self._safe_worker_start("startup")
+        worker.start()
 
         self.root.after(300, self._init_session)
         self.root.after(600, self._refresh_table)
@@ -646,26 +647,6 @@ class App:
             return
         self._copy_to_clipboard("\n".join(urls), f"已複製 {status} URL：{len(urls)} 筆")
 
-    def _safe_worker_start(self, reason: str = "") -> bool:
-        """安全啟動 / 重新喚醒 worker，避免 stop 後 resume 沒有 thread 繼續跑。"""
-        try:
-            worker.start()
-            return True
-        except RuntimeError as e:
-            logger.warning(f"worker.start 已在執行或不可重複啟動 ({reason}): {e}")
-            return False
-        except Exception as e:
-            logger.warning(f"worker.start 失敗 ({reason}): {e}")
-            return False
-
-    def _safe_worker_resume(self, reason: str = "") -> None:
-        """解除暫停並確保 worker 存活。"""
-        try:
-            worker.resume()
-        except Exception as e:
-            logger.warning(f"worker.resume 失敗 ({reason}): {e}")
-        self._safe_worker_start(reason or "resume")
-
     def _init_session(self):
         if os.path.exists(COOKIES_FILE):
             instagram.use_cookies(COOKIES_FILE)
@@ -825,9 +806,9 @@ class App:
         skipped_processed = int(result.get("skipped_processed", result.get("skipped", 0)) or 0)
         skipped_duplicate = int(result.get("skipped_duplicate", result.get("duplicated", 0)) or 0)
 
-        # stop 後重新貼連結 / 再按開始時，必須解除暫停並確保 worker thread 存活。
-        self._worker_stopped_by_user = False
-        self._safe_worker_resume("start_download")
+        # 新增任務代表新批次，允許完成後再次跳出摘要通知。
+        self._completion_notified = False
+        self._last_completion_signature = ""
 
         self.status_var.set(
             f"新增 {added} 筆  |  "
@@ -1001,62 +982,23 @@ class App:
         self.status_var.set(f"已開啟預處理 output：{PREPROCESS_OUTPUT_DIR}")
 
     def _pause_downloads(self):
-        try:
-            worker.pause()
-            self.status_var.set("已暫停下載")
-        except Exception as e:
-            logger.warning(f"pause 失敗: {e}")
-            self.status_var.set(f"暫停失敗：{e}")
+        worker.pause()
+        self.status_var.set("已暫停下載")
 
     def _resume_downloads(self):
-        # 使用者常見操作是「停止」後又按「繼續」。
-        # 此時舊 worker thread 可能已退出，所以 resume 之外還要 start。
-        try:
-            reset_count = queue_manager.reset_interrupted_downloads()
-        except AttributeError:
-            reset_count = 0
-        except Exception as e:
-            logger.warning(f"reset_interrupted_downloads 失敗: {e}")
-            reset_count = 0
-
-        self._worker_stopped_by_user = False
-        self._safe_worker_resume("resume_button")
-
-        if reset_count > 0:
-            self.status_var.set(f"已繼續下載，已恢復中斷任務 {reset_count} 筆")
-        else:
-            self.status_var.set("已繼續下載")
-
-        self._schedule_refresh(0)
+        worker.resume()
+        self.status_var.set("已繼續下載")
 
     def _stop_downloads(self):
         if not messagebox.askyesno("確認停止", "停止下載？\n正在下載中的這一筆會先安全收尾。", parent=self.root):
             return
-
-        self._worker_stopped_by_user = True
-
-        try:
-            worker.stop()
-        except Exception as e:
-            logger.warning(f"stop 失敗: {e}")
-            self.status_var.set(f"停止失敗：{e}")
-            return
-
-        # 若 worker 在 DOWNLOADING 狀態中被停止，避免下一次按「繼續」時表格永遠卡在 DOWNLOADING。
-        try:
-            queue_manager.mark_stop_requested()
-        except AttributeError:
-            pass
-        except Exception as e:
-            logger.warning(f"mark_stop_requested 失敗: {e}")
-
-        self.status_var.set("停止中，等待目前任務安全收尾；若要繼續，請按 ▶ 繼續重新喚醒 worker。")
-        self._schedule_refresh(0)
+        worker.stop()
+        self.status_var.set("停止中，等待目前任務安全收尾...")
 
     def _retry_failed(self):
         queue_manager.retry_failed()
-        self._worker_stopped_by_user = False
-        self._safe_worker_resume("retry_failed")
+        self._completion_notified = False
+        self._last_completion_signature = ""
         self.status_var.set("已重置失敗任務，重新下載中...")
         self._schedule_refresh(0)
 
@@ -1067,6 +1009,8 @@ class App:
         queue_manager.clear_tasks()
         self._blocked_warned = False
         self._elapsed_start_ts = None
+        self._completion_notified = False
+        self._last_completion_signature = ""
         self._schedule_refresh(0)
         self.status_var.set("任務已清空，日誌已儲存至 data/")
 
@@ -1247,6 +1191,142 @@ class App:
             self._refresh_id = None
         self._refresh_id = self.root.after(delay, self._refresh_table)
 
+    def _maybe_show_completion_popup(self, snapshot: list[dict], runtime: dict, counts: dict, elapsed: float):
+        """批次完成後跳出一次非阻塞摘要視窗。"""
+        total = len(snapshot)
+        if total <= 0:
+            self._completion_notified = False
+            self._last_completion_signature = ""
+            return
+
+        active_count = counts.get("PENDING", 0) + counts.get("DOWNLOADING", 0)
+        phase = runtime.get("phase", "IDLE")
+
+        # 冷卻中代表 worker 還在跑下一筆，不視為完成。
+        if active_count > 0 or phase in {"DOWNLOADING", "COOLDOWN", "PAUSED"}:
+            return
+
+        signature_parts = [str(total)]
+        for status in ("SUCCESS", "FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE"):
+            signature_parts.append(f"{status}:{counts.get(status, 0)}")
+        signature = "|".join(signature_parts)
+
+        if self._completion_notified and self._last_completion_signature == signature:
+            return
+
+        self._completion_notified = True
+        self._last_completion_signature = signature
+        self.root.after(120, lambda: self._show_completion_popup(total, counts, elapsed))
+
+    def _show_completion_popup(self, total: int, counts: dict, elapsed: float):
+        """顯示下載結果摘要。採非 modal 設計，避免阻塞 GUI refresh / worker。"""
+        if not self.root.winfo_exists():
+            return
+
+        success = counts.get("SUCCESS", 0)
+        failed = counts.get("FAILED", 0)
+        blocked = counts.get("BLOCKED", 0)
+        missing = counts.get("MISSING", 0)
+        retry = counts.get("RETRY", 0)
+        unavailable = counts.get("UNAVAILABLE", 0)
+        problem_total = failed + blocked + missing + retry + unavailable
+
+        title = "下載完成" if problem_total == 0 else "下載完成，部分任務需檢查"
+        icon = "✅" if problem_total == 0 else "⚠️"
+        title_color = "#2E7D32" if problem_total == 0 else "#E65100"
+
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("460x360")
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        try:
+            win.attributes("-topmost", True)
+            win.after(1200, lambda: win.attributes("-topmost", False) if win.winfo_exists() else None)
+        except Exception:
+            pass
+
+        frame = tk.Frame(win, padx=20, pady=18)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            frame,
+            text=f"{icon} {title}",
+            font=("Microsoft JhengHei UI", 18, "bold"),
+            fg=title_color,
+        ).pack(anchor="w", pady=(0, 12))
+
+        rows = [
+            ("總任務", total),
+            ("成功", success),
+            ("失敗", failed),
+            ("封鎖", blocked),
+            ("Missing", missing),
+            ("待重試", retry),
+            ("不可用", unavailable),
+            ("耗時", _format_seconds(elapsed)),
+        ]
+
+        grid = tk.Frame(frame)
+        grid.pack(fill=tk.X, pady=(0, 12))
+        for r, (k, v) in enumerate(rows):
+            tk.Label(grid, text=f"{k}：", font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").grid(row=r, column=0, sticky="w", pady=2)
+            tk.Label(grid, text=str(v), font=("Microsoft JhengHei UI", 11), anchor="w").grid(row=r, column=1, sticky="w", pady=2)
+
+        hint = "全部任務已成功完成。" if problem_total == 0 else "可點擊「查看失敗」檢查 FAILED / BLOCKED / MISSING / RETRY 清單。"
+        tk.Label(
+            frame,
+            text=hint,
+            font=("Microsoft JhengHei UI", 10),
+            fg="#555555",
+            wraplength=410,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 12))
+
+        btn_row = tk.Frame(frame)
+        btn_row.pack(fill=tk.X, pady=(4, 0))
+
+        tk.Button(
+            btn_row,
+            text="📁 開啟下載資料夾",
+            command=lambda: self._open_path(DOWNLOAD_DIR),
+            bg="#1976D2",
+            fg="white",
+            padx=12,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        if problem_total:
+            tk.Button(
+                btn_row,
+                text="📄 查看失敗",
+                command=self._show_failed_links_window,
+                bg="#6D4C41",
+                fg="white",
+                padx=12,
+                pady=6,
+                relief=tk.FLAT,
+                cursor="hand2",
+            ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Button(
+            btn_row,
+            text="關閉",
+            command=win.destroy,
+            padx=14,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.RIGHT)
+
+        win.update_idletasks()
+        x = self.root.winfo_x() + max(0, (self.root.winfo_width() - win.winfo_width()) // 2)
+        y = self.root.winfo_y() + max(0, (self.root.winfo_height() - win.winfo_height()) // 2)
+        win.geometry(f"+{x}+{y}")
+
     def _refresh_table(self):
         self._refresh_id = None
         snapshot = queue_manager.get_snapshot()
@@ -1321,6 +1401,8 @@ class App:
         for s in ("DOWNLOADING", "PENDING", "SUCCESS", "FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE"):
             if counts.get(s, 0):
                 parts.append(f"{s}: {counts[s]}")
+
+        self._maybe_show_completion_popup(snapshot, runtime, counts, elapsed)
 
         blocked_n = counts.get("BLOCKED", 0)
         if blocked_n > 0 and not self._blocked_warned:
@@ -1397,10 +1479,7 @@ def main():
 
 
 def _on_close(root: tk.Tk):
-    try:
-        worker.stop()
-    except Exception:
-        pass
+    worker.stop()
     queue_manager.write_logs()
     root.destroy()
 

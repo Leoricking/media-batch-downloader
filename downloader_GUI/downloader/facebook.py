@@ -77,6 +77,80 @@ def clear_temp():
     os.makedirs(TEMP_DIR, exist_ok=True)
 
 
+def _clear_temp_after_terminal_failure(status: str, reason: str = ""):
+    """Clean temporary Facebook post/ residue after terminal non-success results.
+
+    SUCCESS is intentionally excluded because move_files() owns cleanup after a
+    valid move. This prevents failed / blocked / unavailable / retry tasks from
+    leaving cap_*.jpg / cap_*.mp4 files in TEMP_DIR and polluting later tasks.
+    """
+    if (status or "").upper() == "SUCCESS":
+        return
+
+    try:
+        leftovers = _list_media_files(TEMP_DIR)
+    except Exception:
+        leftovers = []
+
+    if leftovers:
+        logger.info(
+            f"FB 清理暫存 post/：status={status}, leftover={len(leftovers)}, "
+            f"reason={reason or 'n/a'}"
+        )
+
+    clear_temp()
+
+
+def _is_fb_reel_url(url: str) -> bool:
+    """Detect Facebook Reel / short-video share URLs without affecting normal /share/ photo posts."""
+    low = (url or "").lower()
+    return any(x in low for x in [
+        "/share/r/",
+        "/reel/",
+        "/reels/",
+        "/watch/reel/",
+        "fb.watch/",
+    ])
+
+
+def _extract_fb_reel_or_share_id(url: str) -> str:
+    """Extract a stable ID for fallback names such as Facebook_Reel_186iijKiQf."""
+    u = html.unescape(unquote(str(url or "")))
+    patterns = [
+        r"/share/r/([^/?#&]+)",
+        r"/share/v/([^/?#&]+)",
+        r"/reels?/([^/?#&]+)",
+        r"/watch/reel/([^/?#&]+)",
+        r"[?&]v=([0-9A-Za-z_-]+)",
+        r"/videos/([0-9A-Za-z_-]+)",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, u, flags=re.I)
+        if m:
+            return safe_title(m.group(1))[:48]
+
+    try:
+        parsed = urlparse(u)
+        base = os.path.basename(parsed.path.strip("/"))
+        if base and base.lower() not in {"r", "v", "share", "reel", "reels", "watch"}:
+            return safe_title(base)[:48]
+    except Exception:
+        pass
+
+    return ""
+
+
+def _fb_reel_fallback_title(url: str) -> str:
+    rid = _extract_fb_reel_or_share_id(url)
+    return f"Facebook_Reel_{rid}" if rid else "Facebook_Reel"
+
+
+def _is_fallback_fb_title(title: str) -> bool:
+    clean = _clean_fb_post_title_for_path(title or "", fallback="Facebook_Post")
+    return clean in {"Facebook_Post", "Facebook", "Facebook_Video", "Facebook_Watch"}
+
+
 def _find_ffmpeg():
     candidates = [
         os.path.join(os.getcwd(), "ffmpeg.exe"),
@@ -3958,6 +4032,79 @@ def _collect_fb_media_playwright(url: str):
 
             title = _clean_fb_post_title_for_path(_get_fb_title(page), fallback="Facebook_Post")
 
+            # Reel / share/r/ is a single-video route. Do not send it through the
+            # photo-gallery viewer pipeline; Facebook may preload many unrelated Reel
+            # videos and thumbnails, and the gallery path can incorrectly move the
+            # cover image as Facebook_Post.jpg. This branch only accepts a valid
+            # video candidate; if no video is captured, it returns RETRY instead of
+            # finalizing a .jpg.
+            if _is_fb_reel_url(url) or _is_fb_reel_url(resolved) or _is_fb_reel_url(page.url):
+                reel_title = title
+                if _is_fallback_fb_title(reel_title):
+                    reel_title = _fb_reel_fallback_title(resolved or url)
+
+                try:
+                    try:
+                        page.mouse.click(960, 600)
+                    except Exception:
+                        pass
+
+                    page.wait_for_timeout(2500)
+
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=6000)
+                    except Exception:
+                        pass
+
+                    reel_candidates = _collect_current_page_candidates(
+                        page,
+                        network_items=network_items,
+                        include_network=True,
+                        include_meta=True,
+                        include_html=True,
+                    )
+
+                    video_candidates = []
+                    for cand in reel_candidates:
+                        src = cand.get("src") or ""
+                        if cand.get("type") == "video" or _is_probably_video_url(src) or any(
+                            x in src.lower() for x in [".mp4", ".m4v", ".mov"]
+                        ):
+                            c2 = dict(cand)
+                            c2["type"] = "video"
+                            c2["score"] = int(c2.get("score") or 0) + 3000000
+                            video_candidates.append(c2)
+
+                    video_candidates = _dedupe_ordered(video_candidates)
+                    logger.info(
+                        f"FB Reel video candidate count={len(video_candidates)} "
+                        f"from total={len(reel_candidates)}"
+                    )
+
+                    if not video_candidates:
+                        clear_temp()
+                        return "RETRY", "Facebook Reel 未擷取到有效影片候選，避免誤存封面圖為 jpg"
+
+                    final_dst, size = _download_best_candidate(
+                        context,
+                        video_candidates,
+                        os.path.join(TEMP_DIR, "fb_0001"),
+                        referer=resolved,
+                    )
+                    logger.info(
+                        f"FB Reel 主影片已下載: {os.path.basename(final_dst)} "
+                        f"({size // 1024} KB)"
+                    )
+
+                    if move_files(reel_title):
+                        return "SUCCESS", ""
+
+                    return "FAILED", "Facebook Reel 影片已下載，但搬移檔案失敗"
+
+                except Exception as e:
+                    clear_temp()
+                    return _classify_error(f"Facebook Reel 影片下載失敗: {e}")
+
             # 第一階段：先從原貼文收集 photo links / grid items，這裡最接近畫面順序
             grid_before = _collect_fb_grid_items(page)
             links_before = _collect_fb_photo_links(page)
@@ -4394,10 +4541,15 @@ def _download_via_ytdlp(url: str):
                         download=True,
                     )
 
+                    fallback_title = (
+                        _fb_reel_fallback_title(resolved)
+                        if (_is_fb_reel_url(url) or _is_fb_reel_url(resolved))
+                        else "Facebook_Post"
+                    )
                     title = (
                         info.get("description")
                         or info.get("title")
-                        or "Facebook_Post"
+                        or fallback_title
                     )
 
                 if move_files(title):
@@ -4426,17 +4578,22 @@ def download(url: str):
         # - If Playwright says RETRY/BLOCKED/UNAVAILABLE, return that status directly.
         # - Do NOT fall back to yt-dlp after an incomplete gallery RETRY, because that can
         #   incorrectly download an unrelated/sibling .mp4 and mark the photo task SUCCESS.
-        force_playwright_first = any(x in original_low for x in [
-            "/share/",
-            "/posts/",
-            "/photo",
-            "/photos/",
-            "story_fbid=",
-            "fbid=",
-            "/permalink/",
-        ])
+        is_reel_like_url = _is_fb_reel_url(original_low) or _is_fb_reel_url(resolved_low)
 
-        explicit_video_url = any(x in original_low or x in resolved_low for x in [
+        force_playwright_first = (
+            any(x in original_low for x in [
+                "/share/",
+                "/posts/",
+                "/photo",
+                "/photos/",
+                "story_fbid=",
+                "fbid=",
+                "/permalink/",
+            ])
+            and not is_reel_like_url
+        )
+
+        explicit_video_url = is_reel_like_url or any(x in original_low or x in resolved_low for x in [
             "/watch",
             "/videos/",
             "video.php",
@@ -4518,4 +4675,8 @@ def download(url: str):
         clear_temp()
         return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
 
-    return result_box[0] or ("FAILED", "未知錯誤")
+    result = result_box[0] or ("FAILED", "未知錯誤")
+    status, reason = result
+    if status != "SUCCESS":
+        _clear_temp_after_terminal_failure(status, reason)
+    return result
