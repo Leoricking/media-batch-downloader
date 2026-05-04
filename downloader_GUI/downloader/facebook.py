@@ -698,6 +698,134 @@ def _cleanup_fb_debug_capture() -> None:
         logger.warning(f"FB debug capture cleanup failed: {e}")
 
 
+
+
+def _image_file_dimensions(path: str) -> tuple[int, int]:
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            return int(img.width or 0), int(img.height or 0)
+    except Exception:
+        return 0, 0
+
+
+def _image_average_hash(path: str, hash_size: int = 16) -> tuple[int | None, int, int]:
+    """
+    v11.33 Visual Duplicate Audit:
+    Return a lightweight perceptual hash for image similarity reporting.
+
+    This is intentionally audit-only.  It never deletes files and never changes
+    the strict Facebook completeness guard.  Facebook posts can legitimately
+    contain adjacent animation frames or intentionally repeated images, so
+    visual duplicates are reported for human review instead of being removed.
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            width, height = int(img.width or 0), int(img.height or 0)
+            img = img.convert("L").resize((hash_size, hash_size))
+            pixels = list(img.getdata())
+        if not pixels:
+            return None, width, height
+        avg = sum(pixels) / len(pixels)
+        bits = 0
+        for px in pixels:
+            bits = (bits << 1) | (1 if px >= avg else 0)
+        return bits, width, height
+    except Exception:
+        return None, 0, 0
+
+
+def _hamming_distance_int(a: int, b: int) -> int:
+    try:
+        return int((int(a) ^ int(b)).bit_count())
+    except Exception:
+        return 10**9
+
+
+def _write_visual_duplicate_report(folder: str, image_paths: list[str]) -> None:
+    """
+    v11.33 Visual Duplicate Audit.
+
+    Generate a report for visually similar outputs such as adjacent animation
+    frames or same-looking images saved at different resolutions.  This does not
+    delete or rename anything.  The downloader still preserves all 103/103 files
+    when Facebook says the target is 103.
+    """
+    try:
+        if not folder or not os.path.isdir(folder):
+            return
+
+        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+        paths = [
+            p for p in (image_paths or [])
+            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in image_exts
+        ]
+        if len(paths) < 2:
+            return
+
+        records = []
+        for path in sorted(paths, key=_natural_key):
+            ahash, width, height = _image_average_hash(path, hash_size=16)
+            if ahash is None:
+                continue
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                size = 0
+            records.append({
+                "path": path,
+                "name": os.path.basename(path),
+                "hash": ahash,
+                "width": width,
+                "height": height,
+                "size": size,
+            })
+
+        if len(records) < 2:
+            return
+
+        suspects = []
+        # 16x16 average hash has 256 bits.  <= 10 is intentionally conservative:
+        # it catches near-identical/resized images while avoiding most normal
+        # sequential animation frames.
+        threshold = 10
+        for i in range(len(records)):
+            a = records[i]
+            for j in range(i + 1, len(records)):
+                b = records[j]
+                dist = _hamming_distance_int(a["hash"], b["hash"])
+                if dist <= threshold:
+                    suspects.append((dist, a, b))
+
+        report_path = os.path.join(folder, "_visual_duplicate_report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("Facebook visual duplicate audit report\n")
+            f.write("======================================\n\n")
+            f.write("This report is audit-only. No files were deleted or renamed.\n")
+            f.write("The downloader preserves the full Facebook target count; visually similar\n")
+            f.write("images may be intentional adjacent frames from the original post.\n\n")
+            f.write(f"Scanned images: {len(records)}\n")
+            f.write(f"Similarity threshold: average-hash Hamming distance <= {threshold}\n")
+            f.write(f"Suspected visual duplicate pairs: {len(suspects)}\n\n")
+
+            if not suspects:
+                f.write("No suspected visual duplicates found.\n")
+            else:
+                for idx, (dist, a, b) in enumerate(sorted(suspects, key=lambda x: (x[0], x[1]["name"], x[2]["name"])), 1):
+                    f.write(f"[{idx}] distance={dist}\n")
+                    f.write(f"  A: {a['name']} | {a['width']}x{a['height']} | {a['size']} bytes\n")
+                    f.write(f"  B: {b['name']} | {b['width']}x{b['height']} | {b['size']} bytes\n\n")
+
+        if suspects:
+            logger.info(
+                f"FB visual duplicate audit: suspected={len(suspects)} report={os.path.basename(report_path)}"
+            )
+        else:
+            logger.info("FB visual duplicate audit: no suspected visual duplicates")
+    except Exception as e:
+        logger.warning(f"FB visual duplicate audit failed: {e}")
+
 def move_files(title: str) -> bool:
     """
     Move validated Facebook temp outputs into DOWNLOAD_DIR.
@@ -744,6 +872,7 @@ def move_files(title: str) -> bool:
         files = image_files
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    moved_paths: list[str] = []
 
     if len(files) == 1:
         src = files[0]
@@ -756,6 +885,7 @@ def move_files(title: str) -> bool:
             os.remove(dst)
 
         shutil.move(src, dst)
+        moved_paths.append(dst)
         logger.info(f"FB 單檔完成: {os.path.basename(dst)}")
 
     else:
@@ -780,7 +910,9 @@ def move_files(title: str) -> bool:
                 os.remove(dst)
 
             shutil.move(src, dst)
+            moved_paths.append(dst)
 
+        _write_visual_duplicate_report(folder, moved_paths)
         logger.info(f"FB 多檔完成: {name}/ ({len(files)} 個)")
 
     _cleanup_fb_debug_capture()
@@ -3108,6 +3240,12 @@ def _collect_viewer_sequence_intercept(
     first_key = ""
     stale = 0
     network_bucket: list[dict] = []
+    # v11.32 Speed-Safe:
+    # Reduce duplicate response writes/log spam in long large-album runs.
+    # Do not use this as a success condition; final strict completeness guard remains unchanged.
+    response_seen_src_keys: set[str] = set()
+    response_seen_body_hashes: set[str] = set()
+    response_best_media_size: dict[str, int] = {}
 
     try:
         large_album_mode = int(target_count or 0) >= 80
@@ -3133,6 +3271,14 @@ def _collect_viewer_sequence_intercept(
             if _is_bad_fb_media_url(low) or _is_probable_fb_thumbnail_url(low):
                 return
 
+            # v11.32: Skip exact repeated CDN responses before reading the body.
+            # Facebook often replays the same already-loaded image during viewer recovery;
+            # writing/logging those duplicates was a major cost in 100+ photo albums.
+            src_key = _media_key_from_src(u) or u.split("?")[0]
+            media_id = _fb_media_numeric_id_str_from_src(u)
+            if src_key and src_key in response_seen_src_keys:
+                return
+
             ctype = ""
             clen = 0
             try:
@@ -3146,6 +3292,16 @@ def _collect_viewer_sequence_intercept(
             if 0 < clen < _MIN_FILE_SIZE:
                 logger.debug(f"FB ignore tiny image response: {clen} bytes | {u[:100]}")
                 return
+
+            # v11.32: If the same stable media id was already captured with an equal
+            # or larger declared size, skip this repeated response.  Header-less
+            # responses still pass through because they may be the only usable body.
+            if media_id and clen > 0:
+                best_seen = int(response_best_media_size.get(media_id, 0) or 0)
+                if best_seen and clen <= best_seen:
+                    if src_key:
+                        response_seen_src_keys.add(src_key)
+                    return
 
             # 明確圖片 response 才大幅加權；content-length 太小不直接丟，避免 header 缺失，
             # 但降低權重，最後仍會由實際下載大小決定。
@@ -3170,6 +3326,11 @@ def _collect_viewer_sequence_intercept(
                     capture_dir = os.path.join(TEMP_DIR, "_fb_capture")
                     os.makedirs(capture_dir, exist_ok=True)
                     h = hashlib.md5(body).hexdigest()[:16]
+                    if h in response_seen_body_hashes:
+                        if src_key:
+                            response_seen_src_keys.add(src_key)
+                        return
+                    response_seen_body_hashes.add(h)
                     ext = _ext_from_url(u, ".jpg")
                     persisted_path = os.path.join(capture_dir, f"cap_{h}{ext}")
                     if not os.path.exists(persisted_path) or os.path.getsize(persisted_path) < body_size:
@@ -3181,12 +3342,28 @@ def _collect_viewer_sequence_intercept(
                             except Exception:
                                 pass
                     score += min(body_size, 1200000)
+                    if media_id:
+                        response_best_media_size[media_id] = max(
+                            int(response_best_media_size.get(media_id, 0) or 0),
+                            body_size,
+                            clen,
+                        )
+                    if src_key:
+                        response_seen_src_keys.add(src_key)
                     logger.info(
                         f"FB response 實體落盤: {os.path.basename(persisted_path)} "
                         f"({body_size // 1024} KB)"
                     )
             except Exception:
                 pass
+
+            if src_key:
+                response_seen_src_keys.add(src_key)
+            if media_id and clen > 0:
+                response_best_media_size[media_id] = max(
+                    int(response_best_media_size.get(media_id, 0) or 0),
+                    clen,
+                )
 
             network_bucket.append({
                 "type": _media_type_from_url(u),
@@ -3398,7 +3575,7 @@ def _collect_viewer_sequence_intercept(
         # v11.30 的 hard_stale_stop=32 仍會過早停止；此處只放寬大型相簿，
         # 小相簿維持原本 strict 行為，避免 15/16 被誤判成功。
         max_turns = max(max_turns, int(target_count or 0) * 6, 640)
-        hard_stale_stop = max(96, int(stale_threshold) + 72)
+        hard_stale_stop = max(48, int(stale_threshold) + 30)
     else:
         hard_stale_stop = max(5, int(stale_threshold) + 2)
 
@@ -3490,6 +3667,23 @@ def _collect_viewer_sequence_intercept(
         else:
             if len(network_bucket) > 60:
                 del network_bucket[:30]
+
+        # v11.32: If a large album is clearly replaying cached frames for a long
+        # plateau, stop this viewer earlier and let final-sweep / segmented rescue
+        # handle the remaining holes.  This keeps the strict final guard while
+        # avoiding hours of repeated ArrowRight recovery loops.
+        if (
+            large_album_mode
+            and target_count
+            and len(collected) < int(target_count)
+            and len(collected) >= max(40, int(target_count) // 2)
+            and stale >= 24
+        ):
+            logger.info(
+                f"FB v11.32 large album plateau shift: collected={len(collected)}/"
+                f"{target_count}, stale={stale}, turn={turn}; enter final-sweep/rescue"
+            )
+            break
 
         # 如果已經很久沒有新圖，停止這個 viewer 起點；其他起點還會繼續補。
         if stale >= hard_stale_stop:
