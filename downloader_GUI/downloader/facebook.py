@@ -1315,6 +1315,45 @@ def _pack_media_cluster_key(pack: dict) -> str:
 
 
 
+def _media_cluster_family_from_key(cluster_key: str) -> str:
+    """Return a relaxed CDN family key for very large FB albums.
+
+    Large Facebook albums can legitimately advance through sibling CDN cluster
+    keys such as 26678053 -> 26678054 -> 26678055 while staying inside the
+    same +N / set=pcb post.  Small albums still use the exact cluster gate;
+    only large-album mode passes this relaxed family key into the collector.
+    """
+    key = str(cluster_key or "")
+    return key[:6] if len(key) >= 6 else ""
+
+
+def _media_cluster_family_from_src(src: str) -> str:
+    return _media_cluster_family_from_key(_media_cluster_key_from_src(src))
+
+
+def _is_large_fb_album_target(expected_photo_count: int | None, plus_count: int = 0) -> bool:
+    """Return True only for high-confidence large FB photo albums.
+
+    Keep the condition intentionally narrow so the relaxed cluster-family logic
+    and resilient stale/recovery settings do not affect normal 5/16-photo
+    galleries or Facebook Reel/video routing.
+    """
+    try:
+        expected = int(expected_photo_count or 0)
+    except Exception:
+        expected = 0
+    try:
+        plus_n = int(plus_count or 0)
+    except Exception:
+        plus_n = 0
+
+    # +99 with expected=103 is the intended path.  The plus overlay guard keeps
+    # random high expected values from enabling large-album behavior by accident.
+    return expected >= 80 and plus_n >= 50
+
+
+
+
 def _fb_media_numeric_id_from_src(src: str) -> int:
     """
     v11.16 Manifest-like ordering:
@@ -1404,6 +1443,7 @@ def _filter_items_by_media_cluster_or_manifest(
     packs: list[dict],
     cluster_key: str,
     manifest_ids: list[str] | None = None,
+    cluster_family: str | None = None,
 ) -> list[dict]:
     """
     v11.17 Manifest Whitelist:
@@ -1424,11 +1464,13 @@ def _filter_items_by_media_cluster_or_manifest(
             continue
 
         key = _media_cluster_key_from_src(src)
+        family = _media_cluster_family_from_key(key)
         in_cluster = bool(cluster_key and key == cluster_key)
+        in_family = bool(cluster_family and family == cluster_family)
         in_manifest = _pack_has_manifest_id(pack, manifest_set)
 
-        if cluster_key or manifest_set:
-            if not (in_cluster or in_manifest):
+        if cluster_key or manifest_set or cluster_family:
+            if not (in_cluster or in_family or in_manifest):
                 continue
 
         clean_candidates = []
@@ -1438,7 +1480,8 @@ def _filter_items_by_media_cluster_or_manifest(
                 continue
             ckey = _media_cluster_key_from_src(csrc)
             cmid = _fb_media_numeric_id_str_from_src(csrc)
-            if (cluster_key and ckey == cluster_key) or (manifest_set and cmid in manifest_set) or (not cluster_key and not manifest_set):
+            cfamily = _media_cluster_family_from_key(ckey)
+            if (cluster_key and ckey == cluster_key) or (cluster_family and cfamily == cluster_family) or (manifest_set and cmid in manifest_set) or (not cluster_key and not manifest_set and not cluster_family):
                 clean_candidates.append(cand)
 
         if not clean_candidates and src:
@@ -2957,7 +3000,94 @@ def _force_viewer_next(page, attempt: int) -> None:
     except Exception:
         pass
 
-def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None) -> list[dict]:
+
+
+def _recover_large_album_viewer(page, *, stale: int = 0, turn: int = 0, label: str = "viewer") -> None:
+    """
+    v11.30 Large Album Recovery Helper.
+
+    Large Facebook albums can temporarily loop back to cached frames around the
+    middle of the viewer.  This helper is intentionally conservative and only
+    performs navigation/focus nudges; it never marks a task as complete and never
+    relaxes the final strict completeness guard.
+    """
+    try:
+        logger.info(
+            f"FB v11.30 large-album recovery: label={label}, stale={stale}, turn={turn}"
+        )
+    except Exception:
+        pass
+
+    try:
+        _focus_viewer(page)
+    except Exception:
+        pass
+
+    # 1) Keyboard / JS burst: useful when the visible Next control is hidden but
+    # the theater viewer still owns keyboard navigation.
+    try:
+        burst = 2
+        if int(stale or 0) >= 2:
+            burst = 3
+        if int(stale or 0) >= 4:
+            burst = 5
+        for i in range(burst):
+            try:
+                page.keyboard.press("ArrowRight")
+            except Exception:
+                pass
+            try:
+                _dispatch_arrow_right_js(page)
+            except Exception:
+                pass
+            _fb_jitter_wait(page, 260 + i * 80, 180)
+    except Exception:
+        pass
+
+    # 2) DOM/physical next fallback.  This reuses existing safe viewer geometry
+    # helpers and avoids clicking the comment column as much as possible.
+    try:
+        _physical_drive_next(page, reason=f"large-recovery-stale{stale}-turn{turn}-primary")
+    except Exception:
+        pass
+
+    # 3) PageDown can wake Facebook lazy-loading when the viewer/listener is
+    # stuck on a preloaded cache batch.  End is delayed until later/staler turns
+    # because it is more aggressive.
+    try:
+        page.keyboard.press("PageDown")
+        _fb_jitter_wait(page, 520, 360)
+    except Exception:
+        pass
+
+    if int(stale or 0) >= 3 or int(turn or 0) >= 60:
+        try:
+            page.keyboard.press("End")
+            _fb_jitter_wait(page, 650, 420)
+            page.keyboard.press("ArrowRight")
+            _dispatch_arrow_right_js(page)
+            _fb_jitter_wait(page, 750, 450)
+        except Exception:
+            pass
+
+    # 4) Final focus restore so harvest_once() sees the main theater image rather
+    # than comments/recommendations.  Exceptions must not escape; otherwise the
+    # collected viewer sequence would be discarded by the caller.
+    try:
+        _focus_viewer(page)
+    except Exception:
+        pass
+
+def _collect_viewer_sequence_intercept(
+    page,
+    *,
+    label: str = "viewer",
+    target_count: int | None = None,
+    stale_threshold: int = 3,
+    max_turns: int | None = None,
+    allowed_cluster: str | None = None,
+    allowed_cluster_family: str | None = None,
+) -> list[dict]:
     """
     v11：Viewer 物理翻頁 + response 快速收割模式。
 
@@ -2971,9 +3101,27 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
     """
     collected: list[dict] = []
     seen_keys: set[str] = set()
+    # v11.29: Track stable FB CDN media IDs at the viewer-intercept scope.
+    # This set must exist before harvest_once() is called; otherwise large-album
+    # mode crashes during high-res warmup with NameError and falls back to 5/103.
+    seen_media_ids: set[str] = set()
     first_key = ""
     stale = 0
     network_bucket: list[dict] = []
+
+    try:
+        large_album_mode = int(target_count or 0) >= 80
+    except Exception:
+        large_album_mode = False
+
+    # Large albums may advance through sibling CDN cluster keys such as
+    # 26678053 -> 26678054 -> 26678055.  Keep exact cluster gate for small
+    # albums, but let large albums accept the same relaxed family.
+    if large_album_mode and allowed_cluster and not allowed_cluster_family:
+        allowed_cluster_family = _media_cluster_family_from_key(allowed_cluster)
+
+    if large_album_mode:
+        stale_threshold = max(int(stale_threshold or 0), 18)
 
     def on_response(resp):
         try:
@@ -3151,11 +3299,20 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
         # 往後找第一個未收過的真圖。
         chosen = None
         chosen_key = ""
-        for cand in candidates[:10]:
-            key = _media_key_from_src(cand.get("src", ""))
-            if key and key not in seen_keys:
+        chosen_media_id = ""
+        for cand in candidates[:16]:
+            src = cand.get("src", "")
+            key = _media_key_from_src(src)
+            mid = _fb_media_numeric_id_str_from_src(src)
+
+            # v11.28: use stable FB CDN media id when available.
+            # The same visual photo may appear with different oh= tokens; raw key
+            # alone can over-count or re-enter duplicate frames in large albums.
+            stable_key = mid or key
+            if stable_key and stable_key not in seen_media_ids and key not in seen_keys:
                 chosen = cand
                 chosen_key = key
+                chosen_media_id = mid
                 break
 
         if not chosen or not chosen_key:
@@ -3163,27 +3320,41 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
 
         # v11.15: Do not count off-post recommendation/media as harvested.
         # This prevents polluted media from satisfying target_count and ending the main viewer early.
-        if allowed_cluster:
+        if allowed_cluster or allowed_cluster_family:
             chosen_cluster = _media_cluster_key_from_src(chosen.get("src", ""))
-            if chosen_cluster and chosen_cluster != allowed_cluster:
+            chosen_family = _media_cluster_family_from_key(chosen_cluster)
+            exact_cluster_ok = bool(allowed_cluster and chosen_cluster == allowed_cluster)
+            relaxed_family_ok = bool(allowed_cluster_family and chosen_family == allowed_cluster_family)
+            if chosen_cluster and not (exact_cluster_ok or relaxed_family_ok):
                 logger.info(
                     f"FB viewer-intercept {label} 跳過異質 cluster: "
-                    f"{chosen_cluster} != {allowed_cluster} | "
+                    f"{chosen_cluster} != {allowed_cluster or allowed_cluster_family} | "
                     f"{os.path.basename(urlparse(chosen.get('src', '').split('?')[0]).path)}"
                 )
                 seen_keys.add(chosen_key)
+                if chosen_media_id:
+                    seen_media_ids.add(chosen_media_id)
                 return False
+            if chosen_cluster and relaxed_family_ok and not exact_cluster_ok:
+                logger.info(
+                    f"FB viewer-intercept {label} large-album 接受同族 cluster: "
+                    f"{chosen_cluster} family={allowed_cluster_family}"
+                )
 
         # v11.15: Post photo mode should not accept videos as completing image targets.
-        if allowed_cluster and (chosen.get("type") == "video" or _is_probably_video_url(chosen.get("src", ""))):
+        if (allowed_cluster or allowed_cluster_family) and (chosen.get("type") == "video" or _is_probably_video_url(chosen.get("src", ""))):
             logger.info(f"FB viewer-intercept {label} 跳過影片候選，不計入照片目標: {chosen.get('src','')[:120]}")
             seen_keys.add(chosen_key)
+            if chosen_media_id:
+                seen_media_ids.add(chosen_media_id)
             return False
 
         if not first_key:
             first_key = chosen_key
 
         seen_keys.add(chosen_key)
+        if chosen_media_id:
+            seen_media_ids.add(chosen_media_id)
 
         # v11.5：一旦判定收集成功，立即實體化，避免「Log collected 但最後沒圖」。
         _force_persist_harvest_candidate(chosen, reason=reason, order_no=len(collected) + 1)
@@ -3222,7 +3393,14 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
             break
 
     max_turns = int(max_turns or _MAX_FB_ITEMS)
-    hard_stale_stop = max(5, int(stale_threshold) + 2)
+    if large_album_mode:
+        # v11.31: 100+ 張大型相簿常在 70~80 張附近進入長時間 lazy-load plateau。
+        # v11.30 的 hard_stale_stop=32 仍會過早停止；此處只放寬大型相簿，
+        # 小相簿維持原本 strict 行為，避免 15/16 被誤判成功。
+        max_turns = max(max_turns, int(target_count or 0) * 6, 640)
+        hard_stale_stop = max(96, int(stale_threshold) + 72)
+    else:
+        hard_stale_stop = max(5, int(stale_threshold) + 2)
 
     for turn in range(max_turns):
         if target_count and len(collected) >= target_count:
@@ -3277,6 +3455,13 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
                             break
             except Exception:
                 pass
+
+            if large_album_mode and target_count and len(collected) < target_count:
+                _recover_large_album_viewer(page, stale=stale, turn=turn, label=label)
+                for wait_i in range(10):
+                    _fb_jitter_wait(page, 520, 420)
+                    if harvest_once(f"large-recovery turn={turn},stale={stale},wait={wait_i}"):
+                        break
         else:
             stale = 0
 
@@ -3297,8 +3482,14 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
                     break
 
         # 清除過舊 network 候選，避免很久以前的 response 被下一輪當新圖。
-        if len(network_bucket) > 60:
-            del network_bucket[:30]
+        # v11.31: 大型相簿 recovery 期間 response 會先噴出一批後段圖，
+        # 若太早裁掉 bucket，後面 harvest_once 可能只看見舊循環圖。
+        if large_album_mode:
+            if len(network_bucket) > 320:
+                del network_bucket[:120]
+        else:
+            if len(network_bucket) > 60:
+                del network_bucket[:30]
 
         # 如果已經很久沒有新圖，停止這個 viewer 起點；其他起點還會繼續補。
         if stale >= hard_stale_stop:
@@ -3311,10 +3502,75 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
             logger.info(f"FB viewer-intercept {label} 偵測回到第一張，停止")
             break
 
+    # v11.31 Network Bucket Final Sweep:
+    # 有些大型相簿在 recovery 時已經把後段高清 response 落盤，
+    # 但目前 viewer DOM 仍停在舊圖，harvest_once 沒有機會把它們納入 collected。
+    # 只在大型相簿未達標時啟用，且仍套用 cluster family / stable media id 去重。
+    if large_album_mode and target_count and len(collected) < int(target_count):
+        before_sweep = len(collected)
+        try:
+            ordered_bucket = sorted(
+                list(network_bucket),
+                key=lambda x: int(x.get("score") or 0) + int(x.get("body_size") or 0) + int(x.get("content_length") or 0),
+                reverse=True,
+            )
+            for cand in ordered_bucket:
+                if len(collected) >= int(target_count):
+                    break
+                src = (cand.get("src") or "").strip()
+                if not src or not _looks_like_real_fb_media_url(src):
+                    continue
+                low = src.lower()
+                if _is_bad_fb_media_url(low) or _is_probable_fb_thumbnail_url(low) or _is_probably_video_url(src):
+                    continue
+                key = _media_key_from_src(src)
+                mid = _fb_media_numeric_id_str_from_src(src)
+                stable_key = mid or key
+                if not key or not stable_key:
+                    continue
+                if key in seen_keys or stable_key in seen_media_ids:
+                    continue
+                chosen_cluster = _media_cluster_key_from_src(src)
+                chosen_family = _media_cluster_family_from_key(chosen_cluster)
+                exact_cluster_ok = bool(allowed_cluster and chosen_cluster == allowed_cluster)
+                relaxed_family_ok = bool(allowed_cluster_family and chosen_family == allowed_cluster_family)
+                if (allowed_cluster or allowed_cluster_family) and chosen_cluster and not (exact_cluster_ok or relaxed_family_ok):
+                    continue
+                seen_keys.add(key)
+                if mid:
+                    seen_media_ids.add(mid)
+                _force_persist_harvest_candidate(cand, reason="network-bucket-final-sweep", order_no=len(collected) + 1)
+                collected.append({
+                    "order": len(collected) + 1,
+                    "candidates": [cand],
+                    "src": src,
+                    "type": cand.get("type", "image"),
+                    "score": cand.get("score", 0),
+                })
+                logger.info(
+                    f"FB viewer-intercept {label} final-sweep 收集第 {len(collected)} 張: "
+                    f"{os.path.basename(urlparse(src.split('?')[0]).path)}"
+                )
+        except Exception as e:
+            logger.warning(f"FB viewer-intercept {label} final-sweep 失敗: {e}")
+        if len(collected) != before_sweep:
+            logger.info(f"FB viewer-intercept {label} final-sweep merged: {before_sweep}->{len(collected)}")
+
     logger.info(f"FB viewer-intercept {label}: collected={len(collected)}")
     return collected
 
-def _collect_viewer_sequence_from_url(context, start_url: str, *, label: str, is_photo_page: bool = False, target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None) -> list[dict]:
+def _collect_viewer_sequence_from_url(
+    context,
+    start_url: str,
+    *,
+    label: str,
+    is_photo_page: bool = False,
+    target_count: int | None = None,
+    stale_threshold: int = 3,
+    max_turns: int | None = None,
+    allowed_cluster: str | None = None,
+    allowed_cluster_family: str | None = None,
+) -> list[dict]:
     p = None
     try:
         p = context.new_page()
@@ -3338,6 +3594,7 @@ def _collect_viewer_sequence_from_url(context, start_url: str, *, label: str, is
             stale_threshold=stale_threshold,
             max_turns=max_turns,
             allowed_cluster=allowed_cluster,
+            allowed_cluster_family=allowed_cluster_family,
         )
         logger.info(f"FB viewer start {label}: collected={len(seq)}")
         return seq
@@ -4177,6 +4434,13 @@ def _collect_fb_media_playwright(url: str):
             )
             logger.info(f"FB expected photo target={expected_photo_count}")
 
+            large_album_mode = _is_large_fb_album_target(expected_photo_count, plus_count_before)
+            large_album_cluster_family = ""
+            if large_album_mode:
+                logger.info(
+                    f"FB v11.26 large album resilient mode enabled: target={expected_photo_count}, plus={plus_count_before}"
+                )
+
             if expected_photo_count and len(ordered_links) > expected_photo_count + 3:
                 logger.warning(
                     f"FB bounded scope: ordered_links={len(ordered_links)} > expected={expected_photo_count}，"
@@ -4208,6 +4472,11 @@ def _collect_fb_media_playwright(url: str):
             pre_viewer_cluster = _dominant_media_cluster(link_items, min_count=2)
             if pre_viewer_cluster:
                 logger.info(f"FB v11.15 pre-viewer media cluster scope={pre_viewer_cluster}")
+                if large_album_mode:
+                    large_album_cluster_family = _media_cluster_family_from_key(pre_viewer_cluster)
+                    logger.info(
+                        f"FB v11.26 large album cluster family scope={large_album_cluster_family or '-'}"
+                    )
 
             # 多圖完整性補強 v9：
             # 從多個入口啟動 viewer。FB 有時從 +N 入口只能翻 3 張，
@@ -4223,20 +4492,63 @@ def _collect_fb_media_playwright(url: str):
                     label="post",
                     is_photo_page=False,
                     target_count=expected_photo_count or None,
-                    stale_threshold=4,
-                    max_turns=max(24, (expected_photo_count or 16) + 10),
+                    stale_threshold=(24 if large_album_mode else 4),
+                    max_turns=(max(640, (expected_photo_count or 16) * 6) if large_album_mode else max(24, (expected_photo_count or 16) + 10)),
                     allowed_cluster=pre_viewer_cluster or None,
+                    allowed_cluster_family=large_album_cluster_family or None,
                 )
                 viewer_sequences.append(post_sequence)
 
-                # v11.13: In post-scoped mode, never open individual photo pages
-                # after post viewer. Logged-in Facebook often redirects those photo pages
-                # to feed/recommendation contexts and pollutes the output.
+                # v11.13: In post-scoped mode, avoid generic photo-page 補挖，因為 logged-in Facebook
+                # often redirects those photo pages to feed/recommendation contexts.
+                # v11.31: 100+ 大型相簿在 post viewer 70~80 張後常卡 plateau。
+                # 只針對 large_album_mode 啟用「同 pcb / 同 cluster family」限縮補挖；
+                # 小相簿維持原本 skip 行為，避免推薦圖污染。
                 if expected_photo_count:
-                    logger.info(
-                        "FB v11.13 post-scoped mode: 略過 photo1/photo2 補挖，"
-                        "只保留主貼文 viewer + scoped link candidates"
-                    )
+                    if large_album_mode:
+                        try:
+                            current_unique_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, *viewer_sequences)))
+                        except Exception:
+                            current_unique_n = len(_aggregate_unique_items(link_items, *viewer_sequences))
+                        if current_unique_n < expected_photo_count:
+                            true_photo_links = []
+                            for link in ordered_links:
+                                if _is_true_photo_link(link):
+                                    true_photo_links.append(link)
+                                if len(true_photo_links) >= 5:
+                                    break
+                            logger.info(
+                                f"FB v11.31 large album segmented photo-page rescue: "
+                                f"unique={current_unique_n}/target={expected_photo_count}, starts={len(true_photo_links)}"
+                            )
+                            for i, link in enumerate(true_photo_links, 1):
+                                try:
+                                    viewer_sequences.append(_collect_viewer_sequence_from_url(
+                                        context,
+                                        link,
+                                        label=f"large-photo{i}",
+                                        is_photo_page=True,
+                                        target_count=expected_photo_count or None,
+                                        stale_threshold=18,
+                                        max_turns=max(160, int(expected_photo_count or 0) * 3),
+                                        allowed_cluster=pre_viewer_cluster or None,
+                                        allowed_cluster_family=large_album_cluster_family or None,
+                                    ))
+                                    try:
+                                        current_unique_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, *viewer_sequences)))
+                                    except Exception:
+                                        current_unique_n = len(_aggregate_unique_items(link_items, *viewer_sequences))
+                                    if current_unique_n >= expected_photo_count:
+                                        break
+                                except Exception as e:
+                                    logger.warning(f"FB v11.31 large-photo{i} rescue 失敗: {e}")
+                        else:
+                            logger.info("FB v11.13 post-scoped mode: 主貼文 viewer 已足夠，略過 photo 補挖")
+                    else:
+                        logger.info(
+                            "FB v11.13 post-scoped mode: 略過 photo1/photo2 補挖，"
+                            "只保留主貼文 viewer + scoped link candidates"
+                        )
                 else:
                     true_photo_links = []
                     for link in ordered_links:
@@ -4255,6 +4567,7 @@ def _collect_fb_media_playwright(url: str):
                             stale_threshold=3,
                             max_turns=6,
                             allowed_cluster=pre_viewer_cluster or None,
+                            allowed_cluster_family=large_album_cluster_family or None,
                         ))
 
                 viewer_items = _aggregate_unique_items(*viewer_sequences)
@@ -4270,11 +4583,17 @@ def _collect_fb_media_playwright(url: str):
                     except Exception:
                         before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
                     if before_retry_n < expected_photo_count:
-                        logger.info(
-                            f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
-                            "skip slow recovery and retry fresh context"
-                        )
-                        return "RETRY", f"Facebook viewer incomplete {before_retry_n}/{expected_photo_count}; retry fresh context"
+                        if large_album_mode:
+                            logger.info(
+                                f"FB v11.26 large album: primary viewer incomplete={before_retry_n}/target={expected_photo_count}; "
+                                "continue to grid tile/final completeness guard"
+                            )
+                        else:
+                            logger.info(
+                                f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
+                                "skip slow recovery and retry fresh context"
+                            )
+                            return "RETRY", f"Facebook viewer incomplete {before_retry_n}/{expected_photo_count}; retry fresh context"
 
             except Exception as e:
                 logger.warning(f"FB viewer fallback 失敗: {e}")
@@ -4361,6 +4680,7 @@ def _collect_fb_media_playwright(url: str):
                     viewer_items,
                     dominant_cluster,
                     manifest_ids=manifest_ids,
+                    cluster_family=large_album_cluster_family or None,
                 )
                 # In post-scoped mode, prefer correctness over quantity.
                 # It is better to output 15 correct images than 16 with one recommendation/ad.
@@ -4565,118 +4885,91 @@ def _download_via_ytdlp(url: str):
 
 
 def download(url: str):
-    result_box = [(None, None)]
+    """Download a Facebook URL.
 
-    def _run():
-        original_low = (url or "").lower()
-        resolved = _resolve_share_url(url)
-        resolved_low = (resolved or "").lower()
+    v11.26:
+    - Run the Playwright pipeline synchronously.  A daemon-thread timeout cannot
+      safely kill Playwright; it only returns RETRY while the old browser context
+      keeps writing temp files in the background.
+    - Preserve strict gallery completeness.  Partial albums still return RETRY
+      and are cleaned after the pipeline returns.
+    """
+    original_low = (url or "").lower()
+    resolved = _resolve_share_url(url)
+    resolved_low = (resolved or "").lower()
 
-        # v11.23.2 full, non-crippled strict routing:
-        # - Keep the whole Playwright gallery pipeline intact.
-        # - For share/posts/photo/permalink URLs, Playwright is the source of truth.
-        # - If Playwright says RETRY/BLOCKED/UNAVAILABLE, return that status directly.
-        # - Do NOT fall back to yt-dlp after an incomplete gallery RETRY, because that can
-        #   incorrectly download an unrelated/sibling .mp4 and mark the photo task SUCCESS.
-        is_reel_like_url = _is_fb_reel_url(original_low) or _is_fb_reel_url(resolved_low)
+    is_reel_like_url = _is_fb_reel_url(original_low) or _is_fb_reel_url(resolved_low)
 
-        force_playwright_first = (
-            any(x in original_low for x in [
-                "/share/",
-                "/posts/",
-                "/photo",
-                "/photos/",
-                "story_fbid=",
-                "fbid=",
-                "/permalink/",
-            ])
-            and not is_reel_like_url
-        )
-
-        explicit_video_url = is_reel_like_url or any(x in original_low or x in resolved_low for x in [
-            "/watch",
-            "/videos/",
-            "video.php",
-            "/reel",
-            "/reels/",
-            "fb.watch",
+    force_playwright_first = (
+        any(x in original_low for x in [
+            "/share/",
+            "/posts/",
+            "/photo",
+            "/photos/",
+            "story_fbid=",
+            "fbid=",
+            "/permalink/",
         ])
+        and not is_reel_like_url
+    )
 
+    explicit_video_url = is_reel_like_url or any(x in original_low or x in resolved_low for x in [
+        "/watch",
+        "/videos/",
+        "video.php",
+        "/reel",
+        "/reels/",
+        "fb.watch",
+    ])
+
+    try:
         if explicit_video_url and not force_playwright_first:
             status1, error1 = _download_via_ytdlp(resolved)
 
             if status1 == "SUCCESS":
-                result_box[0] = (status1, error1)
-                return
+                return status1, error1
 
             status2, error2 = _collect_fb_media_playwright(resolved)
 
             if status2 == "SUCCESS":
-                result_box[0] = (status2, error2)
-                return
+                return status2, error2
 
             if status2 in ("RETRY", "BLOCKED", "UNAVAILABLE"):
-                result_box[0] = (status2, error2)
-                return
+                return status2, error2
 
             final_status, _ = _classify_error(f"ytdlp={error1} | playwright={error2}")
-
-            result_box[0] = (
-                final_status,
-                f"ytdlp={error1} | playwright={error2}",
-            )
-            return
+            return final_status, f"ytdlp={error1} | playwright={error2}"
 
         status1, error1 = _collect_fb_media_playwright(resolved)
 
         if status1 == "SUCCESS":
-            result_box[0] = (status1, error1)
-            return
+            return status1, error1
 
         if status1 in ("RETRY", "BLOCKED", "UNAVAILABLE"):
             logger.info(
                 f"FB Playwright returned {status1}; skip yt-dlp fallback to preserve gallery integrity: {error1}"
             )
-            result_box[0] = (status1, error1)
-            return
+            _clear_temp_after_terminal_failure(status1, error1)
+            return status1, error1
 
-        # Only allow yt-dlp fallback for URLs that are explicitly video-like.
-        # Generic /share/ photo galleries must not become .mp4 after Playwright fails.
         if explicit_video_url:
             status2, error2 = _download_via_ytdlp(resolved)
 
             if status2 == "SUCCESS":
-                result_box[0] = (status2, error2)
-                return
+                return status2, error2
 
             final_status, _ = _classify_error(f"playwright={error1} | ytdlp={error2}")
-
-            result_box[0] = (
-                final_status,
-                f"playwright={error1} | ytdlp={error2}",
-            )
-            return
+            final_error = f"playwright={error1} | ytdlp={error2}"
+            _clear_temp_after_terminal_failure(final_status, final_error)
+            return final_status, final_error
 
         logger.info(
             f"FB non-video/gallery route failed in Playwright; skip yt-dlp fallback: {error1}"
         )
-        result_box[0] = (status1, error1)
+        _clear_temp_after_terminal_failure(status1, error1)
+        return status1, error1
 
-    t = threading.Thread(
-        target=_run,
-        daemon=True,
-    )
-
-    t.start()
-    t.join(_DL_TIMEOUT)
-
-    if t.is_alive():
-        logger.error(f"Facebook 下載超時: {url}")
-        clear_temp()
-        return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
-
-    result = result_box[0] or ("FAILED", "未知錯誤")
-    status, reason = result
-    if status != "SUCCESS":
+    except Exception as e:
+        status, reason = _classify_error(str(e))
         _clear_temp_after_terminal_failure(status, reason)
-    return result
+        return status, reason
