@@ -24,6 +24,15 @@ except Exception:
     FB_DEBUG_CAPTURE = False
 
 try:
+    from config import FB_PARALLEL_RESCUE_PAGES
+except Exception:
+    # v11.34 controlled parallel rescue:
+    # Keep the default conservative.  This is only used by large-album segmented
+    # photo-page rescue after the main viewer has plateaued; normal small albums
+    # and Reel/video routes are unaffected.
+    FB_PARALLEL_RESCUE_PAGES = 2
+
+try:
     from config import FB_FILENAME_WITH_TITLE
 except Exception:
     # True: multiple FB images are named 001_<post_title>.jpg for easier archive/search.
@@ -2554,11 +2563,188 @@ def _capture_single_grid_tile_page(context, href, index, allowed_cluster=None):
             pass
 
 
-def _collect_grid_tile_mode_items(context, page, pcb_key=None, expected_count=None, allowed_cluster=None):
+
+
+def _safe_fb_parallel_rescue_pages() -> int:
+    """Return the guarded page fan-out for v11.34 controlled rescue."""
+    try:
+        n = int(FB_PARALLEL_RESCUE_PAGES or 1)
+    except Exception:
+        n = 1
+    # Keep this intentionally capped.  2 is the default stable setting; 3 is the
+    # highest allowed manual config for later experiments.  5+ is intentionally
+    # blocked because Facebook rate limits and Playwright focus/state risks rise fast.
+    return max(1, min(n, 3))
+
+
+def _candidate_matches_cluster_scope(src: str, allowed_cluster=None, allowed_cluster_family=None) -> bool:
+    """Shared exact/family cluster gate for photo-page rescue candidates."""
+    if not src:
+        return False
+    if not allowed_cluster and not allowed_cluster_family:
+        return True
+    ck = _media_cluster_key_from_src(src)
+    if not ck:
+        return True
+    if allowed_cluster and ck == allowed_cluster:
+        return True
+    if allowed_cluster_family and _media_cluster_family_from_key(ck) == allowed_cluster_family:
+        return True
+    return False
+
+
+def _capture_grid_tile_pages_controlled_batch(
+    context,
+    batch_records,
+    *,
+    allowed_cluster=None,
+    allowed_cluster_family=None,
+):
     """
-    v11.22 Grid Tile Mode:
+    v11.34 controlled parallel photo-page rescue.
+
+    This intentionally avoids ThreadPoolExecutor and does not share Playwright
+    pages across threads.  It opens a small batch of independent pages in the same
+    browser context, lets their network loads overlap, then returns only candidate
+    packs to the main thread.  File moving, dedupe, ordering, cluster filtering and
+    strict completeness guard remain in the original main flow.
+    """
+    opened = []
+    results = []
+
+    def make_on_resp(bucket):
+        def on_resp(resp):
+            try:
+                u = resp.url
+                if not _looks_like_real_fb_media_url(u):
+                    return
+                if _media_type_from_url(u) != "image":
+                    return
+                if not _candidate_matches_cluster_scope(
+                    u,
+                    allowed_cluster=allowed_cluster,
+                    allowed_cluster_family=allowed_cluster_family,
+                ):
+                    return
+                ctype = ""
+                try:
+                    ctype = resp.headers.get("content-type", "") or ""
+                except Exception:
+                    ctype = ""
+                if ctype and "image" not in ctype.lower():
+                    return
+                clen = 0
+                try:
+                    raw_len = resp.headers.get("content-length", "") or "0"
+                    clen = int(raw_len) if str(raw_len).isdigit() else 0
+                except Exception:
+                    clen = 0
+                if 0 < clen < _MIN_FILE_SIZE:
+                    return
+                score = 1750000 + _media_quality_score(u) + min(clen, 900000)
+                bucket.append({"type": "image", "src": u, "score": score})
+            except Exception:
+                pass
+        return on_resp
+
+    try:
+        # Open every page first, each with an isolated response bucket.
+        for order_no, rec in batch_records:
+            href = rec.get("href") or ""
+            if not href:
+                continue
+            pg = context.new_page()
+            bucket = []
+            try:
+                pg.on("response", make_on_resp(bucket))
+            except Exception:
+                pass
+            opened.append((order_no, rec, href, pg, bucket))
+
+        # Navigate pages one by one.  Because all pages stay open, late image
+        # responses from earlier pages can still land while later pages are loading.
+        for order_no, rec, href, pg, bucket in opened:
+            try:
+                pg.goto(href, wait_until="domcontentloaded", timeout=30000)
+            except PlaywrightTimeoutError:
+                pass
+            except Exception as e:
+                logger.warning(f"FB v11.34 controlled rescue tile {order_no} goto failed: {e}")
+
+        # One shared settle window for the batch instead of per-page long waits.
+        if opened:
+            try:
+                opened[-1][3].wait_for_timeout(2600)
+            except Exception:
+                pass
+
+        for order_no, rec, href, pg, bucket in opened:
+            try:
+                try:
+                    pg.wait_for_load_state("networkidle", timeout=2500)
+                except Exception:
+                    pass
+                candidates = _collect_current_page_candidates(
+                    pg,
+                    network_items=bucket,
+                    include_network=True,
+                    include_meta=False,
+                    include_html=True,
+                )
+                scoped = []
+                for cand in candidates:
+                    src = cand.get("src") or ""
+                    if _candidate_matches_cluster_scope(
+                        src,
+                        allowed_cluster=allowed_cluster,
+                        allowed_cluster_family=allowed_cluster_family,
+                    ):
+                        scoped.append(cand)
+                if scoped:
+                    candidates = scoped
+                candidates = _dedupe_ordered(candidates)
+                if not candidates:
+                    # Preserve the old grid thumbnail fallback for this tile.
+                    candidates = _dedupe_ordered(rec.get("candidates") or [])
+                if not candidates:
+                    logger.warning(f"FB v11.34 controlled rescue tile {order_no} no candidate: {href[:100]}")
+                    continue
+                chosen = candidates[0]
+                results.append({
+                    "order": order_no,
+                    "candidates": candidates,
+                    "src": chosen.get("src", ""),
+                    "type": chosen.get("type", "image"),
+                    "score": chosen.get("score", 0),
+                })
+            except Exception as e:
+                logger.warning(f"FB v11.34 controlled rescue tile {order_no} collect failed: {e}")
+
+    finally:
+        for _order_no, _rec, _href, pg, _bucket in opened:
+            try:
+                pg.close()
+            except Exception:
+                pass
+
+    return results
+
+def _collect_grid_tile_mode_items(
+    context,
+    page,
+    pcb_key=None,
+    expected_count=None,
+    allowed_cluster=None,
+    allowed_cluster_family=None,
+):
+    """
+    v11.22 Grid Tile Mode / v11.34 controlled parallel rescue:
     Use tile physical order as the source of truth. It is intentionally used only
     when Theater Viewer misses images, to avoid recommendation pollution.
+
+    v11.34 only enables 2-page batch rescue for large albums. Small albums keep
+    the original single-page behavior so 15/16 still returns RETRY instead of
+    being padded by unsafe candidates.
     """
     records = _collect_grid_tile_records_spatial(page, pcb_key=pcb_key, expected_count=expected_count)
     if expected_count and len(records) > expected_count:
@@ -2568,7 +2754,62 @@ def _collect_grid_tile_mode_items(context, page, pcb_key=None, expected_count=No
 
     out = []
     used = set()
-    logger.info(f"FB v11.22 grid tile mode start: tiles={len(records)} target={expected_count or '-'}")
+    large_album_rescue = int(expected_count or 0) >= 80
+    parallel_pages = _safe_fb_parallel_rescue_pages() if large_album_rescue else 1
+
+    logger.info(
+        f"FB v11.34 grid/photo-page rescue start: tiles={len(records)} "
+        f"target={expected_count or '-'} pages={parallel_pages}"
+    )
+
+    def accept_pack(pack, index_label):
+        if not pack:
+            return False
+        key = _media_key_from_src(pack.get("src", "")) or _fb_media_numeric_id_str_from_src(pack.get("src", ""))
+        if key and key in used:
+            logger.info(f"FB v11.34 grid tile duplicate skipped index={index_label}: {key}")
+            return False
+        if key:
+            used.add(key)
+        out.append(pack)
+        logger.info(
+            f"FB v11.34 grid/photo-page rescue captured "
+            f"{len(out)}/{expected_count or len(records)}: index={index_label}"
+        )
+        return True
+
+    if parallel_pages >= 2:
+        indexed_records = list(enumerate(records, 1))
+        for start in range(0, len(indexed_records), parallel_pages):
+            batch = indexed_records[start:start + parallel_pages]
+            packs = _capture_grid_tile_pages_controlled_batch(
+                context,
+                batch,
+                allowed_cluster=allowed_cluster,
+                allowed_cluster_family=allowed_cluster_family,
+            )
+            by_order = {int(p.get("order") or 0): p for p in packs if p}
+            for i, rec in batch:
+                pack = by_order.get(i)
+                if not pack:
+                    cands = rec.get("candidates") or []
+                    if cands:
+                        best = cands[0]
+                        pack = {
+                            "order": i,
+                            "candidates": cands,
+                            "src": best.get("src", ""),
+                            "type": best.get("type", "image"),
+                            "score": best.get("score", 0) - 100000,
+                        }
+                accept_pack(pack, i)
+                if expected_count and len(out) >= int(expected_count):
+                    break
+            if expected_count and len(out) >= int(expected_count):
+                break
+        return out
+
+    # Original conservative single-page path for small galleries.
     for i, rec in enumerate(records, 1):
         href = rec.get("href") or ""
         pack = _capture_single_grid_tile_page(context, href, i, allowed_cluster=allowed_cluster)
@@ -2577,16 +2818,7 @@ def _collect_grid_tile_mode_items(context, page, pcb_key=None, expected_count=No
             if cands:
                 best = cands[0]
                 pack = {"order": i, "candidates": cands, "src": best.get("src", ""), "type": best.get("type", "image"), "score": best.get("score", 0) - 100000}
-        if not pack:
-            continue
-        key = _media_key_from_src(pack.get("src", "")) or _fb_media_numeric_id_str_from_src(pack.get("src", ""))
-        if key and key in used:
-            logger.info(f"FB v11.22 grid tile duplicate skipped index={i}: {key}")
-            continue
-        if key:
-            used.add(key)
-        out.append(pack)
-        logger.info(f"FB v11.22 grid tile captured {len(out)}/{expected_count or len(records)}: index={i}")
+        accept_pack(pack, i)
     return out
 
 
@@ -4809,6 +5041,7 @@ def _collect_fb_media_playwright(url: str):
                         pcb_key=dominant_pcb_key,
                         expected_count=expected_photo_count,
                         allowed_cluster=pre_viewer_cluster or None,
+                        allowed_cluster_family=large_album_cluster_family or None,
                     )
                     if grid_tile_items:
                         before_grid_merge = current_unique_n

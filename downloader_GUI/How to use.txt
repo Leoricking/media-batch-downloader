@@ -11,6 +11,13 @@ Media Batch Downloader 使用說明
 3. 自動載入可下載連結
 4. 開始下載
 
+目前版本重點：Controlled Parallel Photo-Page Rescue
+- Facebook 大型相簿在 viewer plateau 後，後段補洞可使用受控 2-page photo-page rescue。
+- 不改 viewer 主線，不讓 ArrowRight / focus / response bucket 混線。
+- strict completeness guard 保持不變：缺圖不會 SUCCESS。
+- Facebook Reel / share/r/ 仍走影片分流，不受相簿流程影響。
+- visual duplicate audit 保留，只產生報告，不會刪圖。
+
 --------------------------------
 一、最簡單使用方式
 --------------------------------
@@ -77,13 +84,14 @@ Facebook：
 - /share/v/
 - /watch/
 - /reel/
+- /reels/
 - /videos/
 - /posts/
 - /story.php
 - fb.watch/
 
 注意：
-Facebook 的 share 連結現在也會視為可下載連結。
+Facebook 的 share 連結會視為可下載連結。
 
 --------------------------------
 四、按鈕說明
@@ -163,11 +171,15 @@ BLOCKED
 - 帳號受限
 - 僅特定對象可觀看
 
+MISSING
+內容不存在、貼文移除、連結失效
+
 UNAVAILABLE
 內容已刪除、失效、404、頁面不存在
 
 RETRY
 暫時失敗，後續可重試
+Facebook 多圖相簿若未達完整張數，也會回 RETRY，避免輸出缺圖資料夾。
 
 --------------------------------
 六、進度條與冷卻
@@ -219,12 +231,44 @@ RETRY
 Facebook 下載原則和 Instagram 類似：
 
 1. 若是公開內容，通常可直接下載
-2. 若是 share 連結，現在也會被納入可下載清單
-3. 若內容需要登入或受限，也可能顯示 BLOCKED
-4. 若內容已刪除或不存在，則顯示 UNAVAILABLE
+2. 若是 share 連結，會被納入可下載清單
+3. 若內容需要登入或受限，可能顯示 BLOCKED
+4. 若內容已刪除或不存在，則顯示 UNAVAILABLE / MISSING
+5. 若是大型多圖相簿，程式會以 strict completeness guard 保護完整性
+
+v11.34 Facebook 大型相簿補洞：
+- 主 viewer-intercept 仍是單 page、單 focus。
+- 當 viewer plateau / final-sweep 後仍不足 target，才會進入 controlled 2-page photo-page rescue。
+- 每個補洞 page 都是獨立 new_page，抓完即 close。
+- 補洞 worker 只回傳候選，不直接搬檔。
+- 最後仍由主線統一做過濾、去重、排序、下載與完整性檢查。
+
+這代表：
+- 103 張相簿必須真的收滿 103 張才 SUCCESS。
+- 15/16 不會被當成功。
+- 小相簿不會因為大型相簿加速邏輯而改變行為。
+- Reel / share/r/ 不會被當成圖片相簿處理。
 
 --------------------------------
-九、檔案輸出位置
+九、Facebook visual duplicate audit 說明
+--------------------------------
+
+v11.33+ 會在多圖 Facebook 輸出資料夾產生：
+
+_visual_duplicate_report.txt
+
+用途：
+- 偵測疑似視覺重複圖片
+- 顯示圖片尺寸、檔案大小、相似度距離
+- 方便人工檢查 103/103 內是否有看起來很像的圖
+
+重要：
+這只是 audit report。
+程式不會自動刪除、改名、合併任何圖片。
+原因是 Facebook 原貼文可能本來就有連拍、動畫幀或刻意重複圖。
+
+--------------------------------
+十、檔案輸出位置
 --------------------------------
 
 下載完成的檔案會放在：
@@ -236,16 +280,25 @@ downloads\標題.mp4
 downloads\標題.jpg
 
 多檔貼文命名：
+downloads\標題\001_標題.jpg
+downloads\標題\002_標題.jpg
+
+若 config.py 設定：
+
+FB_FILENAME_WITH_TITLE = False
+
+則 Facebook 多圖可能改成：
+
 downloads\標題\1.jpg
 downloads\標題\2.mp4
 
 Instagram 與 Facebook 都統一走：
 - 先下載到 temp
 - 再搬到 downloads
-- 最後套用同一套命名規則
+- 最後套用命名規則
 
 --------------------------------
-十、命名規則
+十一、命名規則
 --------------------------------
 
 檔名會自動清理：
@@ -255,11 +308,11 @@ Instagram 與 Facebook 都統一走：
 3. 布布 -> Dudu
 4. 移除 Windows 非法字元
 5. 去掉不可見字元
-6. 長度限制 60 字
-7. 空標題用 Untitled
+6. 長度限制
+7. 空標題用 Untitled / Facebook_Post fallback
 
 --------------------------------
-十一、斷點與避免重複下載
+十二、斷點與避免重複下載
 --------------------------------
 
 程式會使用：
@@ -272,7 +325,7 @@ data\processed_links.log
 之後再次加入任務時會自動略過，不會重複下載。
 
 --------------------------------
-十二、失敗紀錄
+十三、失敗紀錄
 --------------------------------
 
 失敗紀錄會寫到：
@@ -292,7 +345,7 @@ data\failed_links.log
 - failed_links.log：所有失敗事件的完整紀錄
 
 --------------------------------
-十三、建議使用流程
+十四、建議使用流程
 --------------------------------
 
 推薦日常流程：
@@ -304,11 +357,20 @@ data\failed_links.log
 5. 若有 BLOCKED：
    - 先更新 cookies.txt
    - 再點「🔁 重試失敗」
-6. 若要查看失敗細節：
+6. 若有 RETRY：
+   - 可先等幾分鐘
+   - 再點「🔁 重試失敗」
+7. 若要查看失敗細節：
    - 點「📄 查看失敗」
 
+Facebook 大型相簿建議：
+- 不要同時丟太多 80+ / 100+ 張的大相簿。
+- 若遇到 102/103 RETRY，代表完整性保護生效，不是輸出失敗。
+- 可更新 cookies 後重試。
+- config.py 裡 FB_PARALLEL_RESCUE_PAGES 建議先保持 2。
+
 --------------------------------
-十四、常見問題
+十五、常見問題
 --------------------------------
 
 Q1. 為什麼會顯示 BLOCKED？
@@ -340,15 +402,38 @@ IG 的驗證挑戰有時不穩定。
 Q6. Facebook share 連結能下載嗎？
 A:
 可以。
-現在像 facebook.com/share/... 這類連結會先被判定為可下載，再交給下載器處理。
+像 facebook.com/share/... 這類連結會先被判定為可下載，再交給下載器處理。
 
 Q7. 我已經有 cookie，為什麼還是失敗？
 A:
 因為 cookie 只代表某個登入身分。
 如果該帳號本身沒有權限、cookie 已過期、或匯出不完整，仍然會失敗。
 
+Q8. Facebook 多圖為什麼 15/16 不輸出？
+A:
+這是故意的。
+多圖相簿如果 target 是 16，只有 15 張代表不完整。
+程式會回 RETRY，避免正式資料夾出現缺圖版本。
+
+Q9. v11.34 的 2-page rescue 是不是會讓下載速度變 2 倍？
+A:
+不保證。
+它只加速大型相簿後段補洞，不加速 viewer 主線。
+實際速度仍受 Facebook 延遲、帳號狀態、rate limit、圖片大小與網路影響。
+
+Q10. 可以把 FB_PARALLEL_RESCUE_PAGES 改成 5 嗎？
+A:
+不建議。
+5-page rescue 風險高，可能造成 rate limit、頁面焦點互搶、context 壓力或推薦圖污染。
+建議先用 2，穩定後最多測 3。
+
+Q11. 為什麼會多一個 _visual_duplicate_report.txt？
+A:
+這是 visual duplicate audit 報告。
+它只協助人工檢查疑似重複圖，不會自動刪除圖片。
+
 --------------------------------
-十五、發行版使用
+十六、發行版使用
 --------------------------------
 
 如果你拿到的是 release 版：

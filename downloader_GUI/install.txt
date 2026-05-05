@@ -1,12 +1,15 @@
 Media Batch Downloader 安裝與建置說明
 ====================================
 
-版本備註：v11.25 Stable Cleanup / Completion Notify
-- 修正 Instagram / Facebook 任務失敗、MISSING、BLOCKED、RETRY 後 post/ 暫存殘留問題。
-- Instagram 每筆任務開始前會清理上一筆殘留暫存；非 SUCCESS 結束時也會清理 post/。
-- GUI 批次下載完成後會跳出結果摘要視窗，顯示 SUCCESS / FAILED / BLOCKED / MISSING / RETRY / UNAVAILABLE 統計。
-- 完成視窗採非阻塞設計，不會卡住 Worker 或 GUI refresh。
-- build.bat 已更新 Playwright / requests / pycryptodome / keyring 套件與 Chromium 安裝步驟。
+版本備註：v11.34 Controlled Parallel Photo-Page Rescue
+- Facebook 大型相簿補洞階段新增「受控 2-page parallel photo-page rescue」。
+- 不並行 viewer 主線；viewer-intercept 仍維持單 page、單 focus，避免 ArrowRight 搶焦點、response bucket 混線與推薦圖污染。
+- 並行只用於大型相簿 plateau / final-sweep 後仍未達 target 的 photo-page rescue 補洞。
+- 預設 FB_PARALLEL_RESCUE_PAGES = 2，可在 config.py 調整；不建議直接開 5。
+- strict completeness guard 保持不變：例如 103/103 才 SUCCESS，15/16 不准 SUCCESS。
+- Facebook Reel / share/r/ 仍走影片分流，不受相簿 rescue 影響。
+- v11.33 visual duplicate audit 仍保留，會產生 _visual_duplicate_report.txt，但不自動刪圖。
+- 需要 Pillow 套件，用於輸出圖片尺寸與 visual duplicate audit。
 
 --------------------------------
 一、需求環境
@@ -14,9 +17,15 @@ Media Batch Downloader 安裝與建置說明
 
 建議環境：
 - Windows 10 / 11
-- Python 3.10 以上
+- Python 3.10 以上，建議 Python 3.11 或 3.12
 - 已安裝 pip
 - 網路可連線
+- 建議安裝 ffmpeg，影片下載 / 合併會更穩
+
+檢查 Python：
+
+python --version
+python -m pip --version
 
 --------------------------------
 二、原始碼模式安裝
@@ -25,15 +34,57 @@ Media Batch Downloader 安裝與建置說明
 進入 downloader_GUI 資料夾後，安裝必要套件：
 
 python -m pip install --upgrade pip
-python -m pip install -U instaloader yt-dlp opencc-python-reimplemented tkinterdnd2 playwright requests pycryptodome keyring pyinstaller
+python -m pip install -U instaloader yt-dlp opencc-python-reimplemented tkinterdnd2 playwright requests pycryptodome keyring pyinstaller pillow
 python -m playwright install chromium
 
-如果你只想執行、不需要拖放功能：
-tkinterdnd2 可以不裝
-但 GUI 拖放 txt 會失效。
+若專案內有 requirements.txt，也可以用：
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+
+說明：
+- playwright：Facebook / Instagram fallback browser 擷取需要。
+- requests：share URL resolve / HTTP 請求需要。
+- yt-dlp：影片下載與部分平台 fallback 需要。
+- instaloader：Instagram 貼文下載主流程需要。
+- opencc-python-reimplemented：簡體轉繁體檔名需要。
+- tkinterdnd2：GUI 拖放 txt 需要；如果只想執行、不需要拖放，可以不裝。
+- pycryptodome / keyring：cookie / 登入相關流程可能用到。
+- pillow：v11.33+ visual duplicate audit 需要，用於讀取圖片尺寸與 average hash。
+- pyinstaller：建置 EXE 需要；只執行原始碼可不裝。
 
 --------------------------------
-三、測試執行
+三、v11.34 Facebook 並行補洞設定
+--------------------------------
+
+v11.34 新增設定項：
+
+FB_PARALLEL_RESCUE_PAGES = 2
+
+建議放在 downloader_GUI/config.py：
+
+# Facebook 大型相簿 photo-page rescue 並行頁數
+# 建議 2；穩定後最多再測 3；不建議 5。
+FB_PARALLEL_RESCUE_PAGES = 2
+
+安全建議：
+- 2：推薦預設，收益中高，風險低～中。
+- 3：可測試，收益較高，但風險中。
+- 5：不建議，容易觸發 Facebook rate limit / page focus / context 壓力。
+
+這個設定只影響大型 Facebook 相簿的「後段補洞」。
+不會讓主 viewer 翻頁並行，也不會改變成功條件。
+
+啟用條件大致為：
+- Facebook 大型相簿
+- target_count >= 80
+- viewer 已經 plateau
+- final-sweep 後仍不足 target
+- 有明確 photo href / fbid records 可補
+
+--------------------------------
+四、測試執行
 --------------------------------
 
 直接執行：
@@ -46,8 +97,12 @@ run.bat
 
 若 GUI 能正常開啟，代表安裝成功。
 
+若 Playwright Chromium 未安裝，通常會看到 browser executable 不存在之類錯誤，請重新執行：
+
+python -m playwright install chromium
+
 --------------------------------
-四、建置 EXE
+五、建置 EXE
 --------------------------------
 
 直接雙擊：
@@ -64,6 +119,10 @@ python -m PyInstaller --noconfirm --onefile --noconsole ^
 --hidden-import=tkinterdnd2 ^
 --hidden-import=playwright ^
 --hidden-import=requests ^
+--hidden-import=Crypto ^
+--hidden-import=keyring ^
+--hidden-import=PIL ^
+--hidden-import=PIL.Image ^
 --collect-all playwright ^
 --add-data "accounts.json;." ^
 --add-data "cookies.txt;." ^
@@ -71,8 +130,13 @@ python -m PyInstaller --noconfirm --onefile --noconsole ^
 --add-data "..\pre-processing;pre-processing" ^
 main.py
 
+注意：
+- Pillow 通常可被 PyInstaller 自動帶入，但 v11.33+ visual duplicate audit 會用 PIL.Image，建議保留 --hidden-import=PIL 與 --hidden-import=PIL.Image。
+- Playwright 必須 collect-all，否則 EXE 可能找不到 driver / browser 相關檔案。
+- 若 release 版啟動後仍找不到 Chromium，請在開發環境先確認 python -m playwright install chromium 已成功。
+
 --------------------------------
-五、打包結果
+六、打包結果
 --------------------------------
 
 build.bat 完成後會建立：
@@ -80,6 +144,7 @@ build.bat 完成後會建立：
 release\MediaBatchDownloader.exe
 
 以及：
+
 release\data\
 release\downloads\
 
@@ -88,7 +153,7 @@ release\downloads\
 release\MediaBatchDownloader.exe
 
 --------------------------------
-六、accounts.json 設定
+七、accounts.json 設定
 --------------------------------
 
 格式如下：
@@ -101,11 +166,12 @@ release\MediaBatchDownloader.exe
 ]
 
 注意：
-- 若使用 2FA，仍可能遇到 IG 額外驗證
-- 建議 cookies.txt 優先
+- 若使用 2FA，仍可能遇到 IG 額外驗證。
+- 建議 cookies.txt 優先。
+- 帳密登入只建議當補充方案。
 
 --------------------------------
-七、cookies.txt 說明
+八、cookies.txt 說明
 --------------------------------
 
 cookies.txt 是 Instagram / Facebook 的登入 cookie。
@@ -116,19 +182,20 @@ cookies.txt 是 Instagram / Facebook 的登入 cookie。
 - 遇到 BLOCKED 時通常比帳密登入更穩
 
 建議：
-- 使用你平常能正常瀏覽 IG / FB 的瀏覽器帳號匯出 cookies
-- 定期更新 cookies.txt
+- 使用你平常能正常瀏覽 IG / FB 的瀏覽器帳號匯出 cookies。
+- IG 與 FB 可以共用同一份 Netscape 格式 cookies.txt，程式會依 domain 過濾。
+- 定期更新 cookies.txt。
 
 重要：
-若你已確認同一帳號在瀏覽器能看到內容，但程式仍無法下載，
-請優先檢查：
+若你已確認同一帳號在瀏覽器能看到內容，但程式仍無法下載，請優先檢查：
 1. cookies.txt 是否是最新匯出的
 2. cookies.txt 是否真的來自同一個帳號
 3. cookies 是否匯出完整
 4. 程式目前讀取的是不是正確那份 cookies.txt
+5. 平台是否已經對該帳號或該內容做風控限制
 
 --------------------------------
-八、pre-processing 使用方式
+九、pre-processing 使用方式
 --------------------------------
 
 專案結構：
@@ -137,12 +204,11 @@ pre-processing\
     20260420.txt
     link_sorter.py
     output\
+        download_link.txt
         undownload_link.txt
 
-你可以把一堆原始分享文字放進：
-pre-processing\20260420.txt
+你可以把一堆原始分享文字放進 txt，然後在 GUI 內按：
 
-然後在 GUI 內按：
 「📂 匯入 txt（自動預處理）」
 
 程式會自動：
@@ -151,7 +217,7 @@ pre-processing\20260420.txt
 3. 自動載入 download_link.txt
 
 --------------------------------
-九、Facebook share 連結說明
+十、Facebook share / gallery / Reel 說明
 --------------------------------
 
 以下類型的 Facebook 連結會視為可下載：
@@ -160,20 +226,25 @@ pre-processing\20260420.txt
 - facebook.com/share/v/...
 - facebook.com/watch/...
 - facebook.com/reel/...
+- facebook.com/reels/...
 - facebook.com/.../videos/...
 - facebook.com/.../posts/...
 - facebook.com/story.php...
 - fb.watch/...
 
-也就是說：
+範例：
 
 https://www.facebook.com/share/1BJ5cEzosx/
 https://www.facebook.com/share/r/1BUMhWkqV3/
 
-這類連結會先進入 download_link.txt，再由 Facebook 下載器處理。
+v11.34 行為：
+- 普通圖文 / 多圖相簿：Playwright viewer / grid / photo-page rescue。
+- 大型相簿：viewer plateau 後可啟用 controlled 2-page photo-page rescue。
+- Reel / share/r/：走影片分流，不進相簿 strict gallery 流程。
+- 近完整但缺圖，例如 15/16：仍然 RETRY，不輸出不完整資料夾。
 
 --------------------------------
-十、已下載跳過 / 斷點續跑
+十一、已下載跳過 / 斷點續跑
 --------------------------------
 
 程式使用：
@@ -186,10 +257,8 @@ data\processed_links.log
 - 不會重複下載
 - 會直接略過或顯示已在 processed_links.log 中
 
-這樣可以避免重跑大量清單時重複下載已完成內容。
-
 --------------------------------
-十一、failed / unavailable / retry 紀錄
+十二、failed / unavailable / retry 紀錄
 --------------------------------
 
 程式會寫出：
@@ -204,7 +273,7 @@ data\unavailable_links.txt
 - unavailable_links.txt：已失效或受限內容
 
 --------------------------------
-十二、暫停 / 繼續 / 停止
+十三、暫停 / 繼續 / 停止
 --------------------------------
 
 目前 GUI 支援：
@@ -223,7 +292,7 @@ data\unavailable_links.txt
 - 會在目前任務安全收尾後停止
 
 --------------------------------
-十三、post/ 暫存資料夾說明
+十四、post/ 暫存資料夾說明
 --------------------------------
 
 post/ 是 TEMP_DIR 暫存下載資料夾，不是正式輸出資料夾。
@@ -231,10 +300,10 @@ post/ 是 TEMP_DIR 暫存下載資料夾，不是正式輸出資料夾。
 正常流程：
 下載媒體 → 寫入 post/ → move_files() 搬到 downloads/ → 清空 post/
 
-v11.25 已加強：
-- 每筆 Instagram 任務開始前會清空上一筆殘留 post/
-- Instagram 任務若以 FAILED / BLOCKED / MISSING / RETRY 結束，會自動清空 post/
-- SUCCESS 由 move_files() 負責清理，避免誤刪已準備搬移的有效媒體
+注意：
+- SUCCESS 由 move_files() 負責清理，避免誤刪已準備搬移的有效媒體。
+- FAILED / BLOCKED / MISSING / RETRY / UNAVAILABLE 會清理暫存，避免污染下一筆任務。
+- Facebook response capture 的 _fb_capture 是內部快取，不會被當成正式檔搬出。
 
 若你手動看到 post/ 內有大量殘留檔，可以在關閉程式後刪除：
 
@@ -243,7 +312,7 @@ rmdir /s /q post
 下次程式會自動重建。
 
 --------------------------------
-十四、下載完成通知
+十五、下載完成通知
 --------------------------------
 
 批次任務完成後，GUI 會跳出一次摘要視窗，包含：
@@ -259,7 +328,7 @@ rmdir /s /q post
 若有失敗或受限任務，視窗會提供「查看失敗」按鈕。
 
 --------------------------------
-十五、狀態定義
+十六、狀態定義
 --------------------------------
 
 SUCCESS
@@ -272,16 +341,16 @@ BLOCKED
 - 需要登入、checkpoint、challenge、私人帳號或權限限制
 
 RETRY
-- 暫時性錯誤，例如 timeout、429、rate limit
+- 暫時性錯誤，例如 timeout、429、rate limit，或 Facebook gallery 未達 strict completeness
 
 FAILED
 - 下載流程失敗，但不屬於以上分類
 
 UNAVAILABLE
-- 舊版不可用狀態，部分流程仍保留相容
+- 內容已刪除、失效、404、頁面不存在；部分舊流程仍保留此狀態相容
 
 --------------------------------
-十六、常見問題排除
+十七、常見問題排除
 --------------------------------
 
 1. build.bat 失敗
@@ -290,6 +359,7 @@ UNAVAILABLE
 - pip 套件未安裝成功
 - Playwright Chromium 未安裝成功
 - 被防毒阻擋
+- Pillow / PIL 沒安裝，但程式啟用 visual duplicate audit
 
 2. EXE 打開沒反應
 先回到原始碼模式測試：
@@ -311,11 +381,12 @@ python main.py
 - 該分享連結是否實際可在瀏覽器打開
 - 是否為受限制內容
 - 若是 Reel，確認是否被推薦影片 / 預載片段污染
+- 若是大型相簿，確認 log 是否顯示 strict completeness，例如 102/103 會 RETRY
 
 5. 顯示 BLOCKED
 代表平台限制，不一定是程式 bug。
 
-6. 顯示 MISSING
+6. 顯示 MISSING / UNAVAILABLE
 代表頁面不存在、貼文已移除、分享連結失效，通常不需要重試。
 
 7. 2FA 驗證碼正確卻失敗
@@ -326,11 +397,17 @@ python main.py
 優先檢查：
 - cookies 是否最新
 - cookies 是否同一帳號
+- cookies 是否完整
 - 是否有平台風控
 - 是否為程式用到的實際 cookie 狀態與瀏覽器不同
 
+9. Facebook 大型相簿變快但仍 RETRY
+這是正常安全行為。
+若 target 是 103，程式必須真的拿到 103 張才會 SUCCESS。
+2-page rescue 只縮短補洞時間，不會降低完整性要求。
+
 --------------------------------
-十七、推薦日常使用方式
+十八、推薦日常使用方式
 --------------------------------
 
 開發 / 測試：
