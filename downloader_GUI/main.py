@@ -5,6 +5,7 @@ import re
 import sys
 import time
 import threading
+import ctypes
 import tkinter as tk
 from datetime import timedelta
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -55,6 +56,57 @@ _STATUS_COLORS = {
 _PLACEHOLDER = "在此貼上 URL（每行一個），或拖入 txt 檔案..."
 
 
+
+def _enable_dpi_awareness():
+    """Enable Windows DPI awareness before Tk is created.
+
+    This keeps the GUI from becoming either huge and blurry or tiny on mixed
+    FHD / 2K / 4K monitors.  Safe no-op on non-Windows systems.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        # Windows 8.1+ per-monitor DPI awareness.
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def _get_work_area(root: tk.Tk) -> tuple[int, int, int, int]:
+    """Return usable desktop work area: left, top, width, height.
+
+    On Windows this excludes the taskbar.  The fallback uses Tk's screen size.
+    """
+    try:
+        if sys.platform == "win32":
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            rect = RECT()
+            SPI_GETWORKAREA = 0x0030
+            if ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+                w = max(800, int(rect.right - rect.left))
+                h = max(600, int(rect.bottom - rect.top))
+                return int(rect.left), int(rect.top), w, h
+    except Exception:
+        pass
+
+    try:
+        return 0, 0, int(root.winfo_screenwidth()), int(root.winfo_screenheight())
+    except Exception:
+        return 0, 0, 1280, 720
+
+
 def _format_seconds(sec) -> str:
     if sec is None:
         return "--:--"
@@ -83,8 +135,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Media Batch Downloader")
-        self.root.geometry("1180x800")
-        self.root.minsize(980, 660)
+        self._configure_adaptive_window()
 
         self._active_filter = "ALL"
         self._refresh_id = None
@@ -113,14 +164,88 @@ class App:
         self.root.after(300, self._init_session)
         self.root.after(600, self._refresh_table)
 
+
+    def _configure_adaptive_window(self):
+        """Size and scale the GUI for FHD / 2K / 4K monitors.
+
+        v11.39 fixed the FHD bottom clipping by using almost the full work area,
+        but on 4K that made the window enormous while fonts stayed visually too
+        small.  This version caps the default window size on high-resolution
+        monitors and uses correct Tk DPI scaling.
+        """
+        left, top, work_w, work_h = _get_work_area(self.root)
+
+        # Use the real Tk point scaling.  At 96 DPI this is about 1.333.
+        try:
+            dpi = float(self.root.winfo_fpixels("1i") or 96.0)
+            tk_scale = max(1.25, min(2.10, dpi / 72.0))
+            self.root.tk.call("tk", "scaling", tk_scale)
+        except Exception:
+            tk_scale = 1.333
+
+        # Default window size should be comfortable, not full-screen, on 4K.
+        if work_w >= 3200 or work_h >= 1700:
+            # 4K / ultra-wide: keep a readable desktop app sized window.
+            width = min(1900, max(1500, int(work_w * 0.52)))
+            height = min(1120, max(900, int(work_h * 0.56)))
+            self._compact_ui = False
+            self._text_input_height = 5
+            self._top_pad_y = 10
+            self._button_pady = 7
+            self._title_font_size = 20
+            self._base_font_size = 11
+            self._small_font_size = 10
+            self._tree_rowheight = 30
+        elif work_w >= 2400 or work_h >= 1300:
+            # 2K / high-DPI laptop external monitor.
+            width = min(1650, max(1300, int(work_w * 0.66)))
+            height = min(1000, max(820, int(work_h * 0.72)))
+            self._compact_ui = False
+            self._text_input_height = 5
+            self._top_pad_y = 8
+            self._button_pady = 6
+            self._title_font_size = 19
+            self._base_font_size = 10
+            self._small_font_size = 9
+            self._tree_rowheight = 28
+        else:
+            # FHD and smaller: fit within the work area and keep bottom buttons visible.
+            width = min(max(1180, int(work_w * 0.96)), max(980, work_w - 24))
+            height = min(max(720, int(work_h * 0.90)), max(620, work_h - 36))
+            self._compact_ui = work_h <= 950 or work_w <= 1400
+            self._text_input_height = 4 if self._compact_ui else 5
+            self._top_pad_y = 6 if self._compact_ui else 8
+            self._button_pady = 4 if self._compact_ui else 6
+            self._title_font_size = 16 if self._compact_ui else 18
+            self._base_font_size = 10
+            self._small_font_size = 9
+            self._tree_rowheight = 24 if self._compact_ui else 26
+
+        width = max(980, min(width, work_w - 16 if work_w > 1000 else work_w))
+        height = max(620, min(height, work_h - 16 if work_h > 700 else work_h))
+        x = left + max(0, (work_w - width) // 2)
+        y = top + max(0, (work_h - height) // 2)
+
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.minsize(980, min(700, max(560, work_h - 80)))
+
+        # ttk style tuning must happen after Tk exists.  It keeps Treeview rows
+        # readable on 4K without bloating the whole window on FHD.
+        try:
+            style = ttk.Style(self.root)
+            style.configure("Treeview", rowheight=self._tree_rowheight)
+            style.configure("Treeview.Heading", font=("Microsoft JhengHei UI", self._small_font_size, "bold"))
+        except Exception:
+            pass
+
     def _build_ui(self):
-        top = tk.Frame(self.root, padx=10, pady=8)
+        top = tk.Frame(self.root, padx=10, pady=self._top_pad_y)
         top.pack(fill=tk.X)
 
         tk.Label(
             top,
             text="Media Batch Downloader",
-            font=("Microsoft JhengHei UI", 18, "bold"),
+            font=("Microsoft JhengHei UI", self._title_font_size, "bold"),
         ).pack(anchor="w")
 
         hint = "支援 Instagram / Facebook  •  可貼 URL 或拖入 .txt  •  匯入 txt 會自動預處理"
@@ -129,7 +254,7 @@ class App:
         tk.Label(
             top,
             text=hint,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             fg="#666666",
         ).pack(anchor="w")
 
@@ -140,7 +265,7 @@ class App:
         tk.Label(
             progress_frame,
             textvariable=self.progress_label_var,
-            font=("Microsoft JhengHei UI", 10, "bold"),
+            font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             fg="#333333",
         ).pack(anchor="w")
 
@@ -157,7 +282,7 @@ class App:
         tk.Label(
             progress_frame,
             textvariable=self.phase_var,
-            font=("Microsoft JhengHei UI", 9),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             fg="#444444",
         ).pack(anchor="w")
 
@@ -165,7 +290,7 @@ class App:
         tk.Label(
             progress_frame,
             textvariable=self.active_url_var,
-            font=("Consolas", 9),
+            font=("Consolas", self._small_font_size),
             fg="#666666",
         ).pack(anchor="w")
 
@@ -173,7 +298,7 @@ class App:
         tk.Label(
             progress_frame,
             textvariable=self.cooldown_var,
-            font=("Microsoft JhengHei UI", 10, "bold"),
+            font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             fg="#E65100",
         ).pack(anchor="w")
 
@@ -186,22 +311,22 @@ class App:
         tk.Label(
             time_frame,
             textvariable=self.elapsed_var,
-            font=("Microsoft JhengHei UI", 10, "bold"),
+            font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             fg="#1976D2",
         ).pack(side=tk.LEFT, padx=(0, 20))
 
         tk.Label(
             time_frame,
             textvariable=self.remaining_var,
-            font=("Microsoft JhengHei UI", 10, "bold"),
+            font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             fg="#2E7D32",
         ).pack(side=tk.LEFT)
 
         self.text_input = tk.Text(
             top,
-            height=6,
+            height=self._text_input_height,
             wrap=tk.WORD,
-            font=("Consolas", 11),
+            font=("Consolas", self._base_font_size + 1),
             relief=tk.SOLID,
             bd=1,
             fg="#999999",
@@ -225,8 +350,8 @@ class App:
             bg="#1976D2",
             fg="white",
             padx=12,
-            pady=6,
-            font=("Microsoft JhengHei UI", 10, "bold"),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 6))
@@ -236,7 +361,7 @@ class App:
             text="🧹 清空輸入框",
             command=self._clear_input,
             padx=10,
-            pady=6,
+            pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 4))
@@ -248,8 +373,8 @@ class App:
             bg="#6A1B9A",
             fg="white",
             padx=10,
-            pady=6,
-            font=("Microsoft JhengHei UI", 9),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 4))
@@ -261,8 +386,8 @@ class App:
             bg="#00897B",
             fg="white",
             padx=10,
-            pady=6,
-            font=("Microsoft JhengHei UI", 9),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 4))
@@ -274,8 +399,8 @@ class App:
             bg="#5E35B1",
             fg="white",
             padx=10,
-            pady=6,
-            font=("Microsoft JhengHei UI", 9),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 4))
@@ -285,7 +410,7 @@ class App:
             text="📁 開啟下載資料夾",
             command=self._open_downloads,
             padx=10,
-            pady=6,
+            pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 4))
@@ -297,8 +422,8 @@ class App:
             bg="#37474F",
             fg="white",
             padx=10,
-            pady=6,
-            font=("Microsoft JhengHei UI", 9),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 8))
@@ -310,8 +435,8 @@ class App:
             bg="#455A64",
             fg="white",
             padx=10,
-            pady=6,
-            font=("Microsoft JhengHei UI", 9),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 8))
@@ -323,8 +448,8 @@ class App:
             bg="#5C6BC0",
             fg="white",
             padx=10,
-            pady=6,
-            font=("Microsoft JhengHei UI", 9),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
@@ -389,7 +514,7 @@ class App:
                 text=label,
                 width=btn_width,
                 fg=color if key != "ALL" else "#333333",
-                font=("Microsoft JhengHei UI", 9),
+                font=("Microsoft JhengHei UI", self._small_font_size),
                 command=lambda k=key: self._set_filter(k),
                 relief=tk.FLAT,
                 cursor="hand2",
@@ -406,7 +531,7 @@ class App:
             fg="white",
             padx=10,
             pady=5,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=4)
@@ -419,7 +544,7 @@ class App:
             fg="white",
             padx=10,
             pady=5,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=4)
@@ -432,7 +557,7 @@ class App:
             fg="white",
             padx=10,
             pady=5,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
@@ -446,7 +571,7 @@ class App:
             fg="white",
             padx=10,
             pady=5,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
@@ -460,7 +585,7 @@ class App:
             fg="white",
             padx=10,
             pady=5,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
@@ -474,7 +599,7 @@ class App:
             fg="white",
             padx=10,
             pady=5,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=4)
@@ -487,7 +612,7 @@ class App:
             fg="white",
             padx=10,
             pady=5,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT)
@@ -499,7 +624,7 @@ class App:
             anchor="w",
             relief=tk.SUNKEN,
             bd=1,
-            font=("Microsoft JhengHei UI", 9),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             fg="#333333",
             padx=6,
         ).pack(fill=tk.X, side=tk.BOTTOM)
@@ -1253,7 +1378,7 @@ class App:
         tk.Label(
             frame,
             text=f"{icon} {title}",
-            font=("Microsoft JhengHei UI", 18, "bold"),
+            font=("Microsoft JhengHei UI", self._title_font_size, "bold"),
             fg=title_color,
         ).pack(anchor="w", pady=(0, 12))
 
@@ -1278,7 +1403,7 @@ class App:
         tk.Label(
             frame,
             text=hint,
-            font=("Microsoft JhengHei UI", 10),
+            font=("Microsoft JhengHei UI", self._base_font_size),
             fg="#555555",
             wraplength=410,
             justify=tk.LEFT,
@@ -1294,7 +1419,7 @@ class App:
             bg="#1976D2",
             fg="white",
             padx=12,
-            pady=6,
+            pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 8))
@@ -1307,7 +1432,7 @@ class App:
                 bg="#6D4C41",
                 fg="white",
                 padx=12,
-                pady=6,
+                pady=self._button_pady,
                 relief=tk.FLAT,
                 cursor="hand2",
             ).pack(side=tk.LEFT, padx=(0, 8))
@@ -1317,7 +1442,7 @@ class App:
             text="關閉",
             command=win.destroy,
             padx=14,
-            pady=6,
+            pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.RIGHT)
@@ -1465,6 +1590,8 @@ def _load_accounts() -> list:
 
 
 def main():
+    _enable_dpi_awareness()
+
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(PREPROCESS_OUTPUT_DIR, exist_ok=True)
