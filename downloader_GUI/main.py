@@ -195,7 +195,8 @@ class App:
             self._title_font_size = 20
             self._base_font_size = 11
             self._small_font_size = 10
-            self._tree_rowheight = 30
+            self._tree_rowheight = 34
+            self._ui_scale = 1.18
         elif work_w >= 2400 or work_h >= 1300:
             # 2K / high-DPI laptop external monitor.
             width = min(1650, max(1300, int(work_w * 0.66)))
@@ -207,7 +208,8 @@ class App:
             self._title_font_size = 19
             self._base_font_size = 10
             self._small_font_size = 9
-            self._tree_rowheight = 28
+            self._tree_rowheight = 30
+            self._ui_scale = 1.06
         else:
             # FHD and smaller: fit within the work area and keep bottom buttons visible.
             width = min(max(1180, int(work_w * 0.96)), max(980, work_w - 24))
@@ -219,7 +221,17 @@ class App:
             self._title_font_size = 16 if self._compact_ui else 18
             self._base_font_size = 10
             self._small_font_size = 9
-            self._tree_rowheight = 24 if self._compact_ui else 26
+            if self._compact_ui:
+                self._title_font_size = 15
+                self._base_font_size = 9
+                self._small_font_size = 8
+                self._text_input_height = 3
+                self._button_pady = 3
+                self._tree_rowheight = 22
+                self._ui_scale = 0.90
+            else:
+                self._tree_rowheight = 26
+                self._ui_scale = 1.00
 
         width = max(980, min(width, work_w - 16 if work_w > 1000 else work_w))
         height = max(620, min(height, work_h - 16 if work_h > 700 else work_h))
@@ -227,19 +239,45 @@ class App:
         y = top + max(0, (work_h - height) // 2)
 
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.minsize(980, min(700, max(560, work_h - 80)))
+        min_w = 940 if self._compact_ui else 980
+        min_h = min(680, max(540, work_h - 80)) if self._compact_ui else min(700, max(560, work_h - 80))
+        self.root.minsize(min_w, min_h)
+
+        # ttk style tuning must happen after Tk exists.  It keeps Treeview rows
+        # readable on 4K without bloating the whole window on FHD.
+        # Centralized pixel metrics.  The UI uses these values instead of a mix
+        # of fixed constants so fonts, button padding, frame padding and row
+        # heights scale together on FHD / 2K / 4K / Windows 125%-175% setups.
+        self._pad_x = self._ui_px(10)
+        self._pad_y = self._ui_px(6)
+        self._gap_x = self._ui_px(4)
+        self._gap_y = self._ui_px(4)
+        self._button_padx = self._ui_px(10)
+        self._button_pady_main = self._ui_px(5)
+        self._bottom_button_pady = self._ui_px(4)
+        self._status_padx = self._ui_px(6)
+        self._filter_width = 9 if self._compact_ui else 11
+        self._filter_downloading_width = 12 if self._compact_ui else 14
+        self._url_col_width = self._ui_px(720)
+        self._status_col_width = self._ui_px(150)
+        self._retry_col_width = self._ui_px(64)
 
         # ttk style tuning must happen after Tk exists.  It keeps Treeview rows
         # readable on 4K without bloating the whole window on FHD.
         try:
             style = ttk.Style(self.root)
-            style.configure("Treeview", rowheight=self._tree_rowheight)
+            style.configure("Treeview", rowheight=self._tree_rowheight, font=("Microsoft JhengHei UI", self._small_font_size))
             style.configure("Treeview.Heading", font=("Microsoft JhengHei UI", self._small_font_size, "bold"))
         except Exception:
             pass
 
+    def _ui_px(self, value: int, minimum: int = 1) -> int:
+        """Scale integer pixel values with the current UI scale."""
+        scale = float(getattr(self, "_ui_scale", 1.0) or 1.0)
+        return max(minimum, int(round(value * scale)))
+
     def _build_ui(self):
-        top = tk.Frame(self.root, padx=10, pady=self._top_pad_y)
+        top = tk.Frame(self.root, padx=self._pad_x, pady=self._top_pad_y)
         top.pack(fill=tk.X)
 
         tk.Label(
@@ -259,7 +297,7 @@ class App:
         ).pack(anchor="w")
 
         progress_frame = tk.Frame(top)
-        progress_frame.pack(fill=tk.X, pady=(8, 4))
+        progress_frame.pack(fill=tk.X, pady=(self._ui_px(8), self._ui_px(4)))
 
         self.progress_label_var = tk.StringVar(value="進度：0 / 0")
         tk.Label(
@@ -276,7 +314,7 @@ class App:
             maximum=100,
             value=0,
         )
-        self.progress.pack(fill=tk.X, pady=(4, 2))
+        self.progress.pack(fill=tk.X, pady=(self._ui_px(4), self._ui_px(2)))
 
         self.phase_var = tk.StringVar(value="目前狀態：就緒")
         tk.Label(
@@ -303,7 +341,7 @@ class App:
         ).pack(anchor="w")
 
         time_frame = tk.Frame(progress_frame)
-        time_frame.pack(anchor="w", pady=(2, 0))
+        time_frame.pack(anchor="w", pady=(self._ui_px(2), 0))
 
         self.elapsed_var = tk.StringVar(value="Elapsed: 00:00")
         self.remaining_var = tk.StringVar(value="Remaining: --:--")
@@ -313,7 +351,7 @@ class App:
             textvariable=self.elapsed_var,
             font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             fg="#1976D2",
-        ).pack(side=tk.LEFT, padx=(0, 20))
+        ).pack(side=tk.LEFT, padx=(0, self._ui_px(20)))
 
         tk.Label(
             time_frame,
@@ -331,7 +369,7 @@ class App:
             bd=1,
             fg="#999999",
         )
-        self.text_input.pack(fill=tk.X, pady=(8, 6))
+        self.text_input.pack(fill=tk.X, pady=(self._ui_px(8), self._ui_px(6)))
         self.text_input.insert("1.0", _PLACEHOLDER)
         self.text_input.bind("<FocusIn>", self._on_focus_in)
         self.text_input.bind("<FocusOut>", self._on_focus_out)
@@ -340,8 +378,15 @@ class App:
             self.text_input.drop_target_register(DND_FILES)
             self.text_input.dnd_bind("<<Drop>>", self._on_drop)
 
-        btn_row = tk.Frame(top)
-        btn_row.pack(anchor="w", pady=(0, 4))
+        btn_area = tk.Frame(top)
+        btn_area.pack(fill=tk.X, pady=(0, self._ui_px(4)))
+        btn_row = tk.Frame(btn_area)
+        btn_row.pack(anchor="w", fill=tk.X)
+        btn_row2 = tk.Frame(btn_area)
+        if self._compact_ui:
+            btn_row2.pack(anchor="w", fill=tk.X, pady=(self._ui_px(4), 0))
+        else:
+            btn_row2 = btn_row
 
         tk.Button(
             btn_row,
@@ -349,7 +394,7 @@ class App:
             command=self._start_download,
             bg="#1976D2",
             fg="white",
-            padx=12,
+            padx=self._ui_px(12),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             relief=tk.FLAT,
@@ -360,7 +405,7 @@ class App:
             btn_row,
             text="🧹 清空輸入框",
             command=self._clear_input,
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
@@ -372,7 +417,7 @@ class App:
             command=self._import_txt,
             bg="#6A1B9A",
             fg="white",
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
@@ -385,7 +430,7 @@ class App:
             command=self._preprocess_links,
             bg="#00897B",
             fg="white",
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
@@ -398,7 +443,7 @@ class App:
             command=self._load_preprocessed_downloads,
             bg="#5E35B1",
             fg="white",
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
@@ -409,19 +454,19 @@ class App:
             btn_row,
             text="📁 開啟下載資料夾",
             command=self._open_downloads,
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=(0, 4))
 
         tk.Button(
-            btn_row,
+            btn_row2,
             text="📂 開啟預處理 output",
             command=self._open_preprocess_output,
             bg="#37474F",
             fg="white",
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
@@ -429,12 +474,12 @@ class App:
         ).pack(side=tk.LEFT, padx=(0, 8))
 
         tk.Button(
-            btn_row,
+            btn_row2,
             text="🧼 清除已下載紀錄",
             command=self._clear_processed_log,
             bg="#455A64",
             fg="white",
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
@@ -442,12 +487,12 @@ class App:
         ).pack(side=tk.LEFT, padx=(0, 8))
 
         self.login_btn = tk.Button(
-            btn_row,
+            btn_row2,
             text="🔑 登入 IG",
             command=self._manual_login,
             bg="#5C6BC0",
             fg="white",
-            padx=10,
+            padx=self._button_padx,
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
@@ -455,9 +500,9 @@ class App:
         )
         self.login_btn.pack(side=tk.LEFT)
 
-        ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=self._ui_px(8), pady=(0, self._ui_px(4)))
 
-        mid = tk.Frame(self.root, padx=10)
+        mid = tk.Frame(self.root, padx=self._pad_x)
         mid.pack(fill=tk.BOTH, expand=True)
 
         cols = ("url", "status", "retry")
@@ -465,9 +510,9 @@ class App:
         self.tree.heading("url", text="URL")
         self.tree.heading("status", text="狀態", anchor="center")
         self.tree.heading("retry", text="Retry", anchor="center")
-        self.tree.column("url", width=720, stretch=True, minwidth=320)
-        self.tree.column("status", width=160, stretch=False, anchor="center")
-        self.tree.column("retry", width=70, stretch=False, anchor="center")
+        self.tree.column("url", width=self._url_col_width, stretch=True, minwidth=self._ui_px(300))
+        self.tree.column("status", width=self._status_col_width, stretch=False, anchor="center")
+        self.tree.column("retry", width=self._retry_col_width, stretch=False, anchor="center")
 
         vsb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(mid, orient="horizontal", command=self.tree.xview)
@@ -488,13 +533,16 @@ class App:
         self.tree.bind("<Control-C>", self._copy_selected_url)
         self.tree.bind("<Double-Button-1>", self._copy_selected_url)
 
-        ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=8, pady=(4, 0))
+        ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=self._ui_px(8), pady=(self._ui_px(4), 0))
 
-        bot = tk.Frame(self.root, padx=10, pady=6)
+        bot = tk.Frame(self.root, padx=self._pad_x, pady=self._pad_y)
         bot.pack(fill=tk.X)
 
-        filter_frame = tk.LabelFrame(bot, text="篩選", padx=4, pady=2)
-        filter_frame.pack(side=tk.LEFT)
+        filter_frame = tk.LabelFrame(bot, text="篩選", padx=self._ui_px(4), pady=self._ui_px(2))
+        if self._compact_ui:
+            filter_frame.pack(anchor="w", fill=tk.X, pady=(0, self._ui_px(4)))
+        else:
+            filter_frame.pack(side=tk.LEFT)
 
         filter_defs = [
             ("全部", "ALL"),
@@ -506,9 +554,9 @@ class App:
         ]
         for label, key in filter_defs:
             color = _STATUS_COLORS.get(key, "#333333")
-            btn_width = 11
+            btn_width = self._filter_width
             if key == "DOWNLOADING":
-                btn_width = 14
+                btn_width = self._filter_downloading_width
             tk.Button(
                 filter_frame,
                 text=label,
@@ -518,10 +566,13 @@ class App:
                 command=lambda k=key: self._set_filter(k),
                 relief=tk.FLAT,
                 cursor="hand2",
-            ).pack(side=tk.LEFT, padx=2, pady=1)
+            ).pack(side=tk.LEFT, padx=self._ui_px(2), pady=self._ui_px(1))
 
         act_frame = tk.Frame(bot)
-        act_frame.pack(side=tk.RIGHT)
+        if self._compact_ui:
+            act_frame.pack(anchor="e", fill=tk.X)
+        else:
+            act_frame.pack(side=tk.RIGHT)
 
         tk.Button(
             act_frame,
@@ -529,12 +580,12 @@ class App:
             command=self._show_failed_links_window,
             bg="#6D4C41",
             fg="white",
-            padx=10,
-            pady=5,
+            padx=self._button_padx,
+            pady=self._bottom_button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             act_frame,
@@ -542,12 +593,12 @@ class App:
             command=lambda: self._copy_status_urls("BLOCKED"),
             bg="#EF6C00",
             fg="white",
-            padx=10,
-            pady=5,
+            padx=self._button_padx,
+            pady=self._bottom_button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
 
         self.pause_btn = tk.Button(
             act_frame,
@@ -555,13 +606,13 @@ class App:
             command=self._pause_downloads,
             bg="#546E7A",
             fg="white",
-            padx=10,
-            pady=5,
+            padx=self._button_padx,
+            pady=self._bottom_button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.pause_btn.pack(side=tk.LEFT, padx=4)
+        self.pause_btn.pack(side=tk.LEFT, padx=self._gap_x)
 
         self.resume_btn = tk.Button(
             act_frame,
@@ -569,13 +620,13 @@ class App:
             command=self._resume_downloads,
             bg="#2E7D32",
             fg="white",
-            padx=10,
-            pady=5,
+            padx=self._button_padx,
+            pady=self._bottom_button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.resume_btn.pack(side=tk.LEFT, padx=4)
+        self.resume_btn.pack(side=tk.LEFT, padx=self._gap_x)
 
         self.stop_btn = tk.Button(
             act_frame,
@@ -583,13 +634,13 @@ class App:
             command=self._stop_downloads,
             bg="#8E24AA",
             fg="white",
-            padx=10,
-            pady=5,
+            padx=self._button_padx,
+            pady=self._bottom_button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.stop_btn.pack(side=tk.LEFT, padx=4)
+        self.stop_btn.pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             act_frame,
@@ -597,12 +648,12 @@ class App:
             command=self._retry_failed,
             bg="#E65100",
             fg="white",
-            padx=10,
-            pady=5,
+            padx=self._button_padx,
+            pady=self._bottom_button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             act_frame,
@@ -610,8 +661,8 @@ class App:
             command=self._clear_tasks,
             bg="#C62828",
             fg="white",
-            padx=10,
-            pady=5,
+            padx=self._button_padx,
+            pady=self._bottom_button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size),
             relief=tk.FLAT,
             cursor="hand2",
@@ -626,7 +677,7 @@ class App:
             bd=1,
             font=("Microsoft JhengHei UI", self._small_font_size),
             fg="#333333",
-            padx=6,
+            padx=self._status_padx,
         ).pack(fill=tk.X, side=tk.BOTTOM)
 
     def _build_tree_context_menu(self):
@@ -802,20 +853,20 @@ class App:
         win.title("選擇帳號")
         win.grab_set()
         win.resizable(False, False)
-        win.geometry("320x210")
+        win.geometry(f"{self._ui_px(320)}x{self._ui_px(210)}")
 
         tk.Label(
             win,
             text="選擇要登入的帳號：",
-            font=("Microsoft JhengHei UI", 11),
-            pady=10,
+            font=("Microsoft JhengHei UI", self._base_font_size),
+            pady=self._ui_px(10),
         ).pack()
 
-        lb = tk.Listbox(win, width=36, height=min(len(accounts), 6), font=("Consolas", 10))
+        lb = tk.Listbox(win, width=36, height=min(len(accounts), 6), font=("Consolas", self._small_font_size))
         for a in accounts:
             lb.insert(tk.END, a["username"])
         lb.select_set(0)
-        lb.pack(padx=20, pady=(0, 6))
+        lb.pack(padx=self._ui_px(20), pady=(0, self._ui_px(6)))
 
         def _confirm():
             sel = lb.curselection()
@@ -824,25 +875,25 @@ class App:
             win.destroy()
 
         btn_r = tk.Frame(win)
-        btn_r.pack(pady=6)
+        btn_r.pack(pady=self._ui_px(6))
         tk.Button(
             btn_r,
             text="確認",
             command=_confirm,
-            padx=18,
-            pady=4,
+            padx=self._ui_px(18),
+            pady=self._ui_px(4),
             bg="#1976D2",
             fg="white",
             relief=tk.FLAT,
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
         tk.Button(
             btn_r,
             text="取消",
             command=win.destroy,
-            padx=18,
-            pady=4,
+            padx=self._ui_px(18),
+            pady=self._ui_px(4),
             relief=tk.FLAT,
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
 
     def _do_login(self, account: dict):
         if self._login_in_progress:
@@ -1148,21 +1199,21 @@ class App:
 
         self._failed_window = tk.Toplevel(self.root)
         self._failed_window.title("失敗 / 封鎖 / Missing URL 清單")
-        self._failed_window.geometry("980x620")
+        self._failed_window.geometry(f"{self._ui_px(980)}x{self._ui_px(620)}")
 
-        top = tk.Frame(self._failed_window, padx=10, pady=10)
+        top = tk.Frame(self._failed_window, padx=self._pad_x, pady=self._pad_x)
         top.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(
             top,
             text="失敗 / 封鎖 / Missing / 不可用 連結",
-            font=("Microsoft JhengHei UI", 14, "bold"),
-        ).pack(anchor="w", pady=(0, 8))
+            font=("Microsoft JhengHei UI", self._title_font_size - 2, "bold"),
+        ).pack(anchor="w", pady=(0, self._ui_px(8)))
 
         filter_row = tk.Frame(top)
-        filter_row.pack(fill=tk.X, pady=(0, 6))
+        filter_row.pack(fill=tk.X, pady=(0, self._ui_px(6)))
 
-        tk.Label(filter_row, text="狀態篩選：", font=("Microsoft JhengHei UI", 10)).pack(side=tk.LEFT)
+        tk.Label(filter_row, text="狀態篩選：", font=("Microsoft JhengHei UI", self._small_font_size)).pack(side=tk.LEFT)
         self.failed_filter_var = tk.StringVar(value="ALL")
         self.failed_filter_combo = ttk.Combobox(
             filter_row,
@@ -1171,7 +1222,7 @@ class App:
             state="readonly",
             width=16,
         )
-        self.failed_filter_combo.pack(side=tk.LEFT, padx=(4, 10))
+        self.failed_filter_combo.pack(side=tk.LEFT, padx=(self._gap_x, self._button_padx))
         self.failed_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_failed_window_text())
 
         tk.Button(
@@ -1180,8 +1231,8 @@ class App:
             command=lambda: self._copy_status_urls("BLOCKED"),
             bg="#EF6C00",
             fg="white",
-            padx=10,
-            pady=3,
+            padx=self._button_padx,
+            pady=self._ui_px(3),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=3)
@@ -1192,8 +1243,8 @@ class App:
             command=lambda: self._copy_status_urls("MISSING"),
             bg="#607D8B",
             fg="white",
-            padx=10,
-            pady=3,
+            padx=self._button_padx,
+            pady=self._ui_px(3),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=3)
@@ -1204,8 +1255,8 @@ class App:
             command=lambda: self._open_path(DATA_DIR),
             bg="#455A64",
             fg="white",
-            padx=10,
-            pady=3,
+            padx=self._button_padx,
+            pady=self._ui_px(3),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=3)
@@ -1213,14 +1264,14 @@ class App:
         self.failed_text = tk.Text(
             top,
             wrap=tk.WORD,
-            font=("Consolas", 10),
+            font=("Consolas", self._small_font_size + 1),
             relief=tk.SOLID,
             bd=1,
         )
         self.failed_text.pack(fill=tk.BOTH, expand=True)
 
         btns = tk.Frame(top)
-        btns.pack(fill=tk.X, pady=(8, 0))
+        btns.pack(fill=tk.X, pady=(self._ui_px(8), 0))
 
         tk.Button(
             btns,
@@ -1228,11 +1279,11 @@ class App:
             command=self._refresh_failed_window_text,
             bg="#1976D2",
             fg="white",
-            padx=10,
-            pady=4,
+            padx=self._button_padx,
+            pady=self._ui_px(4),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             btns,
@@ -1240,11 +1291,11 @@ class App:
             command=self._copy_failed_text,
             bg="#6A1B9A",
             fg="white",
-            padx=10,
-            pady=4,
+            padx=self._button_padx,
+            pady=self._ui_px(4),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             btns,
@@ -1252,18 +1303,18 @@ class App:
             command=self._copy_failed_urls_only,
             bg="#00897B",
             fg="white",
-            padx=10,
-            pady=4,
+            padx=self._button_padx,
+            pady=self._ui_px(4),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=4)
+        ).pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             btns,
             text="關閉",
             command=self._failed_window.destroy,
-            padx=10,
-            pady=4,
+            padx=self._button_padx,
+            pady=self._ui_px(4),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.RIGHT, padx=4)
@@ -1362,7 +1413,7 @@ class App:
 
         win = tk.Toplevel(self.root)
         win.title(title)
-        win.geometry("460x360")
+        win.geometry(f"{self._ui_px(460)}x{self._ui_px(360)}")
         win.resizable(False, False)
         win.transient(self.root)
 
@@ -1372,7 +1423,7 @@ class App:
         except Exception:
             pass
 
-        frame = tk.Frame(win, padx=20, pady=18)
+        frame = tk.Frame(win, padx=self._ui_px(20), pady=self._ui_px(18))
         frame.pack(fill=tk.BOTH, expand=True)
 
         tk.Label(
@@ -1380,7 +1431,7 @@ class App:
             text=f"{icon} {title}",
             font=("Microsoft JhengHei UI", self._title_font_size, "bold"),
             fg=title_color,
-        ).pack(anchor="w", pady=(0, 12))
+        ).pack(anchor="w", pady=(0, self._ui_px(12)))
 
         rows = [
             ("總任務", total),
@@ -1394,10 +1445,10 @@ class App:
         ]
 
         grid = tk.Frame(frame)
-        grid.pack(fill=tk.X, pady=(0, 12))
+        grid.pack(fill=tk.X, pady=(0, self._ui_px(12)))
         for r, (k, v) in enumerate(rows):
-            tk.Label(grid, text=f"{k}：", font=("Microsoft JhengHei UI", 11, "bold"), anchor="w").grid(row=r, column=0, sticky="w", pady=2)
-            tk.Label(grid, text=str(v), font=("Microsoft JhengHei UI", 11), anchor="w").grid(row=r, column=1, sticky="w", pady=2)
+            tk.Label(grid, text=f"{k}：", font=("Microsoft JhengHei UI", self._base_font_size, "bold"), anchor="w").grid(row=r, column=0, sticky="w", pady=self._ui_px(2))
+            tk.Label(grid, text=str(v), font=("Microsoft JhengHei UI", self._base_font_size), anchor="w").grid(row=r, column=1, sticky="w", pady=self._ui_px(2))
 
         hint = "全部任務已成功完成。" if problem_total == 0 else "可點擊「查看失敗」檢查 FAILED / BLOCKED / MISSING / RETRY 清單。"
         tk.Label(
@@ -1407,10 +1458,10 @@ class App:
             fg="#555555",
             wraplength=410,
             justify=tk.LEFT,
-        ).pack(anchor="w", pady=(0, 12))
+        ).pack(anchor="w", pady=(0, self._ui_px(12)))
 
         btn_row = tk.Frame(frame)
-        btn_row.pack(fill=tk.X, pady=(4, 0))
+        btn_row.pack(fill=tk.X, pady=(self._ui_px(4), 0))
 
         tk.Button(
             btn_row,
@@ -1418,7 +1469,7 @@ class App:
             command=lambda: self._open_path(DOWNLOAD_DIR),
             bg="#1976D2",
             fg="white",
-            padx=12,
+            padx=self._ui_px(12),
             pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
@@ -1441,7 +1492,7 @@ class App:
             btn_row,
             text="關閉",
             command=win.destroy,
-            padx=14,
+            padx=self._ui_px(14),
             pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
