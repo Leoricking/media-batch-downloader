@@ -24,15 +24,6 @@ except Exception:
     FB_DEBUG_CAPTURE = False
 
 try:
-    from config import FB_PARALLEL_RESCUE_PAGES
-except Exception:
-    # v11.34 controlled parallel rescue:
-    # Default to controlled 3-page rescue for v11.37 fast plateau shift.  This is only used by large-album segmented
-    # photo-page rescue after the main viewer has plateaued; normal small albums
-    # and Reel/video routes are unaffected.
-    FB_PARALLEL_RESCUE_PAGES = 3
-
-try:
     from config import FB_FILENAME_WITH_TITLE
 except Exception:
     # True: multiple FB images are named 001_<post_title>.jpg for easier archive/search.
@@ -54,15 +45,13 @@ try:
 except Exception:
     load_netscape_cookies_to_playwright = None
 
-# v11.42 Full Build: restore small/mid raw links + expand large-album Comet/CDN crawl
+# v11.23.2 Full Build: v11.22.1 Fast Retry Guard + Grid Tile Mode + Strict no-video fallback for incomplete galleries
 
 _cc = OpenCC("s2t") if OpenCC else None
 
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
 _DL_TIMEOUT = 900
-# v11.37: allow true large albums (e.g. +99 => 103 photos) to build enough
-# photo-page records.  Strict scope filters / completeness guard still decide final output.
-_MAX_FB_ITEMS = 160
+_MAX_FB_ITEMS = 40
 _MIN_FILE_SIZE = 20 * 1024
 _PREFERRED_IMAGE_SIZE = 80 * 1024
 
@@ -709,134 +698,6 @@ def _cleanup_fb_debug_capture() -> None:
         logger.warning(f"FB debug capture cleanup failed: {e}")
 
 
-
-
-def _image_file_dimensions(path: str) -> tuple[int, int]:
-    try:
-        from PIL import Image
-        with Image.open(path) as img:
-            return int(img.width or 0), int(img.height or 0)
-    except Exception:
-        return 0, 0
-
-
-def _image_average_hash(path: str, hash_size: int = 16) -> tuple[int | None, int, int]:
-    """
-    v11.33 Visual Duplicate Audit:
-    Return a lightweight perceptual hash for image similarity reporting.
-
-    This is intentionally audit-only.  It never deletes files and never changes
-    the strict Facebook completeness guard.  Facebook posts can legitimately
-    contain adjacent animation frames or intentionally repeated images, so
-    visual duplicates are reported for human review instead of being removed.
-    """
-    try:
-        from PIL import Image
-        with Image.open(path) as img:
-            width, height = int(img.width or 0), int(img.height or 0)
-            img = img.convert("L").resize((hash_size, hash_size))
-            pixels = list(img.getdata())
-        if not pixels:
-            return None, width, height
-        avg = sum(pixels) / len(pixels)
-        bits = 0
-        for px in pixels:
-            bits = (bits << 1) | (1 if px >= avg else 0)
-        return bits, width, height
-    except Exception:
-        return None, 0, 0
-
-
-def _hamming_distance_int(a: int, b: int) -> int:
-    try:
-        return int((int(a) ^ int(b)).bit_count())
-    except Exception:
-        return 10**9
-
-
-def _write_visual_duplicate_report(folder: str, image_paths: list[str]) -> None:
-    """
-    v11.33 Visual Duplicate Audit.
-
-    Generate a report for visually similar outputs such as adjacent animation
-    frames or same-looking images saved at different resolutions.  This does not
-    delete or rename anything.  The downloader still preserves all 103/103 files
-    when Facebook says the target is 103.
-    """
-    try:
-        if not folder or not os.path.isdir(folder):
-            return
-
-        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
-        paths = [
-            p for p in (image_paths or [])
-            if os.path.isfile(p) and os.path.splitext(p)[1].lower() in image_exts
-        ]
-        if len(paths) < 2:
-            return
-
-        records = []
-        for path in sorted(paths, key=_natural_key):
-            ahash, width, height = _image_average_hash(path, hash_size=16)
-            if ahash is None:
-                continue
-            try:
-                size = os.path.getsize(path)
-            except Exception:
-                size = 0
-            records.append({
-                "path": path,
-                "name": os.path.basename(path),
-                "hash": ahash,
-                "width": width,
-                "height": height,
-                "size": size,
-            })
-
-        if len(records) < 2:
-            return
-
-        suspects = []
-        # 16x16 average hash has 256 bits.  <= 10 is intentionally conservative:
-        # it catches near-identical/resized images while avoiding most normal
-        # sequential animation frames.
-        threshold = 10
-        for i in range(len(records)):
-            a = records[i]
-            for j in range(i + 1, len(records)):
-                b = records[j]
-                dist = _hamming_distance_int(a["hash"], b["hash"])
-                if dist <= threshold:
-                    suspects.append((dist, a, b))
-
-        report_path = os.path.join(folder, "_visual_duplicate_report.txt")
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("Facebook visual duplicate audit report\n")
-            f.write("======================================\n\n")
-            f.write("This report is audit-only. No files were deleted or renamed.\n")
-            f.write("The downloader preserves the full Facebook target count; visually similar\n")
-            f.write("images may be intentional adjacent frames from the original post.\n\n")
-            f.write(f"Scanned images: {len(records)}\n")
-            f.write(f"Similarity threshold: average-hash Hamming distance <= {threshold}\n")
-            f.write(f"Suspected visual duplicate pairs: {len(suspects)}\n\n")
-
-            if not suspects:
-                f.write("No suspected visual duplicates found.\n")
-            else:
-                for idx, (dist, a, b) in enumerate(sorted(suspects, key=lambda x: (x[0], x[1]["name"], x[2]["name"])), 1):
-                    f.write(f"[{idx}] distance={dist}\n")
-                    f.write(f"  A: {a['name']} | {a['width']}x{a['height']} | {a['size']} bytes\n")
-                    f.write(f"  B: {b['name']} | {b['width']}x{b['height']} | {b['size']} bytes\n\n")
-
-        if suspects:
-            logger.info(
-                f"FB visual duplicate audit: suspected={len(suspects)} report={os.path.basename(report_path)}"
-            )
-        else:
-            logger.info("FB visual duplicate audit: no suspected visual duplicates")
-    except Exception as e:
-        logger.warning(f"FB visual duplicate audit failed: {e}")
-
 def move_files(title: str) -> bool:
     """
     Move validated Facebook temp outputs into DOWNLOAD_DIR.
@@ -883,7 +744,6 @@ def move_files(title: str) -> bool:
         files = image_files
 
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    moved_paths: list[str] = []
 
     if len(files) == 1:
         src = files[0]
@@ -896,7 +756,6 @@ def move_files(title: str) -> bool:
             os.remove(dst)
 
         shutil.move(src, dst)
-        moved_paths.append(dst)
         logger.info(f"FB 單檔完成: {os.path.basename(dst)}")
 
     else:
@@ -921,9 +780,7 @@ def move_files(title: str) -> bool:
                 os.remove(dst)
 
             shutil.move(src, dst)
-            moved_paths.append(dst)
 
-        _write_visual_duplicate_report(folder, moved_paths)
         logger.info(f"FB 多檔完成: {name}/ ({len(files)} 個)")
 
     _cleanup_fb_debug_capture()
@@ -1458,45 +1315,6 @@ def _pack_media_cluster_key(pack: dict) -> str:
 
 
 
-def _media_cluster_family_from_key(cluster_key: str) -> str:
-    """Return a relaxed CDN family key for very large FB albums.
-
-    Large Facebook albums can legitimately advance through sibling CDN cluster
-    keys such as 26678053 -> 26678054 -> 26678055 while staying inside the
-    same +N / set=pcb post.  Small albums still use the exact cluster gate;
-    only large-album mode passes this relaxed family key into the collector.
-    """
-    key = str(cluster_key or "")
-    return key[:6] if len(key) >= 6 else ""
-
-
-def _media_cluster_family_from_src(src: str) -> str:
-    return _media_cluster_family_from_key(_media_cluster_key_from_src(src))
-
-
-def _is_large_fb_album_target(expected_photo_count: int | None, plus_count: int = 0) -> bool:
-    """Return True only for high-confidence large FB photo albums.
-
-    Keep the condition intentionally narrow so the relaxed cluster-family logic
-    and resilient stale/recovery settings do not affect normal 5/16-photo
-    galleries or Facebook Reel/video routing.
-    """
-    try:
-        expected = int(expected_photo_count or 0)
-    except Exception:
-        expected = 0
-    try:
-        plus_n = int(plus_count or 0)
-    except Exception:
-        plus_n = 0
-
-    # +99 with expected=103 is the intended path.  The plus overlay guard keeps
-    # random high expected values from enabling large-album behavior by accident.
-    return expected >= 80 and plus_n >= 50
-
-
-
-
 def _fb_media_numeric_id_from_src(src: str) -> int:
     """
     v11.16 Manifest-like ordering:
@@ -1586,7 +1404,6 @@ def _filter_items_by_media_cluster_or_manifest(
     packs: list[dict],
     cluster_key: str,
     manifest_ids: list[str] | None = None,
-    cluster_family: str | None = None,
 ) -> list[dict]:
     """
     v11.17 Manifest Whitelist:
@@ -1607,13 +1424,11 @@ def _filter_items_by_media_cluster_or_manifest(
             continue
 
         key = _media_cluster_key_from_src(src)
-        family = _media_cluster_family_from_key(key)
         in_cluster = bool(cluster_key and key == cluster_key)
-        in_family = bool(cluster_family and family == cluster_family)
         in_manifest = _pack_has_manifest_id(pack, manifest_set)
 
-        if cluster_key or manifest_set or cluster_family:
-            if not (in_cluster or in_family or in_manifest):
+        if cluster_key or manifest_set:
+            if not (in_cluster or in_manifest):
                 continue
 
         clean_candidates = []
@@ -1623,8 +1438,7 @@ def _filter_items_by_media_cluster_or_manifest(
                 continue
             ckey = _media_cluster_key_from_src(csrc)
             cmid = _fb_media_numeric_id_str_from_src(csrc)
-            cfamily = _media_cluster_family_from_key(ckey)
-            if (cluster_key and ckey == cluster_key) or (cluster_family and cfamily == cluster_family) or (manifest_set and cmid in manifest_set) or (not cluster_key and not manifest_set and not cluster_family):
+            if (cluster_key and ckey == cluster_key) or (manifest_set and cmid in manifest_set) or (not cluster_key and not manifest_set):
                 clean_candidates.append(cand)
 
         if not clean_candidates and src:
@@ -2161,978 +1975,6 @@ def _collect_fb_photo_links(page):
 
 
 
-
-def _extract_fb_photo_links_from_html_text(text: str, pcb_key: str | None = None, expected_count: int | None = None) -> list[str]:
-    """
-    v11.37 Large Album HTML Manifest Rescue.
-
-    Facebook +N large albums can show only the first 5 visible anchors in the DOM
-    while the bootstrapped HTML / JSON still contains many photo/?fbid links for
-    the same set=pcb.<post_id>.  DOM-only grid collection then stalls at 5/103.
-
-    This parser extracts same-post photo links from the page HTML without
-    relaxing the final strict completeness guard.  It only returns links scoped
-    to the selected pcb when pcb_key is available.
-    """
-    if not text:
-        return []
-
-    try:
-        decoded = str(text)
-        # Decode the common FB / JSON escape layers.
-        for _ in range(2):
-            decoded = html.unescape(decoded)
-            decoded = decoded.replace("\\u0026", "&").replace("\\/", "/")
-            decoded = unquote(decoded)
-    except Exception:
-        decoded = str(text or "")
-
-    pcb = ""
-    try:
-        m = re.search(r"pcb:?([0-9]{8,})", pcb_key or "", flags=re.I)
-        if m:
-            pcb = m.group(1)
-    except Exception:
-        pcb = ""
-
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def add(fbid: str, set_id: str = "") -> None:
-        if not fbid:
-            return
-        if not re.fullmatch(r"[0-9]{8,}", str(fbid)):
-            return
-        if pcb:
-            if set_id and set_id != pcb:
-                return
-            set_id = pcb
-        elif set_id and not re.fullmatch(r"[0-9]{8,}", str(set_id)):
-            set_id = ""
-
-        # Prefer explicit pcb scoping.  Without a set id, keep only when no pcb is known.
-        if pcb and not set_id:
-            return
-
-        key = f"{fbid}|{set_id or ''}"
-        if key in seen:
-            return
-        seen.add(key)
-        if set_id:
-            out.append(f"https://www.facebook.com/photo/?fbid={fbid}&set=pcb.{set_id}")
-        else:
-            out.append(f"https://www.facebook.com/photo/?fbid={fbid}")
-
-    # Direct URL patterns, including escaped forms already decoded above.
-    direct_patterns = [
-        r"(?:https?://(?:www\.)?facebook\.com)?/photo/\?[^\"'<>\s]*?fbid=([0-9]{8,})[^\"'<>\s]*?[&?]set=pcb\.([0-9]{8,})",
-        r"(?:https?://(?:www\.)?facebook\.com)?/photo\.php\?[^\"'<>\s]*?fbid=([0-9]{8,})[^\"'<>\s]*?[&?]set=pcb\.([0-9]{8,})",
-        r"(?:https?://(?:www\.)?facebook\.com)?/photos/[^\"'<>\s]+?/([0-9]{8,})[^\"'<>\s]*?[&?]set=pcb\.([0-9]{8,})",
-    ]
-    for pat in direct_patterns:
-        try:
-            for fbid, set_id in re.findall(pat, decoded, flags=re.I):
-                add(fbid, set_id)
-        except Exception:
-            pass
-
-    # Reversed order sometimes appears in tracking/query fragments.
-    try:
-        for set_id, fbid in re.findall(
-            r"set=pcb\.([0-9]{8,})[^\"'<>\s]{0,260}?fbid=([0-9]{8,})",
-            decoded,
-            flags=re.I,
-        ):
-            add(fbid, set_id)
-    except Exception:
-        pass
-
-    # JSON-ish fallback: look for fbid/photo_id near the selected set id.
-    # Windowed scan avoids collecting unrelated recommendation photos.
-    if pcb:
-        try:
-            for m in re.finditer(rf"pcb\.?{re.escape(pcb)}", decoded, flags=re.I):
-                start = max(0, m.start() - 2600)
-                end = min(len(decoded), m.end() + 2600)
-                chunk = decoded[start:end]
-                ids = []
-                ids.extend(re.findall(r"(?:fbid|photo_id)[\\\"'\s:=]+([0-9]{8,})", chunk, flags=re.I))
-                ids.extend(re.findall(r"/photo/\?[^\"'<>\s]*?fbid=([0-9]{8,})", chunk, flags=re.I))
-                ids.extend(re.findall(r"/photos/[^\"'<>\s]+?/([0-9]{8,})", chunk, flags=re.I))
-                for fbid in ids:
-                    add(fbid, pcb)
-        except Exception:
-            pass
-
-    if expected_count:
-        try:
-            out = out[: max(int(expected_count) + 8, int(expected_count))]
-        except Exception:
-            pass
-
-    return out
-
-
-def _pcb_id_from_key(pcb_key: str | None) -> str:
-    """Return numeric pcb/post id from strings like pcb:123 or pcb.123."""
-    try:
-        m = re.search(r"pcb[:.]?([0-9]{8,})", str(pcb_key or ""), flags=re.I)
-        return m.group(1) if m else ""
-    except Exception:
-        return ""
-
-
-def _photo_fbid_from_link(url: str) -> str:
-    """Return numeric fbid/photo id from a true Facebook photo URL."""
-    try:
-        key = _stable_photo_link_key(url)
-        m = re.search(r"(?:fbid|photo_id|story_fbid):([0-9]{8,})", key, flags=re.I)
-        if m:
-            return m.group(1)
-        u = html.unescape(unquote(str(url or "")))
-        for pat in [
-            r"[?&](?:fbid|photo_id)=([0-9]{8,})",
-            r"/photos/(?:[^/]+/)?([0-9]{8,})",
-            r"[?&]story_fbid=([0-9]{8,})",
-        ]:
-            m2 = re.search(pat, u, flags=re.I)
-            if m2:
-                return m2.group(1)
-    except Exception:
-        pass
-    return ""
-
-
-def _canonical_photo_link_from_fbid(fbid: str, pcb_id: str = "") -> str:
-    if pcb_id:
-        return f"https://www.facebook.com/photo/?fbid={fbid}&set=pcb.{pcb_id}"
-    return f"https://www.facebook.com/photo/?fbid={fbid}"
-
-
-def _basic_photo_variants_from_link(link: str, pcb_key: str | None = None) -> list[str]:
-    """
-    v11.40 large-album rescue helper.
-
-    Convert desktop photo links into mobile/mbasic photo.php URLs.  The desktop
-    Theater viewer can stall or fail to open for 100+ albums, while mobile/basic
-    photo pages often expose next/previous same-set photo links in plain HTML.
-    """
-    fbid = _photo_fbid_from_link(link)
-    pcb_id = _pcb_id_from_key(pcb_key)
-    if not fbid:
-        return []
-    qs = urlencode({"fbid": fbid, **({"set": f"pcb.{pcb_id}"} if pcb_id else {})})
-    out = [
-        f"https://mbasic.facebook.com/photo.php?{qs}",
-        f"https://m.facebook.com/photo.php?{qs}",
-        _canonical_photo_link_from_fbid(fbid, pcb_id),
-    ]
-    return out
-
-
-def _basic_post_variants_from_url(url: str, pcb_key: str | None = None) -> list[str]:
-    """Build conservative mobile/basic post URLs for same-pcb large album probing."""
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def add(u: str):
-        if not u:
-            return
-        if u in seen:
-            return
-        seen.add(u)
-        out.append(u)
-
-    try:
-        raw = str(url or "")
-        if raw:
-            add(raw)
-            add(raw.replace("https://www.facebook.com/", "https://m.facebook.com/"))
-            add(raw.replace("https://www.facebook.com/", "https://mbasic.facebook.com/"))
-            add(raw.replace("https://facebook.com/", "https://m.facebook.com/"))
-            add(raw.replace("https://facebook.com/", "https://mbasic.facebook.com/"))
-    except Exception:
-        pass
-
-    pcb_id = _pcb_id_from_key(pcb_key)
-    if pcb_id:
-        add(f"https://mbasic.facebook.com/pcb.{pcb_id}")
-        add(f"https://m.facebook.com/pcb.{pcb_id}")
-        add(f"https://mbasic.facebook.com/story.php?story_fbid={pcb_id}")
-        add(f"https://m.facebook.com/story.php?story_fbid={pcb_id}")
-        add(f"https://www.facebook.com/pcb.{pcb_id}")
-    return out
-
-
-def _extract_same_pcb_photo_links_from_page(page, pcb_key: str | None, expected_count: int | None = None) -> list[str]:
-    """Extract same-pcb photo links from current page anchors plus HTML/JSON."""
-    pcb_id = _pcb_id_from_key(pcb_key)
-    out: list[str] = []
-    seen: set[str] = set()
-
-    def add_link(u: str):
-        if not u:
-            return
-        u = html.unescape(unquote(str(u)))
-        fbid = _photo_fbid_from_link(u)
-        if not fbid:
-            return
-        if pcb_id:
-            # Require the URL itself to mention the selected pcb, unless it is a canonical
-            # fbid-only link discovered near the selected pcb in HTML extraction.
-            low = u.lower()
-            if f"pcb.{pcb_id}" not in low and f"pcb:{pcb_id}" not in low and f"set=pcb.{pcb_id}" not in low:
-                u = _canonical_photo_link_from_fbid(fbid, pcb_id)
-        key = f"{fbid}|{pcb_id}"
-        if key in seen:
-            return
-        seen.add(key)
-        _note_family(fbid)
-        out.append(_canonical_photo_link_from_fbid(fbid, pcb_id))
-
-    try:
-        anchors = page.evaluate(
-            """
-            () => Array.from(document.querySelectorAll('a[href]'))
-              .map(a => a.href || a.getAttribute('href') || '')
-              .filter(Boolean)
-            """
-        ) or []
-        for u in anchors:
-            add_link(u)
-    except Exception:
-        pass
-
-    try:
-        html_links = _extract_fb_photo_links_from_html_text(
-            page.content(),
-            pcb_key=pcb_key,
-            expected_count=expected_count,
-        )
-        for u in html_links:
-            add_link(u)
-    except Exception:
-        pass
-
-    return out
-
-
-def _expand_large_album_links_via_basic_manifest(
-    context,
-    *,
-    original_url: str,
-    resolved_url: str,
-    seed_links: list[str],
-    pcb_key: str | None,
-    expected_count: int | None,
-) -> list[str]:
-    """
-    v11.40 Large Album Basic/Mobile Manifest Expansion.
-
-    This is intentionally separate from the normal viewer path.  It only runs for
-    true large albums after +N target detection.  It tries mobile/mbasic post and
-    photo pages to discover the missing same-pcb photo links without relaxing the
-    final strict completeness guard.
-    """
-    if not expected_count or int(expected_count) < 80:
-        return []
-
-    pcb_id = _pcb_id_from_key(pcb_key)
-    if not pcb_id:
-        return []
-
-    target = int(expected_count)
-    out: list[str] = []
-    seen_keys: set[str] = set()
-    queue: list[str] = []
-    queued: set[str] = set()
-    visited: set[str] = set()
-
-    def add_photo_link(u: str):
-        fbid = _photo_fbid_from_link(u)
-        if not fbid:
-            return
-        key = f"{fbid}|{pcb_id}"
-        if key not in seen_keys:
-            seen_keys.add(key)
-            out.append(_canonical_photo_link_from_fbid(fbid, pcb_id))
-        for v in _basic_photo_variants_from_link(_canonical_photo_link_from_fbid(fbid, pcb_id), pcb_key):
-            if v not in queued and len(queued) < max(target * 3, 80):
-                queued.add(v)
-                queue.append(v)
-
-    # Seed with already known DOM/photo links.
-    for u in seed_links or []:
-        add_photo_link(u)
-
-    # Probe post-level mobile/basic variants first; these sometimes expose a plain
-    # album list even when desktop DOM only shows 5 links.
-    for u in _basic_post_variants_from_url(original_url, pcb_key) + _basic_post_variants_from_url(resolved_url, pcb_key):
-        if u not in queued:
-            queued.add(u)
-            queue.insert(0, u)
-
-    page = None
-    try:
-        page = context.new_page()
-        try:
-            page.set_default_timeout(12000)
-            page.set_default_navigation_timeout(30000)
-        except Exception:
-            pass
-
-        max_visits = min(max(target + 24, 80), 150)
-        no_growth_rounds = 0
-        last_count = len(out)
-
-        while queue and len(out) < target and len(visited) < max_visits:
-            u = queue.pop(0)
-            if u in visited:
-                continue
-            visited.add(u)
-
-            try:
-                page.goto(u, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(900)
-            except PlaywrightTimeoutError:
-                logger.debug(f"FB v11.40 basic manifest goto timeout: {u[:120]}")
-            except Exception as e:
-                logger.debug(f"FB v11.40 basic manifest goto failed: {str(e)[:120]} | {u[:120]}")
-                continue
-
-            found = _extract_same_pcb_photo_links_from_page(page, pcb_key, expected_count=target)
-            before = len(out)
-            for link in found:
-                add_photo_link(link)
-                if len(out) >= target:
-                    break
-
-            if len(out) == before:
-                no_growth_rounds += 1
-            else:
-                no_growth_rounds = 0
-                logger.info(
-                    f"FB v11.40 basic manifest expanded: {before}->{len(out)} "
-                    f"visited={len(visited)} queue={len(queue)}"
-                )
-
-            # If many pages have produced no new IDs, stop early.  This keeps the
-            # large-album probe bounded and prevents another long RETRY loop.
-            if no_growth_rounds >= 24 and len(out) <= last_count + 2:
-                break
-            last_count = max(last_count, len(out))
-
-    finally:
-        try:
-            if page:
-                page.close()
-        except Exception:
-            pass
-
-    if out:
-        logger.info(
-            f"FB v11.40 basic/mobile manifest result: links={len(out)}/{target}, "
-            f"visited={len(visited)}, queued={len(queued)}"
-        )
-    return out[: max(target + 8, target)]
-
-
-
-def _extract_fb_cdn_image_urls_from_text(text: str) -> list[str]:
-    """
-    v11.41: Extract CDN image URLs from Comet/bootstrap HTML/JSON text.
-
-    Facebook frequently stores image URLs inside escaped Comet payloads instead of
-    visible anchors.  This helper is intentionally broad at extraction time, then
-    strict at candidate filtering time.
-    """
-    if not text:
-        return []
-    raw = str(text)
-    variants = [raw]
-    try:
-        variants.append(html.unescape(raw))
-    except Exception:
-        pass
-    try:
-        variants.append(raw.replace('\\/', '/').replace('\\u0025', '%').replace('\\u0026', '&'))
-    except Exception:
-        pass
-
-    out = []
-    seen = set()
-
-    def add(u: str):
-        if not u:
-            return
-        try:
-            u = html.unescape(unquote(str(u)))
-            u = u.replace('\\/', '/')
-            # Strip JSON/string delimiters that often trail the URL.
-            u = re.split(r"[\"'<>\\\\\s]", u, maxsplit=1)[0]
-            u = u.rstrip('.,;:)]}')
-        except Exception:
-            return
-        low = u.lower()
-        if 'fbcdn' not in low and 'scontent' not in low:
-            return
-        if not _looks_like_real_fb_media_url(u):
-            return
-        if _is_bad_fb_media_url(low) or _is_probable_fb_thumbnail_url(low):
-            return
-        key = _media_key_from_src(u) or u
-        if key in seen:
-            return
-        seen.add(key)
-        out.append(u)
-
-    patterns = [
-        r"https?:\\/\\/[^\"'<>\\\s]+?(?:\.jpg|\.jpeg|\.png|\.webp)(?:[^\"'<>\\\s]*)?",
-        r"https?://[^\"'<>\\\s]+?(?:\.jpg|\.jpeg|\.png|\.webp)(?:[^\"'<>\\\s]*)?",
-        r"(?:url|uri|src)\\?\"?\s*[:=]\s*\\?\"(https?:\\/\\/[^\"<>]+?(?:\.jpg|\.jpeg|\.png|\.webp)[^\"<>]*)",
-        r"(?:url|uri|src)\"?\s*:\s*\"(https?://[^\"<>]+?(?:\.jpg|\.jpeg|\.png|\.webp)[^\"<>]*)",
-    ]
-    for blob in variants:
-        for pat in patterns:
-            try:
-                for m in re.finditer(pat, blob, flags=re.I):
-                    add(m.group(1) if m.lastindex else m.group(0))
-            except Exception:
-                pass
-    return out
-
-
-def _collect_large_album_comet_cdn_manifest_items(
-    context,
-    *,
-    original_url: str,
-    resolved_url: str,
-    seed_links: list[str],
-    pcb_key: str | None,
-    expected_count: int | None,
-    allowed_cluster_family: str | None = None,
-) -> list[dict]:
-    """
-    v11.41 Large Album Comet/CDN Manifest Rescue.
-
-    This does not change success criteria.  It only creates additional image
-    candidate packs for true large albums by scraping Comet/bootstrap payloads and
-    mobile/basic pages for same-family CDN URLs.  Final cluster/media-id filters
-    and strict completeness guard still decide the result.
-    """
-    try:
-        target = int(expected_count or 0)
-    except Exception:
-        target = 0
-    if target < 80:
-        return []
-
-    pcb_id = _pcb_id_from_key(pcb_key)
-    urls = []
-    seen_urls = set()
-
-    def add_url(u: str):
-        if not u:
-            return
-        u = str(u)
-        if u in seen_urls:
-            return
-        seen_urls.add(u)
-        urls.append(u)
-
-    for u in [original_url, resolved_url]:
-        add_url(u)
-        for v in _basic_post_variants_from_url(u, pcb_key):
-            add_url(v)
-    for link in seed_links or []:
-        add_url(link)
-        for v in _basic_photo_variants_from_link(link, pcb_key):
-            add_url(v)
-
-    # Keep it bounded.  If the browser payload only exposes a few images, do not
-    # turn this into another multi-hour retry loop.
-    # v11.42: allow a wider but still bounded crawl.  v11.41 stopped at the
-    # initial URL frontier (about 34 visits in the 103-photo case).  The Comet
-    # payload often reveals additional same-pcb photo links only after visiting
-    # discovered photo pages, so this queue is allowed to grow dynamically.
-    max_visits = min(max(target + 48, 120), 220)
-    page = None
-    candidates = []
-    seen_media = set()
-    visited = 0
-    no_growth = 0
-
-    def add_candidate(src: str):
-        if not src:
-            return
-        if allowed_cluster_family:
-            fam = _media_cluster_family_from_src(src)
-            # Large album CDN clusters can drift slightly; allow exact family only.
-            if fam and fam != allowed_cluster_family:
-                return
-        key = _media_key_from_src(src) or src
-        if key in seen_media:
-            return
-        seen_media.add(key)
-        score = 3200000 + _media_quality_score(src)
-        candidates.append({
-            'type': _media_type_from_url(src),
-            'src': src,
-            'score': score,
-            'candidates': [{
-                'type': _media_type_from_url(src),
-                'src': src,
-                'score': score,
-            }],
-            'source': 'v11.41_comet_cdn_manifest',
-        })
-
-    try:
-        page = context.new_page()
-        try:
-            page.set_default_timeout(12000)
-            page.set_default_navigation_timeout(28000)
-        except Exception:
-            pass
-        idx = 0
-        while idx < len(urls) and visited < max_visits:
-            u = urls[idx]
-            idx += 1
-            before = len(candidates)
-            try:
-                page.goto(u, wait_until='domcontentloaded', timeout=28000)
-                page.wait_for_timeout(900)
-            except PlaywrightTimeoutError:
-                logger.debug(f"FB v11.41 comet/cdn goto timeout: {u[:120]}")
-            except Exception as e:
-                logger.debug(f"FB v11.41 comet/cdn goto failed: {str(e)[:120]} | {u[:120]}")
-                continue
-            visited += 1
-            try:
-                # Visible DOM first.
-                for it in _collect_current_page_candidates(page, include_network=False, include_meta=True, include_html=True):
-                    add_candidate(it.get('src') or '')
-            except Exception:
-                pass
-            try:
-                content = page.content()
-                for cdn_url in _extract_fb_cdn_image_urls_from_text(content):
-                    add_candidate(cdn_url)
-
-                # v11.42: grow the Comet crawl frontier with same-pcb photo links
-                # discovered inside each visited page.  This is separate from candidate
-                # acceptance: final media-id dedupe and strict completeness guard still apply.
-                try:
-                    discovered_links = _extract_fb_photo_links_from_html_text(
-                        content,
-                        pcb_key=pcb_key,
-                        expected_count=target,
-                    )
-                except Exception:
-                    discovered_links = []
-                for link in discovered_links or []:
-                    for nxt in [link] + _basic_photo_variants_from_link(link, pcb_key):
-                        if nxt and nxt not in seen_urls and len(urls) < max(target * 4, 260):
-                            seen_urls.add(nxt)
-                            urls.append(nxt)
-            except Exception:
-                pass
-            if len(candidates) == before:
-                no_growth += 1
-            else:
-                no_growth = 0
-                logger.info(f"FB v11.41 comet/cdn manifest expanded: {before}->{len(candidates)} visited={visited}")
-            if len(candidates) >= target:
-                break
-            if no_growth >= 20 and len(candidates) <= 8:
-                break
-    finally:
-        try:
-            if page:
-                page.close()
-        except Exception:
-            pass
-
-    logger.info(f"FB v11.42 comet/cdn manifest result: items={len(candidates)}/{target}, visited={visited}")
-    return candidates[:max(target + 8, target)]
-
-
-
-
-def _extract_large_album_family_photo_ids_from_text(
-    text: str,
-    *,
-    family_prefix: str = '',
-    pcb_id: str = '',
-    expected_count: int | None = None,
-) -> list[str]:
-    """
-    v11.45 Large Album Relay/Family ID extractor.
-
-    Some Facebook media-set / Comet / Relay payloads expose the next photo ids as
-    plain JSON numbers, without visible /photo/?fbid=... anchors and without an
-    explicit set=pcb.<id> on every item.  After the selected album family is
-    established from same-pcb links, this helper extracts only same-family photo
-    ids and canonicalizes them back to the selected pcb.  It never marks the job
-    successful by itself; strict completeness guard still decides the result.
-    """
-    if not text:
-        return []
-    try:
-        target = int(expected_count or 0)
-    except Exception:
-        target = 0
-
-    fam = str(family_prefix or '').strip()
-    pcb = str(pcb_id or '').strip()
-    if len(fam) < 6 and not pcb:
-        return []
-
-    try:
-        decoded = str(text)
-        for _ in range(3):
-            decoded = html.unescape(decoded)
-            decoded = decoded.replace('\\/', '/').replace('\\u0025', '%').replace('\\u0026', '&')
-            decoded = unquote(decoded)
-    except Exception:
-        decoded = str(text or '')
-
-    ids: list[str] = []
-    seen: set[str] = set()
-
-    def add_id(x: str):
-        if not x:
-            return
-        x = str(x).strip()
-        if not re.fullmatch(r'[0-9]{8,}', x):
-            return
-        if pcb and x == pcb:
-            return
-        if fam and not x.startswith(fam):
-            return
-        if x in seen:
-            return
-        seen.add(x)
-        ids.append(x)
-
-    # Direct keys in Relay / Comet JSON.
-    key_patterns = [
-        r'(?:fbid|photo_id|legacy_fbid|legacy_photo_id|target_id|media_id|image_id)[\\"\'\s:=]+([0-9]{8,})',
-        r'\\"(?:fbid|photo_id|legacy_fbid|legacy_photo_id|target_id|media_id|image_id)\\"\s*:\s*\\"?([0-9]{8,})',
-        r'"(?:fbid|photo_id|legacy_fbid|legacy_photo_id|target_id|media_id|image_id)"\s*:\s*"?([0-9]{8,})',
-        r'/photo/\?[^"\'<>\s]*?fbid=([0-9]{8,})',
-        r'/photo\.php\?[^"\'<>\s]*?fbid=([0-9]{8,})',
-        r'/photos/(?:[^/"\'<>\s]+/)?([0-9]{8,})',
-    ]
-    for pat in key_patterns:
-        try:
-            for m in re.findall(pat, decoded, flags=re.I):
-                add_id(m)
-        except Exception:
-            pass
-
-    # Windowed scan around the selected pcb can recover ids without named keys.
-    if pcb:
-        try:
-            for m in re.finditer(re.escape(pcb), decoded, flags=re.I):
-                start = max(0, m.start() - 9000)
-                end = min(len(decoded), m.end() + 9000)
-                chunk = decoded[start:end]
-                for x in re.findall(r'([0-9]{14,22})', chunk):
-                    add_id(x)
-        except Exception:
-            pass
-
-    # Family-only fallback: only after family prefix is stable.  This intentionally
-    # rejects unrelated recommendation ids with different prefixes.
-    if fam:
-        try:
-            for x in re.findall(r'([0-9]{14,22})', decoded):
-                if str(x).startswith(fam):
-                    add_id(x)
-        except Exception:
-            pass
-
-    if target:
-        return ids[:max(target + 12, target)]
-    return ids
-
-def _expand_large_album_links_via_media_set_manifest(
-    context,
-    *,
-    pcb_key: str | None,
-    expected_count: int | None,
-) -> list[str]:
-    """
-    v11.43 Large Album Media-Set Manifest Expansion.
-
-    Some large Facebook posts expose +99 on the post, but the post DOM, mbasic
-    post page and Comet bootstrap payload only reveal the first 5~8 photos.  A
-    dedicated media/set page can expose a different pagination surface.  This
-    probe only runs for true 80+ photo targets and only returns same-pcb photo
-    links.  It never relaxes strict completeness.
-    """
-    try:
-        target = int(expected_count or 0)
-    except Exception:
-        target = 0
-    if target < 80:
-        return []
-
-    pcb_id = _pcb_id_from_key(pcb_key)
-    if not pcb_id:
-        return []
-
-    out: list[str] = []
-    seen: set[str] = set()
-    queue: list[str] = []
-    queued: set[str] = set()
-    visited: set[str] = set()
-
-    # v11.45: many mbasic/media-set pages expose next/older photo links without
-    # repeating set=pcb.<id>.  Once we have a few same-set fbids, keep a conservative
-    # fbid family prefix so those plain fbid/photo links can extend the frontier.
-    family_counts: dict[str, int] = {}
-    family_prefix = ''
-
-    def _note_family(fbid: str):
-        nonlocal family_prefix
-        try:
-            f = str(fbid or '')[:6]
-            if len(f) < 6 or not f.isdigit():
-                return
-            family_counts[f] = family_counts.get(f, 0) + 1
-            best, cnt = max(family_counts.items(), key=lambda kv: kv[1])
-            if cnt >= 3:
-                family_prefix = best
-        except Exception:
-            pass
-
-    def _family_ok(fbid: str) -> bool:
-        try:
-            return bool(family_prefix and str(fbid or '').startswith(family_prefix))
-        except Exception:
-            return False
-
-    def add_queue(u: str):
-        if not u:
-            return
-        u = html.unescape(unquote(str(u))).replace('amp;', '')
-        if u.startswith('/'):
-            u = 'https://www.facebook.com' + u
-        if u not in queued and len(queued) < max(target * 10, 1200):
-            queued.add(u)
-            queue.append(u)
-
-    def add_photo(u: str):
-        if not u:
-            return
-        fbid = _photo_fbid_from_link(u)
-        if not fbid:
-            return
-        key = f'{fbid}|{pcb_id}'
-        if key in seen:
-            return
-        seen.add(key)
-        _note_family(fbid)  # v11.45: enable same-family plain-id expansion after same-pcb seeds.
-        out.append(_canonical_photo_link_from_fbid(fbid, pcb_id))
-
-    media_set_urls = [
-        f'https://www.facebook.com/media/set/?set=pcb.{pcb_id}&type=3',
-        f'https://m.facebook.com/media/set/?set=pcb.{pcb_id}&type=3',
-        f'https://mbasic.facebook.com/media/set/?set=pcb.{pcb_id}&type=3',
-        f'https://www.facebook.com/pcb.{pcb_id}',
-        f'https://m.facebook.com/pcb.{pcb_id}',
-        f'https://mbasic.facebook.com/pcb.{pcb_id}',
-    ]
-    for u in media_set_urls:
-        add_queue(u)
-
-    page = None
-    try:
-        page = context.new_page()
-        try:
-            page.set_default_timeout(14000)
-            page.set_default_navigation_timeout(35000)
-        except Exception:
-            pass
-
-        relay_text_blobs: list[str] = []
-        relay_seen_urls: set[str] = set()
-
-        def _on_media_set_response(resp):
-            # v11.45: capture bounded GraphQL / Relay / AJAX payloads while media-set pages load.
-            # Facebook often keeps later photo ids in response bodies rather than visible anchors.
-            try:
-                ru = str(getattr(resp, 'url', '') or '')
-                low = ru.lower()
-                if ru in relay_seen_urls:
-                    return
-                if not any(k in low for k in ['/api/graphql', 'graphql', 'relay', 'ajax', 'media/set', 'photo.php']):
-                    return
-                relay_seen_urls.add(ru)
-                headers = getattr(resp, 'headers', {}) or {}
-                ctype = str(headers.get('content-type') or headers.get('Content-Type') or '').lower()
-                clen_s = str(headers.get('content-length') or headers.get('Content-Length') or '0')
-                try:
-                    clen = int(clen_s or 0)
-                except Exception:
-                    clen = 0
-                if clen and clen > 3500000:
-                    return
-                if ctype and not any(k in ctype for k in ['json', 'html', 'javascript', 'text', 'x-www-form-urlencoded']):
-                    return
-                txt = resp.text()
-                if not txt:
-                    return
-                if pcb_id not in txt and (not family_prefix or family_prefix not in txt):
-                    # Still keep a few GraphQL payloads because fbid family may be established later.
-                    if 'graphql' not in low and '/api/' not in low:
-                        return
-                relay_text_blobs.append(txt[:3500000])
-            except Exception:
-                return
-
-        try:
-            page.on('response', _on_media_set_response)
-        except Exception:
-            pass
-
-        max_visits = min(max(target * 5, 420), 900)
-        stale_pages = 0
-        while queue and len(out) < target and len(visited) < max_visits:
-            u = queue.pop(0)
-            if u in visited:
-                continue
-            visited.add(u)
-            before = len(out)
-            try:
-                page.goto(u, wait_until='domcontentloaded', timeout=35000)
-                page.wait_for_timeout(1200)
-            except PlaywrightTimeoutError:
-                logger.debug(f'FB v11.45 media-set manifest goto timeout: {u[:140]}')
-            except Exception as e:
-                logger.debug(f'FB v11.45 media-set manifest goto failed: {str(e)[:120]} | {u[:140]}')
-                continue
-
-            # Desktop/m.facebook.com: scroll a few times; mbasic: pagination links.
-            try:
-                for _ in range(10):
-                    found_now = _extract_same_pcb_photo_links_from_page(page, pcb_key, expected_count=target)
-                    for link in found_now or []:
-                        add_photo(link)
-                    if len(out) >= target:
-                        break
-                    page.evaluate('() => window.scrollBy(0, Math.max(900, window.innerHeight || 900))')
-                    page.wait_for_timeout(850)
-            except Exception:
-                pass
-
-            try:
-                content = page.content()
-                for link in _extract_fb_photo_links_from_html_text(content, pcb_key=pcb_key, expected_count=target) or []:
-                    add_photo(link)
-
-                # v11.45: after a same-set fbid family is established, collect plain
-                # fbid/photo_id occurrences that FB exposes on media-set/mbasic pages
-                # without an explicit set=pcb query.  They are canonicalized back to
-                # the selected pcb and still pass final media-id/cluster dedupe.
-                if family_prefix:
-                    try:
-                        for fbid in re.findall(r'(?:fbid|photo_id)[\"\'\s:=]+([0-9]{8,})', content, flags=re.I):
-                            if _family_ok(fbid):
-                                add_photo(_canonical_photo_link_from_fbid(fbid, pcb_id))
-                        for fbid in re.findall(r'/photo/\?[^"\'<>\s]*?fbid=([0-9]{8,})', content, flags=re.I):
-                            if _family_ok(fbid):
-                                add_photo(_canonical_photo_link_from_fbid(fbid, pcb_id))
-                        for fbid in re.findall(r'/photos/(?:[^/"\'<>\s]+/)?([0-9]{8,})', content, flags=re.I):
-                            if _family_ok(fbid):
-                                add_photo(_canonical_photo_link_from_fbid(fbid, pcb_id))
-                    except Exception:
-                        pass
-
-                # v11.45: Relay / Comet plain-id extraction from current HTML and captured response bodies.
-                try:
-                    relay_ids = _extract_large_album_family_photo_ids_from_text(
-                        content,
-                        family_prefix=family_prefix,
-                        pcb_id=pcb_id,
-                        expected_count=target,
-                    )
-                    for fbid in relay_ids:
-                        add_photo(_canonical_photo_link_from_fbid(fbid, pcb_id))
-                except Exception:
-                    pass
-
-                try:
-                    if relay_text_blobs and family_prefix:
-                        blobs = relay_text_blobs[-30:]
-                        for blob in blobs:
-                            for fbid in _extract_large_album_family_photo_ids_from_text(
-                                blob,
-                                family_prefix=family_prefix,
-                                pcb_id=pcb_id,
-                                expected_count=target,
-                            ):
-                                add_photo(_canonical_photo_link_from_fbid(fbid, pcb_id))
-                            if len(out) >= target:
-                                break
-                except Exception:
-                    pass
-
-                # Follow same-set pagination / more links from mbasic and media set pages.
-                try:
-                    hrefs = page.evaluate("""
-                    () => Array.from(document.querySelectorAll('a[href]'))
-                      .map(a => ({href: a.href || a.getAttribute('href') || '', text: (a.innerText || a.textContent || '')}))
-                      .filter(x => x.href)
-                    """) or []
-                except Exception:
-                    hrefs = []
-                for item in hrefs:
-                    if isinstance(item, dict):
-                        h = item.get('href') or ''
-                        txt = item.get('text') or ''
-                    else:
-                        h = str(item or '')
-                        txt = ''
-                    low = html.unescape(unquote(str(h))).lower()
-                    txt_low = html.unescape(unquote(str(txt))).lower()
-                    h_fbid = _photo_fbid_from_link(h)
-                    if f'pcb.{pcb_id}' in low or f'set=pcb.{pcb_id}' in low:
-                        if ('media/set' in low or '/photo' in low or 'fbid=' in low or 'cursor=' in low or 'after=' in low or 'pnref=' in low):
-                            add_queue(h)
-                            if h_fbid:
-                                add_photo(h)
-                    elif h_fbid and _family_ok(h_fbid):
-                        # Same family photo link without explicit pcb; useful for mbasic next/prev chains.
-                        add_photo(_canonical_photo_link_from_fbid(h_fbid, pcb_id))
-                        add_queue(h)
-                    elif ('media/set' in low and ('cursor=' in low or 'after=' in low or 'refid=' in low)):
-                        add_queue(h)
-                    elif any(k in txt_low for k in ['more', 'next', 'older', '下一', '更多', '查看更多']) and ('media/set' in low or 'photo' in low or 'refid=' in low):
-                        add_queue(h)
-            except Exception:
-                pass
-
-            if len(out) > before:
-                stale_pages = 0
-                logger.info(f'FB v11.45 media-set manifest expanded: {before}->{len(out)} visited={len(visited)} queue={len(queue)}')
-            else:
-                stale_pages += 1
-                if stale_pages >= 35 and len(out) <= before + 2:
-                    break
-    finally:
-        try:
-            if page:
-                page.close()
-        except Exception:
-            pass
-
-    if out:
-        logger.info(f'FB v11.45 media-set manifest result: links={len(out)}/{target}, visited={len(visited)}, queued={len(queued)}')
-    return out[:max(target + 8, target)]
-
 def _collect_fb_grid_items(page):
     """
     從原貼文 grid 直接收集「畫面順序 + 縮圖候選 + photo link」。
@@ -3537,188 +2379,11 @@ def _capture_single_grid_tile_page(context, href, index, allowed_cluster=None):
             pass
 
 
-
-
-def _safe_fb_parallel_rescue_pages() -> int:
-    """Return the guarded page fan-out for v11.34 controlled rescue."""
-    try:
-        n = int(FB_PARALLEL_RESCUE_PAGES or 1)
-    except Exception:
-        n = 1
-    # Keep this intentionally capped.  3 is the default guarded setting and also the
-    # highest allowed manual config for this controlled rescue path.  5+ is intentionally
-    # blocked because Facebook rate limits and Playwright focus/state risks rise fast.
-    return max(1, min(n, 3))
-
-
-def _candidate_matches_cluster_scope(src: str, allowed_cluster=None, allowed_cluster_family=None) -> bool:
-    """Shared exact/family cluster gate for photo-page rescue candidates."""
-    if not src:
-        return False
-    if not allowed_cluster and not allowed_cluster_family:
-        return True
-    ck = _media_cluster_key_from_src(src)
-    if not ck:
-        return True
-    if allowed_cluster and ck == allowed_cluster:
-        return True
-    if allowed_cluster_family and _media_cluster_family_from_key(ck) == allowed_cluster_family:
-        return True
-    return False
-
-
-def _capture_grid_tile_pages_controlled_batch(
-    context,
-    batch_records,
-    *,
-    allowed_cluster=None,
-    allowed_cluster_family=None,
-):
+def _collect_grid_tile_mode_items(context, page, pcb_key=None, expected_count=None, allowed_cluster=None):
     """
-    v11.34 controlled parallel photo-page rescue.
-
-    This intentionally avoids ThreadPoolExecutor and does not share Playwright
-    pages across threads.  It opens a small batch of independent pages in the same
-    browser context, lets their network loads overlap, then returns only candidate
-    packs to the main thread.  File moving, dedupe, ordering, cluster filtering and
-    strict completeness guard remain in the original main flow.
-    """
-    opened = []
-    results = []
-
-    def make_on_resp(bucket):
-        def on_resp(resp):
-            try:
-                u = resp.url
-                if not _looks_like_real_fb_media_url(u):
-                    return
-                if _media_type_from_url(u) != "image":
-                    return
-                if not _candidate_matches_cluster_scope(
-                    u,
-                    allowed_cluster=allowed_cluster,
-                    allowed_cluster_family=allowed_cluster_family,
-                ):
-                    return
-                ctype = ""
-                try:
-                    ctype = resp.headers.get("content-type", "") or ""
-                except Exception:
-                    ctype = ""
-                if ctype and "image" not in ctype.lower():
-                    return
-                clen = 0
-                try:
-                    raw_len = resp.headers.get("content-length", "") or "0"
-                    clen = int(raw_len) if str(raw_len).isdigit() else 0
-                except Exception:
-                    clen = 0
-                if 0 < clen < _MIN_FILE_SIZE:
-                    return
-                score = 1750000 + _media_quality_score(u) + min(clen, 900000)
-                bucket.append({"type": "image", "src": u, "score": score})
-            except Exception:
-                pass
-        return on_resp
-
-    try:
-        # Open every page first, each with an isolated response bucket.
-        for order_no, rec in batch_records:
-            href = rec.get("href") or ""
-            if not href:
-                continue
-            pg = context.new_page()
-            bucket = []
-            try:
-                pg.on("response", make_on_resp(bucket))
-            except Exception:
-                pass
-            opened.append((order_no, rec, href, pg, bucket))
-
-        # Navigate pages one by one.  Because all pages stay open, late image
-        # responses from earlier pages can still land while later pages are loading.
-        for order_no, rec, href, pg, bucket in opened:
-            try:
-                pg.goto(href, wait_until="domcontentloaded", timeout=30000)
-            except PlaywrightTimeoutError:
-                pass
-            except Exception as e:
-                logger.warning(f"FB v11.34 controlled rescue tile {order_no} goto failed: {e}")
-
-        # One shared settle window for the batch instead of per-page long waits.
-        if opened:
-            try:
-                opened[-1][3].wait_for_timeout(2600)
-            except Exception:
-                pass
-
-        for order_no, rec, href, pg, bucket in opened:
-            try:
-                try:
-                    pg.wait_for_load_state("networkidle", timeout=2500)
-                except Exception:
-                    pass
-                candidates = _collect_current_page_candidates(
-                    pg,
-                    network_items=bucket,
-                    include_network=True,
-                    include_meta=False,
-                    include_html=True,
-                )
-                scoped = []
-                for cand in candidates:
-                    src = cand.get("src") or ""
-                    if _candidate_matches_cluster_scope(
-                        src,
-                        allowed_cluster=allowed_cluster,
-                        allowed_cluster_family=allowed_cluster_family,
-                    ):
-                        scoped.append(cand)
-                if scoped:
-                    candidates = scoped
-                candidates = _dedupe_ordered(candidates)
-                if not candidates:
-                    # Preserve the old grid thumbnail fallback for this tile.
-                    candidates = _dedupe_ordered(rec.get("candidates") or [])
-                if not candidates:
-                    logger.warning(f"FB v11.34 controlled rescue tile {order_no} no candidate: {href[:100]}")
-                    continue
-                chosen = candidates[0]
-                results.append({
-                    "order": order_no,
-                    "candidates": candidates,
-                    "src": chosen.get("src", ""),
-                    "type": chosen.get("type", "image"),
-                    "score": chosen.get("score", 0),
-                })
-            except Exception as e:
-                logger.warning(f"FB v11.34 controlled rescue tile {order_no} collect failed: {e}")
-
-    finally:
-        for _order_no, _rec, _href, pg, _bucket in opened:
-            try:
-                pg.close()
-            except Exception:
-                pass
-
-    return results
-
-def _collect_grid_tile_mode_items(
-    context,
-    page,
-    pcb_key=None,
-    expected_count=None,
-    allowed_cluster=None,
-    allowed_cluster_family=None,
-):
-    """
-    v11.22 Grid Tile Mode / v11.34 controlled parallel rescue:
+    v11.22 Grid Tile Mode:
     Use tile physical order as the source of truth. It is intentionally used only
     when Theater Viewer misses images, to avoid recommendation pollution.
-
-    v11.37 enables controlled 3-page batch rescue for large albums. Small albums keep
-    the original single-page behavior so 15/16 still returns RETRY instead of
-    being padded by unsafe candidates.
     """
     records = _collect_grid_tile_records_spatial(page, pcb_key=pcb_key, expected_count=expected_count)
     if expected_count and len(records) > expected_count:
@@ -3728,62 +2393,7 @@ def _collect_grid_tile_mode_items(
 
     out = []
     used = set()
-    large_album_rescue = int(expected_count or 0) >= 80
-    parallel_pages = _safe_fb_parallel_rescue_pages() if large_album_rescue else 1
-
-    logger.info(
-        f"FB v11.34 grid/photo-page rescue start: tiles={len(records)} "
-        f"target={expected_count or '-'} pages={parallel_pages}"
-    )
-
-    def accept_pack(pack, index_label):
-        if not pack:
-            return False
-        key = _media_key_from_src(pack.get("src", "")) or _fb_media_numeric_id_str_from_src(pack.get("src", ""))
-        if key and key in used:
-            logger.info(f"FB v11.34 grid tile duplicate skipped index={index_label}: {key}")
-            return False
-        if key:
-            used.add(key)
-        out.append(pack)
-        logger.info(
-            f"FB v11.34 grid/photo-page rescue captured "
-            f"{len(out)}/{expected_count or len(records)}: index={index_label}"
-        )
-        return True
-
-    if parallel_pages >= 2:
-        indexed_records = list(enumerate(records, 1))
-        for start in range(0, len(indexed_records), parallel_pages):
-            batch = indexed_records[start:start + parallel_pages]
-            packs = _capture_grid_tile_pages_controlled_batch(
-                context,
-                batch,
-                allowed_cluster=allowed_cluster,
-                allowed_cluster_family=allowed_cluster_family,
-            )
-            by_order = {int(p.get("order") or 0): p for p in packs if p}
-            for i, rec in batch:
-                pack = by_order.get(i)
-                if not pack:
-                    cands = rec.get("candidates") or []
-                    if cands:
-                        best = cands[0]
-                        pack = {
-                            "order": i,
-                            "candidates": cands,
-                            "src": best.get("src", ""),
-                            "type": best.get("type", "image"),
-                            "score": best.get("score", 0) - 100000,
-                        }
-                accept_pack(pack, i)
-                if expected_count and len(out) >= int(expected_count):
-                    break
-            if expected_count and len(out) >= int(expected_count):
-                break
-        return out
-
-    # Original conservative single-page path for small galleries.
+    logger.info(f"FB v11.22 grid tile mode start: tiles={len(records)} target={expected_count or '-'}")
     for i, rec in enumerate(records, 1):
         href = rec.get("href") or ""
         pack = _capture_single_grid_tile_page(context, href, i, allowed_cluster=allowed_cluster)
@@ -3792,7 +2402,16 @@ def _collect_grid_tile_mode_items(
             if cands:
                 best = cands[0]
                 pack = {"order": i, "candidates": cands, "src": best.get("src", ""), "type": best.get("type", "image"), "score": best.get("score", 0) - 100000}
-        accept_pack(pack, i)
+        if not pack:
+            continue
+        key = _media_key_from_src(pack.get("src", "")) or _fb_media_numeric_id_str_from_src(pack.get("src", ""))
+        if key and key in used:
+            logger.info(f"FB v11.22 grid tile duplicate skipped index={i}: {key}")
+            continue
+        if key:
+            used.add(key)
+        out.append(pack)
+        logger.info(f"FB v11.22 grid tile captured {len(out)}/{expected_count or len(records)}: index={i}")
     return out
 
 
@@ -4338,94 +2957,7 @@ def _force_viewer_next(page, attempt: int) -> None:
     except Exception:
         pass
 
-
-
-def _recover_large_album_viewer(page, *, stale: int = 0, turn: int = 0, label: str = "viewer") -> None:
-    """
-    v11.30 Large Album Recovery Helper.
-
-    Large Facebook albums can temporarily loop back to cached frames around the
-    middle of the viewer.  This helper is intentionally conservative and only
-    performs navigation/focus nudges; it never marks a task as complete and never
-    relaxes the final strict completeness guard.
-    """
-    try:
-        logger.info(
-            f"FB v11.30 large-album recovery: label={label}, stale={stale}, turn={turn}"
-        )
-    except Exception:
-        pass
-
-    try:
-        _focus_viewer(page)
-    except Exception:
-        pass
-
-    # 1) Keyboard / JS burst: useful when the visible Next control is hidden but
-    # the theater viewer still owns keyboard navigation.
-    try:
-        burst = 2
-        if int(stale or 0) >= 2:
-            burst = 3
-        if int(stale or 0) >= 4:
-            burst = 5
-        for i in range(burst):
-            try:
-                page.keyboard.press("ArrowRight")
-            except Exception:
-                pass
-            try:
-                _dispatch_arrow_right_js(page)
-            except Exception:
-                pass
-            _fb_jitter_wait(page, 260 + i * 80, 180)
-    except Exception:
-        pass
-
-    # 2) DOM/physical next fallback.  This reuses existing safe viewer geometry
-    # helpers and avoids clicking the comment column as much as possible.
-    try:
-        _physical_drive_next(page, reason=f"large-recovery-stale{stale}-turn{turn}-primary")
-    except Exception:
-        pass
-
-    # 3) PageDown can wake Facebook lazy-loading when the viewer/listener is
-    # stuck on a preloaded cache batch.  End is delayed until later/staler turns
-    # because it is more aggressive.
-    try:
-        page.keyboard.press("PageDown")
-        _fb_jitter_wait(page, 520, 360)
-    except Exception:
-        pass
-
-    if int(stale or 0) >= 3 or int(turn or 0) >= 60:
-        try:
-            page.keyboard.press("End")
-            _fb_jitter_wait(page, 650, 420)
-            page.keyboard.press("ArrowRight")
-            _dispatch_arrow_right_js(page)
-            _fb_jitter_wait(page, 750, 450)
-        except Exception:
-            pass
-
-    # 4) Final focus restore so harvest_once() sees the main theater image rather
-    # than comments/recommendations.  Exceptions must not escape; otherwise the
-    # collected viewer sequence would be discarded by the caller.
-    try:
-        _focus_viewer(page)
-    except Exception:
-        pass
-
-def _collect_viewer_sequence_intercept(
-    page,
-    *,
-    label: str = "viewer",
-    target_count: int | None = None,
-    stale_threshold: int = 3,
-    max_turns: int | None = None,
-    allowed_cluster: str | None = None,
-    allowed_cluster_family: str | None = None,
-) -> list[dict]:
+def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None) -> list[dict]:
     """
     v11：Viewer 物理翻頁 + response 快速收割模式。
 
@@ -4439,33 +2971,9 @@ def _collect_viewer_sequence_intercept(
     """
     collected: list[dict] = []
     seen_keys: set[str] = set()
-    # v11.29: Track stable FB CDN media IDs at the viewer-intercept scope.
-    # This set must exist before harvest_once() is called; otherwise large-album
-    # mode crashes during high-res warmup with NameError and falls back to 5/103.
-    seen_media_ids: set[str] = set()
     first_key = ""
     stale = 0
     network_bucket: list[dict] = []
-    # v11.32 Speed-Safe:
-    # Reduce duplicate response writes/log spam in long large-album runs.
-    # Do not use this as a success condition; final strict completeness guard remains unchanged.
-    response_seen_src_keys: set[str] = set()
-    response_seen_body_hashes: set[str] = set()
-    response_best_media_size: dict[str, int] = {}
-
-    try:
-        large_album_mode = int(target_count or 0) >= 80
-    except Exception:
-        large_album_mode = False
-
-    # Large albums may advance through sibling CDN cluster keys such as
-    # 26678053 -> 26678054 -> 26678055.  Keep exact cluster gate for small
-    # albums, but let large albums accept the same relaxed family.
-    if large_album_mode and allowed_cluster and not allowed_cluster_family:
-        allowed_cluster_family = _media_cluster_family_from_key(allowed_cluster)
-
-    if large_album_mode:
-        stale_threshold = max(int(stale_threshold or 0), 18)
 
     def on_response(resp):
         try:
@@ -4475,14 +2983,6 @@ def _collect_viewer_sequence_intercept(
             if not _looks_like_real_fb_media_url(u):
                 return
             if _is_bad_fb_media_url(low) or _is_probable_fb_thumbnail_url(low):
-                return
-
-            # v11.32: Skip exact repeated CDN responses before reading the body.
-            # Facebook often replays the same already-loaded image during viewer recovery;
-            # writing/logging those duplicates was a major cost in 100+ photo albums.
-            src_key = _media_key_from_src(u) or u.split("?")[0]
-            media_id = _fb_media_numeric_id_str_from_src(u)
-            if src_key and src_key in response_seen_src_keys:
                 return
 
             ctype = ""
@@ -4498,16 +2998,6 @@ def _collect_viewer_sequence_intercept(
             if 0 < clen < _MIN_FILE_SIZE:
                 logger.debug(f"FB ignore tiny image response: {clen} bytes | {u[:100]}")
                 return
-
-            # v11.32: If the same stable media id was already captured with an equal
-            # or larger declared size, skip this repeated response.  Header-less
-            # responses still pass through because they may be the only usable body.
-            if media_id and clen > 0:
-                best_seen = int(response_best_media_size.get(media_id, 0) or 0)
-                if best_seen and clen <= best_seen:
-                    if src_key:
-                        response_seen_src_keys.add(src_key)
-                    return
 
             # 明確圖片 response 才大幅加權；content-length 太小不直接丟，避免 header 缺失，
             # 但降低權重，最後仍會由實際下載大小決定。
@@ -4532,11 +3022,6 @@ def _collect_viewer_sequence_intercept(
                     capture_dir = os.path.join(TEMP_DIR, "_fb_capture")
                     os.makedirs(capture_dir, exist_ok=True)
                     h = hashlib.md5(body).hexdigest()[:16]
-                    if h in response_seen_body_hashes:
-                        if src_key:
-                            response_seen_src_keys.add(src_key)
-                        return
-                    response_seen_body_hashes.add(h)
                     ext = _ext_from_url(u, ".jpg")
                     persisted_path = os.path.join(capture_dir, f"cap_{h}{ext}")
                     if not os.path.exists(persisted_path) or os.path.getsize(persisted_path) < body_size:
@@ -4548,28 +3033,12 @@ def _collect_viewer_sequence_intercept(
                             except Exception:
                                 pass
                     score += min(body_size, 1200000)
-                    if media_id:
-                        response_best_media_size[media_id] = max(
-                            int(response_best_media_size.get(media_id, 0) or 0),
-                            body_size,
-                            clen,
-                        )
-                    if src_key:
-                        response_seen_src_keys.add(src_key)
                     logger.info(
                         f"FB response 實體落盤: {os.path.basename(persisted_path)} "
                         f"({body_size // 1024} KB)"
                     )
             except Exception:
                 pass
-
-            if src_key:
-                response_seen_src_keys.add(src_key)
-            if media_id and clen > 0:
-                response_best_media_size[media_id] = max(
-                    int(response_best_media_size.get(media_id, 0) or 0),
-                    clen,
-                )
 
             network_bucket.append({
                 "type": _media_type_from_url(u),
@@ -4682,20 +3151,11 @@ def _collect_viewer_sequence_intercept(
         # 往後找第一個未收過的真圖。
         chosen = None
         chosen_key = ""
-        chosen_media_id = ""
-        for cand in candidates[:16]:
-            src = cand.get("src", "")
-            key = _media_key_from_src(src)
-            mid = _fb_media_numeric_id_str_from_src(src)
-
-            # v11.28: use stable FB CDN media id when available.
-            # The same visual photo may appear with different oh= tokens; raw key
-            # alone can over-count or re-enter duplicate frames in large albums.
-            stable_key = mid or key
-            if stable_key and stable_key not in seen_media_ids and key not in seen_keys:
+        for cand in candidates[:10]:
+            key = _media_key_from_src(cand.get("src", ""))
+            if key and key not in seen_keys:
                 chosen = cand
                 chosen_key = key
-                chosen_media_id = mid
                 break
 
         if not chosen or not chosen_key:
@@ -4703,41 +3163,27 @@ def _collect_viewer_sequence_intercept(
 
         # v11.15: Do not count off-post recommendation/media as harvested.
         # This prevents polluted media from satisfying target_count and ending the main viewer early.
-        if allowed_cluster or allowed_cluster_family:
+        if allowed_cluster:
             chosen_cluster = _media_cluster_key_from_src(chosen.get("src", ""))
-            chosen_family = _media_cluster_family_from_key(chosen_cluster)
-            exact_cluster_ok = bool(allowed_cluster and chosen_cluster == allowed_cluster)
-            relaxed_family_ok = bool(allowed_cluster_family and chosen_family == allowed_cluster_family)
-            if chosen_cluster and not (exact_cluster_ok or relaxed_family_ok):
+            if chosen_cluster and chosen_cluster != allowed_cluster:
                 logger.info(
                     f"FB viewer-intercept {label} 跳過異質 cluster: "
-                    f"{chosen_cluster} != {allowed_cluster or allowed_cluster_family} | "
+                    f"{chosen_cluster} != {allowed_cluster} | "
                     f"{os.path.basename(urlparse(chosen.get('src', '').split('?')[0]).path)}"
                 )
                 seen_keys.add(chosen_key)
-                if chosen_media_id:
-                    seen_media_ids.add(chosen_media_id)
                 return False
-            if chosen_cluster and relaxed_family_ok and not exact_cluster_ok:
-                logger.info(
-                    f"FB viewer-intercept {label} large-album 接受同族 cluster: "
-                    f"{chosen_cluster} family={allowed_cluster_family}"
-                )
 
         # v11.15: Post photo mode should not accept videos as completing image targets.
-        if (allowed_cluster or allowed_cluster_family) and (chosen.get("type") == "video" or _is_probably_video_url(chosen.get("src", ""))):
+        if allowed_cluster and (chosen.get("type") == "video" or _is_probably_video_url(chosen.get("src", ""))):
             logger.info(f"FB viewer-intercept {label} 跳過影片候選，不計入照片目標: {chosen.get('src','')[:120]}")
             seen_keys.add(chosen_key)
-            if chosen_media_id:
-                seen_media_ids.add(chosen_media_id)
             return False
 
         if not first_key:
             first_key = chosen_key
 
         seen_keys.add(chosen_key)
-        if chosen_media_id:
-            seen_media_ids.add(chosen_media_id)
 
         # v11.5：一旦判定收集成功，立即實體化，避免「Log collected 但最後沒圖」。
         _force_persist_harvest_candidate(chosen, reason=reason, order_no=len(collected) + 1)
@@ -4776,14 +3222,7 @@ def _collect_viewer_sequence_intercept(
             break
 
     max_turns = int(max_turns or _MAX_FB_ITEMS)
-    if large_album_mode:
-        # v11.31: 100+ 張大型相簿常在 70~80 張附近進入長時間 lazy-load plateau。
-        # v11.30 的 hard_stale_stop=32 仍會過早停止；此處只放寬大型相簿，
-        # 小相簿維持原本 strict 行為，避免 15/16 被誤判成功。
-        max_turns = max(max_turns, int(target_count or 0) * 6, 640)
-        hard_stale_stop = max(48, int(stale_threshold) + 30)
-    else:
-        hard_stale_stop = max(5, int(stale_threshold) + 2)
+    hard_stale_stop = max(5, int(stale_threshold) + 2)
 
     for turn in range(max_turns):
         if target_count and len(collected) >= target_count:
@@ -4838,40 +3277,6 @@ def _collect_viewer_sequence_intercept(
                             break
             except Exception:
                 pass
-
-            if large_album_mode and target_count and len(collected) < target_count:
-                # v11.37 Fast Plateau Shift:
-                # If the viewer is producing no useful media, do not spend tens of
-                # minutes clicking the same stale viewer.  Shift to final-sweep /
-                # controlled photo-page rescue earlier.  This keeps strict
-                # completeness unchanged: incomplete galleries still RETRY.
-                label_low = (label or "").lower()
-                if len(collected) == 0 and stale >= 6:
-                    logger.info(
-                        f"FB v11.40 large album empty-viewer plateau shift: "
-                        f"label={label}, stale={stale}, turn={turn}; enter final-sweep/rescue"
-                    )
-                    break
-                if label_low.startswith("large-photo") and stale >= 8:
-                    logger.info(
-                        f"FB v11.40 large-photo plateau shift: "
-                        f"label={label}, collected={len(collected)}, stale={stale}, turn={turn}; "
-                        "return to main rescue"
-                    )
-                    break
-                if len(collected) <= 1 and stale >= 12:
-                    logger.info(
-                        f"FB v11.40 low-yield viewer plateau shift: "
-                        f"label={label}, collected={len(collected)}, stale={stale}, turn={turn}; "
-                        "enter final-sweep/rescue"
-                    )
-                    break
-
-                _recover_large_album_viewer(page, stale=stale, turn=turn, label=label)
-                for wait_i in range(6):
-                    _fb_jitter_wait(page, 420, 320)
-                    if harvest_once(f"large-recovery turn={turn},stale={stale},wait={wait_i}"):
-                        break
         else:
             stale = 0
 
@@ -4892,31 +3297,8 @@ def _collect_viewer_sequence_intercept(
                     break
 
         # 清除過舊 network 候選，避免很久以前的 response 被下一輪當新圖。
-        # v11.31: 大型相簿 recovery 期間 response 會先噴出一批後段圖，
-        # 若太早裁掉 bucket，後面 harvest_once 可能只看見舊循環圖。
-        if large_album_mode:
-            if len(network_bucket) > 320:
-                del network_bucket[:120]
-        else:
-            if len(network_bucket) > 60:
-                del network_bucket[:30]
-
-        # v11.32: If a large album is clearly replaying cached frames for a long
-        # plateau, stop this viewer earlier and let final-sweep / segmented rescue
-        # handle the remaining holes.  This keeps the strict final guard while
-        # avoiding hours of repeated ArrowRight recovery loops.
-        if (
-            large_album_mode
-            and target_count
-            and len(collected) < int(target_count)
-            and len(collected) >= max(40, int(target_count) // 2)
-            and stale >= 24
-        ):
-            logger.info(
-                f"FB v11.32 large album plateau shift: collected={len(collected)}/"
-                f"{target_count}, stale={stale}, turn={turn}; enter final-sweep/rescue"
-            )
-            break
+        if len(network_bucket) > 60:
+            del network_bucket[:30]
 
         # 如果已經很久沒有新圖，停止這個 viewer 起點；其他起點還會繼續補。
         if stale >= hard_stale_stop:
@@ -4929,75 +3311,10 @@ def _collect_viewer_sequence_intercept(
             logger.info(f"FB viewer-intercept {label} 偵測回到第一張，停止")
             break
 
-    # v11.31 Network Bucket Final Sweep:
-    # 有些大型相簿在 recovery 時已經把後段高清 response 落盤，
-    # 但目前 viewer DOM 仍停在舊圖，harvest_once 沒有機會把它們納入 collected。
-    # 只在大型相簿未達標時啟用，且仍套用 cluster family / stable media id 去重。
-    if large_album_mode and target_count and len(collected) < int(target_count):
-        before_sweep = len(collected)
-        try:
-            ordered_bucket = sorted(
-                list(network_bucket),
-                key=lambda x: int(x.get("score") or 0) + int(x.get("body_size") or 0) + int(x.get("content_length") or 0),
-                reverse=True,
-            )
-            for cand in ordered_bucket:
-                if len(collected) >= int(target_count):
-                    break
-                src = (cand.get("src") or "").strip()
-                if not src or not _looks_like_real_fb_media_url(src):
-                    continue
-                low = src.lower()
-                if _is_bad_fb_media_url(low) or _is_probable_fb_thumbnail_url(low) or _is_probably_video_url(src):
-                    continue
-                key = _media_key_from_src(src)
-                mid = _fb_media_numeric_id_str_from_src(src)
-                stable_key = mid or key
-                if not key or not stable_key:
-                    continue
-                if key in seen_keys or stable_key in seen_media_ids:
-                    continue
-                chosen_cluster = _media_cluster_key_from_src(src)
-                chosen_family = _media_cluster_family_from_key(chosen_cluster)
-                exact_cluster_ok = bool(allowed_cluster and chosen_cluster == allowed_cluster)
-                relaxed_family_ok = bool(allowed_cluster_family and chosen_family == allowed_cluster_family)
-                if (allowed_cluster or allowed_cluster_family) and chosen_cluster and not (exact_cluster_ok or relaxed_family_ok):
-                    continue
-                seen_keys.add(key)
-                if mid:
-                    seen_media_ids.add(mid)
-                _force_persist_harvest_candidate(cand, reason="network-bucket-final-sweep", order_no=len(collected) + 1)
-                collected.append({
-                    "order": len(collected) + 1,
-                    "candidates": [cand],
-                    "src": src,
-                    "type": cand.get("type", "image"),
-                    "score": cand.get("score", 0),
-                })
-                logger.info(
-                    f"FB viewer-intercept {label} final-sweep 收集第 {len(collected)} 張: "
-                    f"{os.path.basename(urlparse(src.split('?')[0]).path)}"
-                )
-        except Exception as e:
-            logger.warning(f"FB viewer-intercept {label} final-sweep 失敗: {e}")
-        if len(collected) != before_sweep:
-            logger.info(f"FB viewer-intercept {label} final-sweep merged: {before_sweep}->{len(collected)}")
-
     logger.info(f"FB viewer-intercept {label}: collected={len(collected)}")
     return collected
 
-def _collect_viewer_sequence_from_url(
-    context,
-    start_url: str,
-    *,
-    label: str,
-    is_photo_page: bool = False,
-    target_count: int | None = None,
-    stale_threshold: int = 3,
-    max_turns: int | None = None,
-    allowed_cluster: str | None = None,
-    allowed_cluster_family: str | None = None,
-) -> list[dict]:
+def _collect_viewer_sequence_from_url(context, start_url: str, *, label: str, is_photo_page: bool = False, target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None) -> list[dict]:
     p = None
     try:
         p = context.new_page()
@@ -5021,7 +3338,6 @@ def _collect_viewer_sequence_from_url(
             stale_threshold=stale_threshold,
             max_turns=max_turns,
             allowed_cluster=allowed_cluster,
-            allowed_cluster_family=allowed_cluster_family,
         )
         logger.info(f"FB viewer start {label}: collected={len(seq)}")
         return seq
@@ -5797,54 +4113,24 @@ def _collect_fb_media_playwright(url: str):
             logger.info(f"FB photo link count before +N={len(links_before)}")
             logger.info(f"FB +N overlay count before={plus_count_before}")
 
-            # v11.37: pre-extract hidden same-pcb photo links from bootstrapped HTML.
-            # Large +N posts often expose only 5 DOM anchors but keep many fbid links in HTML/JSON.
-            preliminary_pcb_key = _dominant_pcb_key_from_links(links_before)
-            html_links_before = []
-            try:
-                html_links_before = _extract_fb_photo_links_from_html_text(
-                    page.content(),
-                    pcb_key=preliminary_pcb_key or None,
-                    expected_count=(int(plus_count_before) + 4 if plus_count_before else None),
-                )
-            except Exception as e:
-                logger.warning(f"FB v11.37 html photo link extract before failed: {e}")
-            if html_links_before:
-                logger.info(f"FB v11.37 html photo link count before +N={len(html_links_before)}")
-
             # 第二階段：點 +12 / 更多照片，再收集完整列表
             try:
                 _click_plus_overlay_or_first_photo(page)
-                # v11.37: give FB large grid/dialog lazy rendering a little more time.
-                if plus_count_before and int(plus_count_before) >= 50:
-                    page.wait_for_timeout(5200)
-                else:
-                    page.wait_for_timeout(3000)
+                page.wait_for_timeout(3000)
             except Exception:
                 pass
 
             grid_after = _collect_fb_grid_items(page)
             links_after = _collect_fb_photo_links(page)
-            html_links_after = []
-            try:
-                html_links_after = _extract_fb_photo_links_from_html_text(
-                    page.content(),
-                    pcb_key=preliminary_pcb_key or None,
-                    expected_count=(int(plus_count_before) + 4 if plus_count_before else None),
-                )
-            except Exception as e:
-                logger.warning(f"FB v11.37 html photo link extract after failed: {e}")
             logger.info(f"FB grid item count after +N={len(grid_after)}")
             logger.info(f"FB photo link count after +N={len(links_after)}")
-            if html_links_after:
-                logger.info(f"FB v11.37 html photo link count after +N={len(html_links_after)}")
 
             # 合併順序：
             # 先保留 before 的可見順序，再補 after 的新增連結。
             ordered_links = []
             seen_link = set()
 
-            for link in links_before + html_links_before + links_after + html_links_after:
+            for link in links_before + links_after:
                 if link and link not in seen_link:
                     seen_link.add(link)
                     ordered_links.append(link)
@@ -5861,20 +4147,6 @@ def _collect_fb_media_playwright(url: str):
             logger.info(f"FB ordered photo link count={len(ordered_links)}")
             logger.info(f"FB ordered grid item count={len(ordered_grid_items)}")
 
-            # v11.39 small/medium +N safety:
-            # Keep the pre-PCB ordered links as a rescue source.  Some normal FB galleries
-            # expose 16 real photo links, but only the first 5 carry the first-anchor
-            # set=pcb key.  If we hard-filter those posts to pcb too early, every 16-photo
-            # gallery becomes 5/16 RETRY.  We only restore the raw true-photo link list
-            # when the +N target is small/medium and the raw list is large enough.
-            raw_ordered_links_pre_scope = list(ordered_links or [])
-            raw_ordered_grid_items_pre_scope = list(ordered_grid_items or [])
-            expected_from_plus = 0
-            try:
-                expected_from_plus = int(plus_count_before or 0) + 4 if plus_count_before else 0
-            except Exception:
-                expected_from_plus = 0
-
             dominant_pcb_key = _dominant_pcb_key_from_links(ordered_links)
             if dominant_pcb_key:
                 before_links_n = len(ordered_links)
@@ -5889,54 +4161,6 @@ def _collect_fb_media_playwright(url: str):
                     f"links {before_links_n}->{len(ordered_links)}, "
                     f"grid {before_grid_n}->{len(ordered_grid_items)}"
                 )
-
-                # v11.39: do not let first-anchor pcb filtering break normal +N galleries.
-                # Example from logs: target=16, ordered_links=17, pcb-filtered links=5.
-                # In that case the raw true-photo links are more complete than the strict
-                # first-anchor subset, while final media-id dedupe + strict guard still protect
-                # against incomplete output.  Keep this disabled for 80+/100+ large albums
-                # unless v11.37 html manifest already provides enough same-pcb records.
-                try:
-                    # v11.39: raw_ordered_links_pre_scope may include valid photo anchors that
-                    # _is_true_photo_link() rejects after FB URL escaping / redirect decoration.
-                    # For normal +N posts (<=40), use a more permissive single-photo detector
-                    # based on the stable photo key.  This fixes the v11.38 case where logs had
-                    # ordered_links=17 but the restore branch did not fire, leaving 5/16 RETRY.
-                    raw_true_links = []
-                    raw_true_seen = set()
-                    for u in (raw_ordered_links_pre_scope or []):
-                        key = _stable_photo_link_key(u)
-                        if not key:
-                            continue
-                        low_u = html.unescape(unquote(str(u))).lower()
-                        # Avoid generic story/permalink entries unless they resolve to a numeric
-                        # single-photo key.  Final media-id dedupe + strict guard still protects
-                        # correctness if FB gives a duplicate decorated URL.
-                        if 'pfbid' in low_u and 'fbid=' not in low_u and 'photo_id=' not in low_u:
-                            continue
-                        if key in raw_true_seen:
-                            continue
-                        raw_true_seen.add(key)
-                        raw_true_links.append(u)
-                except Exception:
-                    raw_true_links = []
-
-                if (
-                    expected_from_plus
-                    and expected_from_plus <= 40
-                    and len(ordered_links or []) < expected_from_plus
-                    and len(raw_true_links) >= expected_from_plus
-                ):
-                    logger.info(
-                        f"FB v11.39 restore raw +N photo links after pcb over-filter: "
-                        f"filtered={len(ordered_links or [])}/target={expected_from_plus}, "
-                        f"raw_true={len(raw_true_links)}, raw_ordered={len(raw_ordered_links_pre_scope or [])}"
-                    )
-                    ordered_links = raw_true_links[: expected_from_plus + 3]
-                    # Keep scoped grid items when available. Raw grid is only a thumbnail fallback,
-                    # so restoring it is safe but not required for full photo-link rescue.
-                    if len(ordered_grid_items or []) < min(len(raw_ordered_grid_items_pre_scope or []), expected_from_plus):
-                        ordered_grid_items = raw_ordered_grid_items_pre_scope
 
             # v11.19: title must be scoped to the article containing the selected PCB photo links.
             # Generic page selectors can grab neighboring/recommended posts in logged-in feeds.
@@ -5953,126 +4177,12 @@ def _collect_fb_media_playwright(url: str):
             )
             logger.info(f"FB expected photo target={expected_photo_count}")
 
-            # v11.42: harden v11.39 small/mid album restoration after final target detection.
-            # Some builds computed the +N target correctly (e.g. 16) but still kept the
-            # over-scoped pcb subset (17->5), causing normal posts to RETRY again.
-            # Re-run the raw-link restore here using the final expected_photo_count.
-            try:
-                if (
-                    expected_photo_count
-                    and int(expected_photo_count) <= 40
-                    and len(ordered_links or []) < int(expected_photo_count)
-                    and len(raw_ordered_links_pre_scope or []) >= int(expected_photo_count)
-                ):
-                    raw_true_links_v1142 = []
-                    raw_true_seen_v1142 = set()
-                    for _u in (raw_ordered_links_pre_scope or []):
-                        _key = _stable_photo_link_key(_u)
-                        if not _key:
-                            continue
-                        _low = html.unescape(unquote(str(_u))).lower()
-                        if 'pfbid' in _low and 'fbid=' not in _low and 'photo_id=' not in _low:
-                            continue
-                        if _key in raw_true_seen_v1142:
-                            continue
-                        raw_true_seen_v1142.add(_key)
-                        raw_true_links_v1142.append(_u)
-                    if len(raw_true_links_v1142) >= int(expected_photo_count):
-                        logger.info(
-                            f"FB v11.42 restore small/mid raw +N links after final target: "
-                            f"filtered={len(ordered_links or [])}/target={expected_photo_count}, "
-                            f"raw_true={len(raw_true_links_v1142)}, raw_ordered={len(raw_ordered_links_pre_scope or [])}"
-                        )
-                        ordered_links = raw_true_links_v1142[: int(expected_photo_count) + 3]
-                        if len(ordered_grid_items or []) < min(len(raw_ordered_grid_items_pre_scope or []), int(expected_photo_count)):
-                            ordered_grid_items = raw_ordered_grid_items_pre_scope
-                    elif len(raw_ordered_links_pre_scope or []) >= int(expected_photo_count):
-                        # v11.43: keep normal small/mid +N galleries from regressing to 5/16.
-                        # Some FB anchors are decorated enough that _stable_photo_link_key() is
-                        # conservative, but the viewer path can still harvest them once the raw
-                        # order is preserved.  Final media-id dedupe + strict guard still protect
-                        # against duplicate permalink pollution.
-                        logger.info(
-                            f"FB v11.43 force restore small/mid raw ordered links: "
-                            f"filtered={len(ordered_links or [])}/target={expected_photo_count}, "
-                            f"raw_true={len(raw_true_links_v1142)}, raw_ordered={len(raw_ordered_links_pre_scope or [])}"
-                        )
-                        ordered_links = list(raw_ordered_links_pre_scope or [])[: int(expected_photo_count) + 3]
-                        if len(ordered_grid_items or []) < min(len(raw_ordered_grid_items_pre_scope or []), int(expected_photo_count)):
-                            ordered_grid_items = raw_ordered_grid_items_pre_scope
-            except Exception as _e:
-                logger.debug(f"FB v11.42 small/mid raw restore skipped: {_e}")
-
-            large_album_mode = _is_large_fb_album_target(expected_photo_count, plus_count_before)
-            large_album_cluster_family = ""
-            if large_album_mode:
-                logger.info(
-                    f"FB v11.26 large album resilient mode enabled: target={expected_photo_count}, plus={plus_count_before}"
-                )
-
-            # v11.40: for true large albums, desktop DOM/HTML can expose only the
-            # first 5 anchors even though +N reveals a 100+ target.  Before building
-            # photo link items, try a bounded mobile/mbasic manifest expansion so
-            # photo-page rescue has real same-pcb records to work with.
-            if large_album_mode and expected_photo_count and len(ordered_links or []) < expected_photo_count:
-                try:
-                    seed_for_basic = []
-                    for u in (raw_ordered_links_pre_scope or []) + (ordered_links or []):
-                        if u and u not in seed_for_basic:
-                            seed_for_basic.append(u)
-                    basic_links = _expand_large_album_links_via_basic_manifest(
-                        context,
-                        original_url=url,
-                        resolved_url=resolved,
-                        seed_links=seed_for_basic,
-                        pcb_key=dominant_pcb_key,
-                        expected_count=expected_photo_count,
-                    )
-                    if basic_links and len(basic_links) > len(ordered_links or []):
-                        before_basic_merge = len(ordered_links or [])
-                        merged = []
-                        seen_basic = set()
-                        for u in (ordered_links or []) + basic_links:
-                            key = _stable_photo_link_key(u) or u
-                            if key in seen_basic:
-                                continue
-                            seen_basic.add(key)
-                            merged.append(u)
-                        ordered_links = merged
-                        logger.info(
-                            f"FB v11.40 large album basic manifest merged: "
-                            f"{before_basic_merge}->{len(ordered_links)} target={expected_photo_count}"
-                        )
-                except Exception as e:
-                    logger.warning(f"FB v11.40 large album basic manifest rescue failed: {e}")
-
-            # v11.43: if post/basic/comet seeds still expose only 5~8 records,
-            # probe the dedicated media/set pagination surface before building
-            # photo-link items. This is large-album-only and keeps strict guard.
-            if large_album_mode and expected_photo_count and len(ordered_links or []) < expected_photo_count:
-                try:
-                    media_set_links = _expand_large_album_links_via_media_set_manifest(
-                        context,
-                        pcb_key=dominant_pcb_key,
-                        expected_count=expected_photo_count,
-                    )
-                    if media_set_links and len(media_set_links) > len(ordered_links or []):
-                        before_media_set_n = len(ordered_links or [])
-                        merged = []
-                        seen_media_set = set()
-                        for u in (ordered_links or []) + media_set_links:
-                            key = _stable_photo_link_key(u) or u
-                            if key in seen_media_set:
-                                continue
-                            seen_media_set.add(key)
-                            merged.append(u)
-                        ordered_links = merged
-                        logger.info(
-                            f"FB v11.45 large album media-set merged: "
-                            f"{before_media_set_n}->{len(ordered_links)} target={expected_photo_count}"
-                        )
-                except Exception as e:
-                    logger.warning(f"FB v11.45 large album media-set manifest rescue failed: {e}")
+            # v11.46 safety:
+            # This uploaded full version does not include the later large-album
+            # helper stack from the previous v11.40-v11.45 branch.  Keep this flag
+            # explicit so the narrow single-photo duplicate-link correction below
+            # does not raise NameError and does not alter normal gallery behavior.
+            large_album_mode = False
 
             if expected_photo_count and len(ordered_links) > expected_photo_count + 3:
                 logger.warning(
@@ -6097,6 +4207,40 @@ def _collect_fb_media_playwright(url: str):
             manifest_ids = _manifest_ids_from_packs(link_items)
             if manifest_ids:
                 logger.info(f"FB v11.17 manifest whitelist ids={len(manifest_ids)}")
+
+            # v11.46 Single-photo duplicate-link target correction:
+            # Some Facebook share/p posts expose two ordered photo links even though
+            # every reliable post-scoped signal points to one real photo:
+            #   - no +N overlay
+            #   - one visible grid tile
+            #   - one normalized true photo/link item
+            #   - one manifest/media id
+            # In that case ordered_links=2 is a duplicate/ghost link, not a real 2-photo
+            # gallery.  Correct only this narrow case so normal 2-photo, 16-photo and
+            # large-album completeness guards remain strict.
+            try:
+                if (
+                    expected_photo_count
+                    and int(expected_photo_count) == 2
+                    and not plus_count_before
+                    and len(ordered_grid_items or []) <= 1
+                    and len(ordered_links or []) <= 2
+                    and len(link_items or []) == 1
+                    and len(manifest_ids or []) == 1
+                    and not large_album_mode
+                ):
+                    logger.info(
+                        "FB v11.46 corrected duplicate single-photo target: "
+                        f"expected {expected_photo_count}->1, "
+                        f"ordered_links={len(ordered_links or [])}, "
+                        f"grid={len(ordered_grid_items or [])}, "
+                        f"link_items={len(link_items or [])}, "
+                        f"manifest={len(manifest_ids or [])}"
+                    )
+                    expected_photo_count = 1
+            except Exception as _e:
+                logger.debug(f"FB v11.46 duplicate single-photo target correction skipped: {_e}")
+
             if ordered_links and len(link_items) < max(8, int(len(ordered_links) * 0.7)):
                 logger.warning(f"FB photo-link sequence 明顯不足: link_items={len(link_items)} / ordered_links={len(ordered_links)}，代表部分 photo link 開頁後仍回同一張或只給縮圖")
 
@@ -6105,44 +4249,12 @@ def _collect_fb_media_playwright(url: str):
             pre_viewer_cluster = _dominant_media_cluster(link_items, min_count=2)
             if pre_viewer_cluster:
                 logger.info(f"FB v11.15 pre-viewer media cluster scope={pre_viewer_cluster}")
-                if large_album_mode:
-                    large_album_cluster_family = _media_cluster_family_from_key(pre_viewer_cluster)
-                    logger.info(
-                        f"FB v11.26 large album cluster family scope={large_album_cluster_family or '-'}"
-                    )
 
             # 多圖完整性補強 v9：
             # 從多個入口啟動 viewer。FB 有時從 +N 入口只能翻 3 張，
             # 但從 photo/?fbid= 或原貼文入口可走到不同區段，所以要合併多段 viewer sequence。
             grid_tile_items = []
-            comet_cdn_items = []
             try:
-                # v11.41: run a bounded Comet/CDN manifest scrape for true large albums.
-                # This is separate from viewer clicking and does not relax final strict guard.
-                if large_album_mode and expected_photo_count:
-                    try:
-                        seed_for_comet = []
-                        for u in (raw_ordered_links_pre_scope or []) + (ordered_links or []):
-                            if u and u not in seed_for_comet:
-                                seed_for_comet.append(u)
-                        comet_cdn_items = _collect_large_album_comet_cdn_manifest_items(
-                            context,
-                            original_url=url,
-                            resolved_url=resolved,
-                            seed_links=seed_for_comet,
-                            pcb_key=dominant_pcb_key,
-                            expected_count=expected_photo_count,
-                            allowed_cluster_family=large_album_cluster_family or None,
-                        )
-                        if comet_cdn_items:
-                            before_comet_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items)))
-                            after_comet_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, comet_cdn_items)))
-                            logger.info(
-                                f"FB v11.42 large album comet/cdn merged: {before_comet_n}->{after_comet_n} target={expected_photo_count}"
-                            )
-                    except Exception as e:
-                        logger.warning(f"FB v11.41 large album comet/cdn manifest rescue failed: {e}")
-
                 network_items.clear()
 
                 viewer_sequences = []
@@ -6152,68 +4264,20 @@ def _collect_fb_media_playwright(url: str):
                     label="post",
                     is_photo_page=False,
                     target_count=expected_photo_count or None,
-                    stale_threshold=(24 if large_album_mode else 4),
-                    max_turns=(max(640, (expected_photo_count or 16) * 6) if large_album_mode else max(24, (expected_photo_count or 16) + 10)),
+                    stale_threshold=4,
+                    max_turns=max(24, (expected_photo_count or 16) + 10),
                     allowed_cluster=pre_viewer_cluster or None,
-                    allowed_cluster_family=large_album_cluster_family or None,
                 )
                 viewer_sequences.append(post_sequence)
 
-                # v11.13: In post-scoped mode, avoid generic photo-page 補挖，因為 logged-in Facebook
-                # often redirects those photo pages to feed/recommendation contexts.
-                # v11.31: 100+ 大型相簿在 post viewer 70~80 張後常卡 plateau。
-                # 只針對 large_album_mode 啟用「同 pcb / 同 cluster family」限縮補挖；
-                # 小相簿維持原本 skip 行為，避免推薦圖污染。
+                # v11.13: In post-scoped mode, never open individual photo pages
+                # after post viewer. Logged-in Facebook often redirects those photo pages
+                # to feed/recommendation contexts and pollutes the output.
                 if expected_photo_count:
-                    if large_album_mode:
-                        try:
-                            current_unique_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, *viewer_sequences)))
-                        except Exception:
-                            current_unique_n = len(_aggregate_unique_items(link_items, *viewer_sequences))
-                        if current_unique_n < expected_photo_count:
-                            # v11.37: segmented photo-page viewer starts are probes, not
-                            # another full-length 100+ photo crawl.  If the main viewer already
-                            # produced almost nothing, cap probes at 3 and let controlled
-                            # grid/photo-page rescue handle the remaining holes.
-                            segmented_probe_limit = 3 if current_unique_n <= max(8, len(link_items) + 2) else 5
-                            true_photo_links = []
-                            for link in ordered_links:
-                                if _is_true_photo_link(link):
-                                    true_photo_links.append(link)
-                                if len(true_photo_links) >= segmented_probe_limit:
-                                    break
-                            logger.info(
-                                f"FB v11.40 large album segmented photo-page probe: "
-                                f"unique={current_unique_n}/target={expected_photo_count}, starts={len(true_photo_links)}"
-                            )
-                            for i, link in enumerate(true_photo_links, 1):
-                                try:
-                                    viewer_sequences.append(_collect_viewer_sequence_from_url(
-                                        context,
-                                        link,
-                                        label=f"large-photo{i}",
-                                        is_photo_page=True,
-                                        target_count=expected_photo_count or None,
-                                        stale_threshold=6,
-                                        max_turns=42,
-                                        allowed_cluster=pre_viewer_cluster or None,
-                                        allowed_cluster_family=large_album_cluster_family or None,
-                                    ))
-                                    try:
-                                        current_unique_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, *viewer_sequences)))
-                                    except Exception:
-                                        current_unique_n = len(_aggregate_unique_items(link_items, *viewer_sequences))
-                                    if current_unique_n >= expected_photo_count:
-                                        break
-                                except Exception as e:
-                                    logger.warning(f"FB v11.31 large-photo{i} rescue 失敗: {e}")
-                        else:
-                            logger.info("FB v11.13 post-scoped mode: 主貼文 viewer 已足夠，略過 photo 補挖")
-                    else:
-                        logger.info(
-                            "FB v11.13 post-scoped mode: 略過 photo1/photo2 補挖，"
-                            "只保留主貼文 viewer + scoped link candidates"
-                        )
+                    logger.info(
+                        "FB v11.13 post-scoped mode: 略過 photo1/photo2 補挖，"
+                        "只保留主貼文 viewer + scoped link candidates"
+                    )
                 else:
                     true_photo_links = []
                     for link in ordered_links:
@@ -6232,15 +4296,9 @@ def _collect_fb_media_playwright(url: str):
                             stale_threshold=3,
                             max_turns=6,
                             allowed_cluster=pre_viewer_cluster or None,
-                            allowed_cluster_family=large_album_cluster_family or None,
                         ))
 
                 viewer_items = _aggregate_unique_items(*viewer_sequences)
-                if comet_cdn_items:
-                    before_viewer_comet = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
-                    viewer_items = _aggregate_unique_items(viewer_items, comet_cdn_items)
-                    after_viewer_comet = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
-                    logger.info(f"FB v11.42 large album comet/cdn items applied: {before_viewer_comet}->{after_viewer_comet}")
                 logger.info(f"FB viewer sequence count={len(viewer_items)}")
 
                 # v11.22.1 Fast Retry Guard:
@@ -6253,17 +4311,11 @@ def _collect_fb_media_playwright(url: str):
                     except Exception:
                         before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
                     if before_retry_n < expected_photo_count:
-                        if large_album_mode:
-                            logger.info(
-                                f"FB v11.26 large album: primary viewer incomplete={before_retry_n}/target={expected_photo_count}; "
-                                "continue to grid tile/final completeness guard"
-                            )
-                        else:
-                            logger.info(
-                                f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
-                                "skip slow recovery and retry fresh context"
-                            )
-                            return "RETRY", f"Facebook viewer incomplete {before_retry_n}/{expected_photo_count}; retry fresh context"
+                        logger.info(
+                            f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
+                            "skip slow recovery and retry fresh context"
+                        )
+                        return "RETRY", f"Facebook viewer incomplete {before_retry_n}/{expected_photo_count}; retry fresh context"
 
             except Exception as e:
                 logger.warning(f"FB viewer fallback 失敗: {e}")
@@ -6285,7 +4337,6 @@ def _collect_fb_media_playwright(url: str):
                         pcb_key=dominant_pcb_key,
                         expected_count=expected_photo_count,
                         allowed_cluster=pre_viewer_cluster or None,
-                        allowed_cluster_family=large_album_cluster_family or None,
                     )
                     if grid_tile_items:
                         before_grid_merge = current_unique_n
@@ -6351,7 +4402,6 @@ def _collect_fb_media_playwright(url: str):
                     viewer_items,
                     dominant_cluster,
                     manifest_ids=manifest_ids,
-                    cluster_family=large_album_cluster_family or None,
                 )
                 # In post-scoped mode, prefer correctness over quantity.
                 # It is better to output 15 correct images than 16 with one recommendation/ad.
@@ -6556,91 +4606,118 @@ def _download_via_ytdlp(url: str):
 
 
 def download(url: str):
-    """Download a Facebook URL.
+    result_box = [(None, None)]
 
-    v11.26:
-    - Run the Playwright pipeline synchronously.  A daemon-thread timeout cannot
-      safely kill Playwright; it only returns RETRY while the old browser context
-      keeps writing temp files in the background.
-    - Preserve strict gallery completeness.  Partial albums still return RETRY
-      and are cleaned after the pipeline returns.
-    """
-    original_low = (url or "").lower()
-    resolved = _resolve_share_url(url)
-    resolved_low = (resolved or "").lower()
+    def _run():
+        original_low = (url or "").lower()
+        resolved = _resolve_share_url(url)
+        resolved_low = (resolved or "").lower()
 
-    is_reel_like_url = _is_fb_reel_url(original_low) or _is_fb_reel_url(resolved_low)
+        # v11.23.2 full, non-crippled strict routing:
+        # - Keep the whole Playwright gallery pipeline intact.
+        # - For share/posts/photo/permalink URLs, Playwright is the source of truth.
+        # - If Playwright says RETRY/BLOCKED/UNAVAILABLE, return that status directly.
+        # - Do NOT fall back to yt-dlp after an incomplete gallery RETRY, because that can
+        #   incorrectly download an unrelated/sibling .mp4 and mark the photo task SUCCESS.
+        is_reel_like_url = _is_fb_reel_url(original_low) or _is_fb_reel_url(resolved_low)
 
-    force_playwright_first = (
-        any(x in original_low for x in [
-            "/share/",
-            "/posts/",
-            "/photo",
-            "/photos/",
-            "story_fbid=",
-            "fbid=",
-            "/permalink/",
+        force_playwright_first = (
+            any(x in original_low for x in [
+                "/share/",
+                "/posts/",
+                "/photo",
+                "/photos/",
+                "story_fbid=",
+                "fbid=",
+                "/permalink/",
+            ])
+            and not is_reel_like_url
+        )
+
+        explicit_video_url = is_reel_like_url or any(x in original_low or x in resolved_low for x in [
+            "/watch",
+            "/videos/",
+            "video.php",
+            "/reel",
+            "/reels/",
+            "fb.watch",
         ])
-        and not is_reel_like_url
-    )
 
-    explicit_video_url = is_reel_like_url or any(x in original_low or x in resolved_low for x in [
-        "/watch",
-        "/videos/",
-        "video.php",
-        "/reel",
-        "/reels/",
-        "fb.watch",
-    ])
-
-    try:
         if explicit_video_url and not force_playwright_first:
             status1, error1 = _download_via_ytdlp(resolved)
 
             if status1 == "SUCCESS":
-                return status1, error1
+                result_box[0] = (status1, error1)
+                return
 
             status2, error2 = _collect_fb_media_playwright(resolved)
 
             if status2 == "SUCCESS":
-                return status2, error2
+                result_box[0] = (status2, error2)
+                return
 
             if status2 in ("RETRY", "BLOCKED", "UNAVAILABLE"):
-                return status2, error2
+                result_box[0] = (status2, error2)
+                return
 
             final_status, _ = _classify_error(f"ytdlp={error1} | playwright={error2}")
-            return final_status, f"ytdlp={error1} | playwright={error2}"
+
+            result_box[0] = (
+                final_status,
+                f"ytdlp={error1} | playwright={error2}",
+            )
+            return
 
         status1, error1 = _collect_fb_media_playwright(resolved)
 
         if status1 == "SUCCESS":
-            return status1, error1
+            result_box[0] = (status1, error1)
+            return
 
         if status1 in ("RETRY", "BLOCKED", "UNAVAILABLE"):
             logger.info(
                 f"FB Playwright returned {status1}; skip yt-dlp fallback to preserve gallery integrity: {error1}"
             )
-            _clear_temp_after_terminal_failure(status1, error1)
-            return status1, error1
+            result_box[0] = (status1, error1)
+            return
 
+        # Only allow yt-dlp fallback for URLs that are explicitly video-like.
+        # Generic /share/ photo galleries must not become .mp4 after Playwright fails.
         if explicit_video_url:
             status2, error2 = _download_via_ytdlp(resolved)
 
             if status2 == "SUCCESS":
-                return status2, error2
+                result_box[0] = (status2, error2)
+                return
 
             final_status, _ = _classify_error(f"playwright={error1} | ytdlp={error2}")
-            final_error = f"playwright={error1} | ytdlp={error2}"
-            _clear_temp_after_terminal_failure(final_status, final_error)
-            return final_status, final_error
+
+            result_box[0] = (
+                final_status,
+                f"playwright={error1} | ytdlp={error2}",
+            )
+            return
 
         logger.info(
             f"FB non-video/gallery route failed in Playwright; skip yt-dlp fallback: {error1}"
         )
-        _clear_temp_after_terminal_failure(status1, error1)
-        return status1, error1
+        result_box[0] = (status1, error1)
 
-    except Exception as e:
-        status, reason = _classify_error(str(e))
+    t = threading.Thread(
+        target=_run,
+        daemon=True,
+    )
+
+    t.start()
+    t.join(_DL_TIMEOUT)
+
+    if t.is_alive():
+        logger.error(f"Facebook 下載超時: {url}")
+        clear_temp()
+        return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
+
+    result = result_box[0] or ("FAILED", "未知錯誤")
+    status, reason = result
+    if status != "SUCCESS":
         _clear_temp_after_terminal_failure(status, reason)
-        return status, reason
+    return result

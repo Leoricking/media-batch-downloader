@@ -1,4 +1,5 @@
 import os
+import re
 import threading
 import time
 from typing import Optional
@@ -69,6 +70,20 @@ def _normalize_status(status: str) -> str:
         "NOT_FOUND": "MISSING",
     }
     return aliases.get(status, status or "FAILED")
+
+
+def _extract_urls_from_text(text: str) -> list[str]:
+    """Extract plain URL values from failed_links.log style lines."""
+    if not text:
+        return []
+    urls = []
+    seen = set()
+    for match in re.findall(r"https?://[^\s\t]+", text):
+        url = match.strip()
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 def _find_task(url: str) -> Optional[dict]:
@@ -242,7 +257,36 @@ def get_snapshot() -> list[dict]:
 def get_urls_by_status(status: str) -> list[str]:
     status = _normalize_status(status)
     with _LOCK:
-        return [t.get("url", "") for t in _TASKS if t.get("status") == status and t.get("url")]
+        urls = [t.get("url", "") for t in _TASKS if t.get("status") == status and t.get("url")]
+
+    if urls:
+        return urls
+
+    # Fallback for cases where the GUI was restarted and in-memory tasks are empty.
+    # Keep this URL-only; do not return the whole failed log line.
+    if os.path.exists(FAILED_LOG_FILE):
+        try:
+            with open(FAILED_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [line for line in f.read().splitlines() if f"[{status}]" in line]
+            return _extract_urls_from_text("\n".join(lines))
+        except Exception:
+            pass
+
+    if status == "RETRY" and os.path.exists(RETRY_NEEDED_FILE):
+        try:
+            with open(RETRY_NEEDED_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                return [x.strip() for x in f if x.strip()]
+        except Exception:
+            pass
+
+    if status in {"MISSING", "UNAVAILABLE"} and os.path.exists(UNAVAILABLE_FILE):
+        try:
+            with open(UNAVAILABLE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                return [x.strip() for x in f if x.strip()]
+        except Exception:
+            pass
+
+    return []
 
 
 def get_tasks_by_status(status: str = "ALL") -> list[dict]:
@@ -293,8 +337,12 @@ def get_failed_links_text(status_filter: str = "ALL", url_only: bool = False, ur
                 content = f.read().strip()
             if content:
                 if status_filter == "ALL":
-                    return content
-                lines = [line for line in content.splitlines() if f"[{status_filter}]" in line]
+                    lines = content.splitlines()
+                else:
+                    lines = [line for line in content.splitlines() if f"[{status_filter}]" in line]
+                if url_only:
+                    urls = _extract_urls_from_text("\n".join(lines))
+                    return "\n".join(urls) if urls else f"目前沒有 {status_filter} 紀錄。"
                 return "\n".join(lines) if lines else f"目前沒有 {status_filter} 紀錄。"
         except Exception:
             pass

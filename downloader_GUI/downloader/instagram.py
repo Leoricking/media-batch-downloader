@@ -278,21 +278,51 @@ def _is_ytdlp_non_video_post_error(err: str) -> bool:
     ])
 
 
+def _clean_error_text(err: str) -> str:
+    """Remove terminal ANSI color codes and normalize whitespace before classification."""
+    text = html.unescape(str(err or ""))
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _is_soft_retry_ig_error(err: str) -> bool:
+    """
+    Errors that are usually transient IG anti-bot / lazy-load / empty-media cases.
+
+    These must not become permanent FAILED or hard BLOCKED unless Playwright
+    actually sees login / checkpoint / challenge / private / missing-page content.
+    """
+    e = _clean_error_text(err).lower()
+    return any(k in e for k in [
+        "instagram sent an empty media response",
+        "empty media response",
+        "requested content is not available, rate-limit reached or login required",
+        "rate-limit reached or login required",
+        "playwright 頁面已開啟，但未抓到有效貼文主媒體",
+        "playwright 頁面已開啟，但本輪未抓到有效貼文主媒體",
+        "playwright 有抓到媒體 url，但全部被判定為垃圾圖",
+        "fetching post metadata failed",
+        "json query to graphql/query",
+        "expecting value: line 1 column 1",
+    ])
+
+
 def _prefer_final_status(*pairs):
     """
     多引擎結果合併規則：
     - SUCCESS 已在呼叫端先 return
     - MISSING 優先，代表頁面真的消失，不重試
     - RETRY 次優先，代表暫時性風控 / timeout，之後可補跑
-    - BLOCKED 僅在明確 login / checkpoint / audience restricted 時保留
-    - 單純 no video formats 不視為 BLOCKED，避免圖文貼文被誤標
+    - BLOCKED 僅在明確 Playwright login / checkpoint / audience restricted 時保留
+    - yt-dlp empty media / mixed login-required help text 不視為永久 FAILED / BLOCKED
     """
     statuses = []
     for st, err in pairs:
         if not st:
             continue
         normalized = "MISSING" if st == "UNAVAILABLE" else (st or "FAILED")
-        statuses.append((normalized, err or ""))
+        statuses.append((normalized, _clean_error_text(err or "")))
 
     for st, err in statuses:
         if st == "MISSING":
@@ -301,6 +331,13 @@ def _prefer_final_status(*pairs):
     for st, err in statuses:
         if st == "RETRY":
             return "RETRY", err
+
+    # If any engine produced a soft/transient IG empty-media signal, keep it
+    # retryable instead of polluting FAILED.  Actual Playwright login/checkpoint
+    # pages are returned as BLOCKED earlier by _collect_ig_media_playwright().
+    for st, err in statuses:
+        if _is_soft_retry_ig_error(err):
+            return "RETRY", err or "Instagram 暫時空回應 / lazy-load 未載入媒體，建議稍後重試"
 
     for st, err in statuses:
         if st == "BLOCKED":
@@ -314,16 +351,17 @@ def _prefer_final_status(*pairs):
 
 
 def _classify_error(err: str):
-    e = (err or "").lower()
+    raw = _clean_error_text(err)
+    e = raw.lower()
 
-    # yt-dlp 的 empty media response 代表 yt-dlp 沒拿到媒體資料，
-    # 不等於帳號 / IP 被封鎖。先回 FAILED，讓 download() 後續交給
-    # Playwright 讀實際頁面，再判斷是 MISSING、BLOCKED 或一般 FAILED。
-    if "empty media response" in e:
-        return "FAILED", err
+    # yt-dlp / Instaloader frequently report generic cookie/login guidance when IG
+    # returns an empty media body.  That is not a confirmed permission BLOCKED case.
+    # Keep it retryable unless Playwright has actually seen login/checkpoint/challenge.
+    if _is_soft_retry_ig_error(raw):
+        return "RETRY", raw
 
     if _is_ytdlp_non_video_post_error(e):
-        return "FAILED", err
+        return "FAILED", raw
 
     if any(k in e for k in [
         "please wait a few minutes",
@@ -336,16 +374,22 @@ def _classify_error(err: str):
         "timed out",
         "net::err_timed_out",
     ]):
-        return "RETRY", err
+        return "RETRY", raw
 
     if any(k in e for k in [
-        "login",
+        "404",
+        "not found",
+        "page not found",
+        "內容不存在",
+        "deleted",
+    ]):
+        return "MISSING", raw
+
+    if any(k in e for k in [
         "checkpoint",
         "challenge",
         "private profile",
         "privateprofile",
-        "requires login",
-        "sign in",
         "specific audience",
         "not available to everyone",
         "特定受眾無法查看",
@@ -355,18 +399,20 @@ def _classify_error(err: str):
         "generic instagram",
         "accounts/login",
     ]):
-        return "BLOCKED", err
+        return "BLOCKED", raw
 
+    # Avoid treating yt-dlp's generic "--cookies / login required" help text as a
+    # hard block.  Real login pages are detected in _is_generic_ig_page().
     if any(k in e for k in [
-        "404",
-        "not found",
-        "page not found",
-        "內容不存在",
-        "deleted",
+        "requires login",
+        "login required",
+        "sign in",
+        "use --cookies-from-browser",
+        "use --cookies",
     ]):
-        return "MISSING", err
+        return "RETRY", raw
 
-    return "FAILED", err
+    return "FAILED", raw
 
 
 def _load_netscape_cookies(path: str, domain_keyword: str):
@@ -380,7 +426,17 @@ def _load_netscape_cookies(path: str, domain_keyword: str):
             for raw in f:
                 line = raw.strip()
 
-                if not line or line.startswith("#"):
+                if not line:
+                    continue
+
+                # Netscape cookie files often store HttpOnly cookies as
+                # #HttpOnly_.instagram.com.  Do not treat those as comments;
+                # sessionid is commonly HttpOnly and is required for logged-in IG.
+                http_only = False
+                if line.startswith("#HttpOnly_"):
+                    line = line.replace("#HttpOnly_", "", 1)
+                    http_only = True
+                elif line.startswith("#"):
                     continue
 
                 parts = line.split("\t")
@@ -394,7 +450,6 @@ def _load_netscape_cookies(path: str, domain_keyword: str):
                     continue
 
                 clean_domain = domain
-                http_only = False
 
                 if clean_domain.startswith("#HttpOnly_"):
                     clean_domain = clean_domain.replace("#HttpOnly_", "", 1)
@@ -1545,7 +1600,7 @@ def _collect_ig_media_playwright(url: str):
             logger.info(f"IG filtered media count={len(filtered)}; network harvest={len(harvested_media)}")
 
             if not filtered:
-                return "FAILED", "Playwright 頁面已開啟，但未抓到有效貼文主媒體"
+                return "RETRY", "Playwright 頁面已開啟，但本輪未抓到有效貼文主媒體；可能是 IG lazy-load / 暫時空回應，建議稍後重試"
 
             success_count = 0
 
@@ -1585,7 +1640,7 @@ def _collect_ig_media_playwright(url: str):
                     logger.warning(f"IG 略過無效媒體: {media_url[:180]} | {e}")
 
             if success_count <= 0:
-                return "FAILED", "Playwright 有抓到媒體 URL，但全部被判定為垃圾圖 / 非有效媒體"
+                return "RETRY", "Playwright 有抓到媒體 URL，但本輪全部下載失敗或過小；可能是 IG CDN 暫時空回應，建議稍後重試"
 
             # Critical fix:
             # If Playwright / browser network cache has already written media files,
