@@ -24,12 +24,14 @@ from config import (
     ACCOUNTS_FILE,
     COOKIES_FILE,
     DOWNLOAD_DIR,
+    IG_PARSER_PROFILE_DIR,
+    FB_PARSER_PROFILE_DIR,
     DATA_DIR,
     PREPROCESS_DEFAULT_DOWNLOAD,
     PREPROCESS_DIR,
     PREPROCESS_OUTPUT_DIR,
 )
-from downloader import instagram
+from downloader import instagram, facebook
 from utils.logger import get_logger
 
 if PREPROCESS_DIR not in sys.path:
@@ -129,6 +131,18 @@ def _extract_urls(text: str) -> list[str]:
             seen.add(u)
             out.append(u)
     return out
+
+
+class _HiddenLoginButton:
+    """No-op placeholder for the legacy IG account/password login button.
+
+    The GUI intentionally no longer creates or packs the legacy login button,
+    but old internal callbacks still call self.login_btn.config(...).  Keeping
+    this tiny placeholder preserves compatibility without showing any widget.
+    """
+    def config(self, *args, **kwargs):
+        return None
+
 
 
 class App:
@@ -389,9 +403,10 @@ class App:
         btn_area.pack(fill=tk.X, pady=(0, self._ui_px(4)))
         btn_row = tk.Frame(btn_area)
         btn_row.pack(anchor="w", fill=tk.X)
-        # Keep the original single-row toolbar look.  Instead of wrapping into
-        # an ugly second row, use shorter labels and smaller padding so the
-        # toolbar fits typical FHD windows without covering the Treeview.
+        # v11.29 Toolbar layout:
+        # Keep the main toolbar in ONE row as requested, but use compact labels
+        # so FHD / Windows scaled UI will not hide right-side buttons.
+        # The legacy IG account/password login button is not created.
         btn_row2 = btn_row
 
         tk.Button(
@@ -400,12 +415,12 @@ class App:
             command=self._start_download,
             bg="#1976D2",
             fg="white",
-            padx=self._ui_px(12),
+            padx=self._ui_px(10),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._base_font_size, "bold"),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 6))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
         tk.Button(
             btn_row,
@@ -413,12 +428,12 @@ class App:
             command=self._clear_input,
             bg="#F57C00",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
         tk.Button(
             btn_row,
@@ -426,12 +441,12 @@ class App:
             command=self._import_txt,
             bg="#6A1B9A",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
         tk.Button(
             btn_row,
@@ -439,12 +454,12 @@ class App:
             command=self._preprocess_links,
             bg="#00897B",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
         tk.Button(
             btn_row,
@@ -452,12 +467,12 @@ class App:
             command=self._load_preprocessed_downloads,
             bg="#5E35B1",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
         tk.Button(
             btn_row,
@@ -465,12 +480,12 @@ class App:
             command=self._open_downloads,
             bg="#F57C00",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
         tk.Button(
             btn_row2,
@@ -478,12 +493,12 @@ class App:
             command=self._open_preprocess_output,
             bg="#37474F",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
         tk.Button(
             btn_row2,
@@ -491,34 +506,37 @@ class App:
             command=self._clear_processed_log,
             bg="#455A64",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 4))
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
 
-        self.login_btn = tk.Button(
-            btn_row2,
-            text="🔑 登入 IG",
-            command=self._manual_login,
-            bg="#5C6BC0",
-            fg="white",
-            padx=self._button_padx,
-            pady=self._button_pady,
-            font=("Microsoft JhengHei UI", self._small_font_size),
-            relief=tk.FLAT,
-            cursor="hand2",
-        )
-        self.login_btn.pack(side=tk.LEFT, padx=(0, self._gap_x))
+        # Legacy IG account/password login is intentionally hidden.
+        # Users should use IG_Parser persistent profile login instead.
+        self.login_btn = _HiddenLoginButton()
 
         tk.Button(
             btn_row2,
-            text="🌐 IG_Parser",
+            text="🌐 IG Parser",
             command=self._open_ig_parser_profile,
             bg="#1565C0",
             fg="white",
-            padx=self._button_padx,
+            padx=self._ui_px(5),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
+
+        tk.Button(
+            btn_row2,
+            text="🌐 FB Parser",
+            command=self._open_fb_parser_profile,
+            bg="#1877F2",
+            fg="white",
+            padx=self._ui_px(5),
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
@@ -558,11 +576,15 @@ class App:
 
         ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=self._ui_px(8), pady=(self._ui_px(4), 0))
 
-        bot = tk.Frame(self.root, padx=self._pad_x, pady=self._pad_y)
+        # v11.29 Bottom layout:
+        # Do not pack filters and action buttons in the same left/right row.
+        # On FHD or Windows UI scaling they overlap and the right-side buttons / resize area
+        # get clipped.  Keep the filter row and action row separate so all controls remain visible.
+        bot = tk.Frame(self.root, padx=self._pad_x, pady=self._ui_px(3))
         bot.pack(fill=tk.X)
 
-        filter_frame = tk.LabelFrame(bot, text="篩選", padx=self._ui_px(4), pady=self._ui_px(2))
-        filter_frame.pack(side=tk.LEFT)
+        filter_frame = tk.LabelFrame(bot, text="篩選", padx=self._ui_px(4), pady=self._ui_px(1))
+        filter_frame.pack(anchor="w", fill=tk.X)
 
         filter_defs = [
             ("全部", "ALL"),
@@ -587,9 +609,11 @@ class App:
                 command=lambda k=key: self._set_filter(k),
                 relief=tk.FLAT,
                 cursor="hand2",
-            ).pack(side=tk.LEFT, padx=self._ui_px(2), pady=self._ui_px(1))
+            ).pack(side=tk.LEFT, padx=self._ui_px(1), pady=0)
 
-        act_frame = tk.Frame(bot)
+        act_row = tk.Frame(bot)
+        act_row.pack(anchor="e", fill=tk.X, pady=(self._ui_px(3), 0))
+        act_frame = tk.Frame(act_row)
         act_frame.pack(side=tk.RIGHT)
 
         tk.Button(
@@ -598,12 +622,12 @@ class App:
             command=self._show_failed_links_window,
             bg="#6D4C41",
             fg="white",
-            padx=self._button_padx,
-            pady=self._bottom_button_pady,
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=self._gap_x)
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
 
         tk.Button(
             act_frame,
@@ -611,12 +635,12 @@ class App:
             command=lambda: self._copy_status_urls("BLOCKED"),
             bg="#EF6C00",
             fg="white",
-            padx=self._button_padx,
-            pady=self._bottom_button_pady,
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=self._gap_x)
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
 
         self.pause_btn = tk.Button(
             act_frame,
@@ -624,13 +648,13 @@ class App:
             command=self._pause_downloads,
             bg="#546E7A",
             fg="white",
-            padx=self._button_padx,
-            pady=self._bottom_button_pady,
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.pause_btn.pack(side=tk.LEFT, padx=self._gap_x)
+        self.pause_btn.pack(side=tk.LEFT, padx=self._ui_px(2))
 
         self.resume_btn = tk.Button(
             act_frame,
@@ -638,13 +662,13 @@ class App:
             command=self._resume_downloads,
             bg="#2E7D32",
             fg="white",
-            padx=self._button_padx,
-            pady=self._bottom_button_pady,
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.resume_btn.pack(side=tk.LEFT, padx=self._gap_x)
+        self.resume_btn.pack(side=tk.LEFT, padx=self._ui_px(2))
 
         self.stop_btn = tk.Button(
             act_frame,
@@ -652,13 +676,13 @@ class App:
             command=self._stop_downloads,
             bg="#8E24AA",
             fg="white",
-            padx=self._button_padx,
-            pady=self._bottom_button_pady,
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.stop_btn.pack(side=tk.LEFT, padx=self._gap_x)
+        self.stop_btn.pack(side=tk.LEFT, padx=self._ui_px(2))
 
         tk.Button(
             act_frame,
@@ -666,12 +690,12 @@ class App:
             command=self._retry_failed,
             bg="#E65100",
             fg="white",
-            padx=self._button_padx,
-            pady=self._bottom_button_pady,
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=self._gap_x)
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
 
         tk.Button(
             act_frame,
@@ -679,12 +703,12 @@ class App:
             command=self._clear_tasks,
             bg="#C62828",
             fg="white",
-            padx=self._button_padx,
-            pady=self._bottom_button_pady,
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT)
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
 
         self.status_var = tk.StringVar(value="就緒")
         tk.Label(
@@ -918,12 +942,26 @@ class App:
         self._copy_to_clipboard("\n".join(urls), f"已複製 {status} URL：{len(urls)} 筆")
 
     def _init_session(self):
+        # v11.27 Parser Profile Login:
+        # IG_Parser / FB_Parser persistent browser profiles are now the recommended
+        # login/trust-state workflow. cookies.txt is still loaded when present, but
+        # only as a legacy emergency fallback for Instaloader / yt-dlp compatibility.
         if os.path.exists(COOKIES_FILE):
             instagram.use_cookies(COOKIES_FILE)
-            self.status_var.set("使用 cookies.txt 模式  •  限制貼文 fallback 會自動使用 data/chrome_ig_parser 專用 Profile")
         else:
             instagram.setup()
-            self.status_var.set("匿名模式  •  建議先點「🌐 初始化 IG_Parser」登入專用 Profile")
+
+        ig_ready = os.path.exists(IG_PARSER_PROFILE_DIR)
+        fb_ready = os.path.exists(FB_PARSER_PROFILE_DIR)
+
+        if ig_ready or fb_ready:
+            self.status_var.set(
+                "Parser Profile 模式已啟用：IG_Parser / FB_Parser 會保留登入與信任狀態；cookies.txt 僅作為備援。"
+            )
+        else:
+            self.status_var.set(
+                "建議先點「🌐 IG Parser」與「🌐 FB Parser」完成登入；不需手動匯出 cookies.txt。"
+            )
 
     def _open_ig_parser_profile(self):
         """Open project-local IG_Parser Chrome profile for one-time login / trust setup."""
@@ -934,9 +972,11 @@ class App:
                 "已開啟 IG_Parser 專用 Chrome Profile。\n\n"
                 "請在該 Chrome 視窗中完成：\n"
                 "1. 登入 Instagram\n"
-                "2. 勾選 / 確認記住這台設備\n"
-                "3. 打開限制貼文並完成未滿18歲 / 特定對象確認\n\n"
-                "完成後關閉該 Chrome 視窗，再回到下載器繼續下載。\n\n"
+                "2. 完成 2FA / 裝置驗證\n"
+                "3. 勾選 / 確認記住這台設備\n"
+                "4. 打開限制貼文並完成未滿18歲 / 特定對象確認\n\n"
+                "完成後關閉該 Chrome 視窗，再回到下載器繼續下載。\n"
+                "之後下載器會直接使用此 Profile，不需要手動匯出 cookies.txt。\n\n"
                 f"Profile 位置：\n{profile_root}",
                 parent=self.root,
             )
@@ -948,6 +988,32 @@ class App:
                 parent=self.root,
             )
             self.status_var.set(f"IG_Parser Profile 開啟失敗：{e}")
+
+    def _open_fb_parser_profile(self):
+        """Open project-local FB_Parser Chrome profile for one-time login / trust setup."""
+        try:
+            profile_root = facebook.open_fb_parser_profile("https://www.facebook.com/")
+            messagebox.showinfo(
+                "FB_Parser 專用 Profile",
+                "已開啟 FB_Parser 專用 Chrome Profile。\n\n"
+                "請在該 Chrome 視窗中完成：\n"
+                "1. 登入 Facebook\n"
+                "2. 完成雙重驗證 / 裝置驗證\n"
+                "3. 勾選保持登入 / 信任此裝置\n"
+                "4. 打開需要下載的貼文、相簿或 Reel，確認瀏覽器可正常觀看\n\n"
+                "完成後關閉該 Chrome 視窗，再回到下載器繼續下載。\n"
+                "之後下載器會直接使用此 Profile，不需要手動匯出 cookies.txt。\n\n"
+                f"Profile 位置：\n{profile_root}",
+                parent=self.root,
+            )
+            self.status_var.set(f"已開啟 FB_Parser 專用 Profile：{profile_root}")
+        except Exception as e:
+            messagebox.showerror(
+                "無法開啟 FB_Parser Profile",
+                f"開啟 FB_Parser 專用 Chrome Profile 失敗：\n{e}",
+                parent=self.root,
+            )
+            self.status_var.set(f"FB_Parser Profile 開啟失敗：{e}")
 
     def _manual_login(self):
         if self._login_in_progress:
