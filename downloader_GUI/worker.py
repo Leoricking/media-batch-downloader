@@ -90,6 +90,46 @@ def _wait_if_paused():
         time.sleep(0.2)
 
 
+
+def _handle_instagram_profile_expand(url: str):
+    """Expand an Instagram profile URL into individual post/reel queue tasks.
+
+    The profile task itself does not download media.  It only scans the profile
+    with IG Parser persistent profile and appends discovered posts back into the
+    normal queue, so every child URL still uses the proven single-post downloader.
+    """
+    queue_manager.update_runtime(
+        phase="DOWNLOADING",
+        message="IG 主頁掃描中，正在收集貼文 / Reels...",
+        active_url=url,
+        cooldown_remaining=0,
+    )
+
+    status, post_urls, message = instagram.scan_profile_post_urls(url)
+    if status != "SUCCESS":
+        return status, message, False
+
+    result = queue_manager.add_tasks(post_urls)
+    added = int(result.get("added", 0) or 0)
+    skipped_processed = int(result.get("skipped_processed", result.get("skipped", 0)) or 0)
+    skipped_duplicate = int(result.get("skipped_duplicate", result.get("duplicated", 0)) or 0)
+
+    summary = (
+        f"IG 主頁已展開：掃到 {len(post_urls)} 筆，"
+        f"新增 {added} 筆，略過已下載 {skipped_processed} 筆，略過重複 {skipped_duplicate} 筆"
+    )
+    if message:
+        summary = f"{summary}；{message}"
+
+    queue_manager.update_runtime(
+        phase="DOWNLOADING",
+        message=summary,
+        active_url=url,
+        cooldown_remaining=0,
+    )
+    logger.info(summary)
+    return "SUCCESS", summary, True
+
 def _worker_loop():
     while not _stop_event.is_set():
         _wait_if_paused()
@@ -118,6 +158,7 @@ def _worker_loop():
         )
 
         status, error = "FAILED", ""
+        profile_expanded = False
         max_attempts = 2
 
         for attempt in range(max_attempts):
@@ -132,7 +173,16 @@ def _worker_loop():
 
             try:
                 if "instagram.com" in url:
-                    status, error = instagram.download(url)
+                    username = ""
+                    try:
+                        username = instagram.is_instagram_profile_url(url)
+                    except Exception:
+                        username = ""
+
+                    if username:
+                        status, error, profile_expanded = _handle_instagram_profile_expand(url)
+                    else:
+                        status, error = instagram.download(url)
                 elif "facebook.com" in url or "fb.watch" in url:
                     status, error = facebook.download(url)
                 else:
@@ -176,9 +226,13 @@ def _worker_loop():
             break
 
         if status == "SUCCESS":
-            sleep_sec = int(random.uniform(20, 40))
-            logger.info(f"冷卻 {sleep_sec}s...")
-            _cooldown_sleep(sleep_sec, url)
+            if profile_expanded:
+                logger.info("IG 主頁展開完成，略過一般下載冷卻，繼續處理展開後的貼文任務")
+                _cooldown_sleep(2, url)
+            else:
+                sleep_sec = int(random.uniform(20, 40))
+                logger.info(f"冷卻 {sleep_sec}s...")
+                _cooldown_sleep(sleep_sec, url)
 
         elif status == "RETRY":
             sleep_sec = 60

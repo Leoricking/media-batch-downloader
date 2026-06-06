@@ -77,6 +77,14 @@ FB_PARSER_PROFILE_DIR = os.path.join(DATA_DIR, "playwright_fb_profile")
 IG_CHROME_USER_DATA_DIR = IG_PARSER_PROFILE_DIR
 FB_CHROME_USER_DATA_DIR = FB_PARSER_PROFILE_DIR
 
+# Instagram profile auto-expand scanning settings.
+# IG_PROFILE_SCAN_MAX_POSTS = 0 means no artificial limit; scan until stable/no new posts or max scroll safety limit.
+IG_PROFILE_SCAN_MAX_POSTS = 0
+IG_PROFILE_SCAN_MAX_SCROLLS = 250
+IG_PROFILE_SCAN_SCROLL_WAIT_MS = 1200
+IG_PROFILE_SCAN_STABLE_ROUNDS = 6
+
+
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "processed_links.log")
 FAILED_LOG_FILE = os.path.join(DATA_DIR, "failed_links.log")
 RETRY_NEEDED_FILE = os.path.join(DATA_DIR, "retry_needed.txt")
@@ -93,4 +101,6 @@ FB_FILENAME_WITH_TITLE = False
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(IG_PARSER_PROFILE_DIR, exist_ok=True)
+os.makedirs(FB_PARSER_PROFILE_DIR, exist_ok=True)
 os.makedirs(PREPROCESS_OUTPUT_DIR, exist_ok=True)

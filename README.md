@@ -211,6 +211,46 @@ Instaloader
 
 對 `/reel/` 或 `/reels/`，仍優先使用 yt-dlp，失敗後再由 Playwright fallback。
 
+
+### Instagram 主頁全自動展開下載
+
+可直接貼 Instagram 帳號主頁網址，也支援 Reels 分頁網址，例如：
+
+```text
+https://www.instagram.com/bubu.dudu_hk/
+https://www.instagram.com/duolastudy/reels/
+```
+
+系統會自動判斷這是 IG 主頁 / Reels 分頁，而不是單篇貼文。`/<username>/reels/` 會先展開成真正的 `/reel/<shortcode>/` 單篇任務，不會直接下載主頁網格縮圖。處理流程如下：
+
+```text
+IG 主頁 URL / IG Reels 分頁 URL
+→ 使用 IG Parser 專用 Chrome Profile 掃描主頁與 Reels 分頁
+→ 自動收集 /p/ 與 /reel/ 貼文連結
+→ 展開成多筆單篇任務加入 GUI 佇列
+→ 每篇仍走原本穩定的單篇 IG 下載流程
+→ 輸出仍依原本 post title / caption 規則建立資料夾
+```
+
+設計原則：
+
+- 主頁 / Reels 分頁任務只負責「掃描與展開」，不直接在同一個任務內下載全部媒體。
+- 每一篇子任務仍使用原本 v11.26 已驗證的單篇下載流程；Reels 會進入單篇 Reel 下載，不會只抓預覽縮圖。
+- 保留 `img_index=` 預分流、restricted Carousel post lock、`total_count` 檢查、scoped network fill、WEBP/JPEG magic bytes 檢查。
+- 已在 `processed_links.log` 內的貼文會自動略過。
+- 佇列中已存在的貼文不會重複加入。
+- 不抓 Stories；Stories 需未來另外做獨立模組。
+- 私人帳號、checkpoint、challenge、權限不足會回 `BLOCKED`。
+- 若主頁貼文很多，掃描時間會較久，建議先完成 IG Parser 登入與信任裝置初始化。
+
+使用方式：
+
+1. 先點「🌐 IG Parser」完成 Instagram 登入、2FA、信任裝置。
+2. 關閉手動登入用 Chrome 視窗，避免 profile lock。
+3. 在 GUI 輸入框貼上 IG 主頁網址或 Reels 分頁網址，例如 `https://www.instagram.com/duolastudy/reels/`。
+4. 按「🚀 開始下載」。
+5. GUI 會先顯示主頁掃描狀態，展開完成後會自動新增多筆 `/p/` 或 `/reel/` 任務。
+
 ### IG Parser 專用 Chrome Profile 與受限貼文
 
 當 Instagram 貼文出現年齡限制、特定對象限制，或 `Instaloader` / `yt-dlp` 回傳 `empty media response` 時，下載器會啟用專案內建的 IG Parser 專用 Chrome Profile：
@@ -545,6 +585,27 @@ python main.py
 
 ## 版本紀錄
 
+### v11.33 IG Profile/Reels Auto Expand Fix
+
+- 修正 `https://www.instagram.com/<username>/reels/` 會被誤當成單一 Reel 任務的問題
+- IG 主頁掃描會同時掃描主頁與 Reels 分頁，避免只抓網格預覽縮圖
+- Reels 分頁會展開成真正的 `/reel/<shortcode>/` 子任務，再沿用原本單篇 Reel 下載與 title/caption 分類規則
+- 保留 v11.32 的 queue 展開架構，不把整個帳號下載塞進單一任務
+
+### v11.32 IG Profile Auto Expand
+
+- 新增 Instagram 主頁 URL 偵測，例如 `https://www.instagram.com/bubu.dudu_hk/`
+- 使用 IG Parser persistent Chrome Profile 掃描主頁貼文
+- 自動收集 `/p/` 與 `/reel/` shortcode
+- 自動展開成單篇 post / Reel 任務加入 GUI queue
+- 每篇子任務仍使用原本穩定的單篇 IG 下載流程
+- 保留原本 post title / caption 輸出分類規則
+- 保留 processed-link 去重與 queue 去重
+- 保留 v11.26 restricted Carousel routing、shortcode lock、total_count validation、scoped network fill、媒體順序與 WEBP/JPEG 檔頭處理
+- 不抓 Stories，避免與貼文下載流程混線
+- 不影響 Facebook 下載流程
+
+
 ### v11.27 Parser Login Profiles
 
 - 新增 IG Parser / FB Parser 專用 Chrome Persistent Profile 登入模式
@@ -613,4 +674,15 @@ build.bat
 ```text
 release/MediaBatchDownloader.exe
 ```
+
+
+### v11.34 IG Reels Click-Scan + Profile Folder Output
+
+- 修正 `https://www.instagram.com/<username>/reels/` 在部分 IG 版面中掃描不到 `a[href]` 的問題。
+- 主頁 / Reels 頁掃描會先嘗試 DOM / HTML / performance URL 擷取；若仍為 0，會用 visible tile click-probe 點開格子，只收集真正的 `/p/<shortcode>/` 與 `/reel/<shortcode>/`。
+- 不再把 Reels grid 預覽縮圖當成正式下載結果。
+- 主頁展開後的每一篇仍走原本穩定單篇下載流程，所以 Reel 會下載真正影片 `.mp4`，圖文 / Carousel 仍保留原本完整數量與順序保護。
+- 從主頁 / Reels 頁展開出的子任務會輸出到 `downloads/<username>/`，例如 `downloads/duolastudy/`。
+- 子任務檔名 / 資料夾名稱仍沿用單篇貼文 title / caption，例如 `找工作，什麼樣的公司不能去？` 或長文案標題。
+- 保留 `processed_links.log` 的 canonical URL 去重，不為了 profile folder 改寫 post URL。
 

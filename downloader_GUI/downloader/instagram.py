@@ -62,6 +62,10 @@ _is_logged_in = False
 _LAST_CAROUSEL_EXPECTED_COUNT = 0
 _LAST_CAROUSEL_TARGET = ""
 
+# v11.34 profile-batch context: shortcode -> username map for downloads/<username>/ output.
+_PROFILE_SHORTCODE_OWNER: dict[str, str] = {}
+_DOWNLOAD_CONTEXT = threading.local()
+
 
 def setup():
     global _L, _is_logged_in
@@ -822,6 +826,47 @@ def _unique_path(path: str) -> str:
     return f"{base}_{int(time.time())}{ext}"
 
 
+
+def _remember_profile_child_owner(username: str, urls: list[str]) -> None:
+    username = (username or "").strip()
+    if not username:
+        return
+    for u in urls or []:
+        sc = _extract_shortcode(u)
+        if sc:
+            _PROFILE_SHORTCODE_OWNER[sc] = username
+
+
+def _get_profile_owner_for_url(url: str) -> str:
+    sc = _extract_shortcode(url)
+    if not sc:
+        return ""
+    return _PROFILE_SHORTCODE_OWNER.get(sc, "") or ""
+
+
+def _set_current_profile_output_owner(owner: str) -> None:
+    owner = (owner or "").strip()
+    if owner:
+        try:
+            _DOWNLOAD_CONTEXT.profile_owner = _safe_output_name(owner, "Instagram_Profile", max_len=48)
+        except Exception:
+            _DOWNLOAD_CONTEXT.profile_owner = owner[:48]
+    else:
+        try:
+            _DOWNLOAD_CONTEXT.profile_owner = ""
+        except Exception:
+            pass
+
+
+def _get_current_download_root() -> str:
+    try:
+        owner = getattr(_DOWNLOAD_CONTEXT, "profile_owner", "") or ""
+    except Exception:
+        owner = ""
+    if owner:
+        return os.path.join(DOWNLOAD_DIR, owner)
+    return DOWNLOAD_DIR
+
 def move_files(title: str, fallback_name: str = "Instagram_Post") -> bool:
     """
     Move downloaded media from TEMP_DIR to DOWNLOAD_DIR.
@@ -837,7 +882,8 @@ def move_files(title: str, fallback_name: str = "Instagram_Post") -> bool:
     if not files:
         return False
 
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    output_root = _get_current_download_root()
+    os.makedirs(output_root, exist_ok=True)
 
     candidate_names = []
     for raw in [title, fallback_name, "Instagram_Post"]:
@@ -854,13 +900,13 @@ def move_files(title: str, fallback_name: str = "Instagram_Post") -> bool:
                 ext = os.path.splitext(src)[1].lower()
                 final_ext = _real_ext_for_file(src)
 
-                dst = _unique_path(os.path.join(DOWNLOAD_DIR, f"{name}{final_ext}"))
+                dst = _unique_path(os.path.join(output_root, f"{name}{final_ext}"))
                 shutil.move(src, dst)
 
                 logger.info(f"IG 單檔完成: {os.path.basename(dst)}")
 
             else:
-                folder = _unique_path(os.path.join(DOWNLOAD_DIR, name))
+                folder = _unique_path(os.path.join(output_root, name))
                 os.makedirs(folder, exist_ok=True)
 
                 for i, src in enumerate(files, 1):
@@ -1913,6 +1959,473 @@ def _get_fresh_persistent_target_page(context):
             pass
 
     return page
+
+
+
+_IG_PROFILE_RESERVED_PATHS = {
+    "p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct",
+    "developer", "about", "legal", "terms", "privacy", "directory", "web",
+    "graphql", "api", "challenge", "oauth", "emails", "settings",
+}
+
+
+def is_instagram_profile_url(url: str) -> str:
+    """Return username when *url* is an Instagram profile/profile-tab URL.
+
+    Supported inputs:
+    - https://www.instagram.com/<username>/
+    - https://www.instagram.com/<username>/reels/
+    - https://www.instagram.com/<username>/tagged/
+
+    Single content URLs such as /p/<shortcode>/, /reel/<shortcode>/ and
+    /stories/<username>/... are intentionally excluded so the existing stable
+    single-post / Reel downloader remains untouched.
+    """
+    raw = html.unescape(unquote(str(url or "").strip()))
+    if not raw:
+        return ""
+
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+
+    host = (parsed.netloc or "").lower()
+    if host not in {"instagram.com", "www.instagram.com"}:
+        return ""
+
+    parts = [p for p in (parsed.path or "").split("/") if p]
+    if not parts:
+        return ""
+
+    username = parts[0].strip()
+    if not username:
+        return ""
+
+    # Top-level IG reserved routes are not usernames.  This also protects
+    # /reel/<shortcode>/ and /reels/<shortcode>/ from being treated as profiles.
+    if username.lower() in _IG_PROFILE_RESERVED_PATHS:
+        return ""
+
+    # Allow only the homepage itself or known profile sub-tabs.  Unknown deeper
+    # paths should stay in the normal downloader/error path instead of silently
+    # becoming a whole-account scan.
+    if len(parts) >= 2:
+        tab = (parts[1] or "").lower()
+        if tab not in {"reels", "tagged"}:
+            return ""
+        if len(parts) > 2:
+            return ""
+
+    # Instagram usernames can contain letters, numbers, underscores and dots.
+    # Be permissive enough for real accounts but strict enough to avoid paths.
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", username):
+        return ""
+
+    return username
+
+def _normalize_ig_profile_url(profile_url: str) -> str:
+    username = is_instagram_profile_url(profile_url)
+    if username:
+        return f"https://www.instagram.com/{username}/"
+    return profile_url
+
+
+def _profile_scan_entry_urls(profile_url: str, username: str) -> list[str]:
+    """Return profile tabs that should be scanned for post/reel links.
+
+    Instagram can separate the normal grid and the Reels tab.  If the user pastes
+    /<username>/reels/ we still scan the homepage plus the Reels tab so the
+    feature means "download this account's visible posts and reels", not just the
+    preview thumbnails currently visible on one tab.
+    """
+    base = f"https://www.instagram.com/{username}/"
+    reels = f"https://www.instagram.com/{username}/reels/"
+
+    out: list[str] = []
+    raw = html.unescape(unquote(str(profile_url or "").strip()))
+    try:
+        parsed = urlparse(raw)
+        parts = [p for p in (parsed.path or "").split("/") if p]
+        if len(parts) == 2 and parts[1].lower() in {"reels", "tagged"}:
+            tab_url = f"https://www.instagram.com/{username}/{parts[1].lower()}/"
+            out.append(tab_url)
+    except Exception:
+        pass
+
+    # Always scan both base and Reels tab.  Dedupe keeps repeated links harmless,
+    # and this prevents /username/reels/ from being treated as a single unsupported
+    # Reel URL while also covering accounts that split posts and reels across tabs.
+    for u in [base, reels]:
+        if u not in out:
+            out.append(u)
+    return out
+
+
+
+def _normalize_profile_child_url(raw_url: str) -> str:
+    u = html.unescape(unquote(str(raw_url or "").strip()))
+    if not u:
+        return ""
+    m = re.search(r"(?:https?://(?:www\.)?instagram\.com)?/(p|reel|reels)/([^/?#&\"'<>\s]+)", u, flags=re.I)
+    if not m:
+        return ""
+    kind = (m.group(1) or "").lower()
+    shortcode = (m.group(2) or "").strip()
+    if not shortcode:
+        return ""
+    if kind == "p":
+        return f"https://www.instagram.com/p/{shortcode}/"
+    return f"https://www.instagram.com/reel/{shortcode}/"
+
+
+def _dedupe_profile_child_urls(urls: list[str]) -> list[str]:
+    out = []
+    seen = set()
+    for raw in urls or []:
+        u = _normalize_profile_child_url(raw)
+        if not u:
+            continue
+        shortcode = _extract_shortcode(u)
+        key = f"reel:{shortcode}" if _is_ig_reel_url(u) else f"p:{shortcode}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(u)
+    return out
+
+
+def _extract_profile_post_urls_from_page(page) -> list[str]:
+    js = r'''
+    () => {
+      const values = [];
+      function push(v) {
+        if (!v) return;
+        try { values.push(String(v)); } catch(e) {}
+      }
+      for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+        push(a.href || '');
+        push(a.getAttribute('href') || '');
+      }
+      const attrNames = ['href', 'data-href', 'to', 'src', 'data-src', 'aria-label'];
+      for (const el of Array.from(document.querySelectorAll('main *'))) {
+        for (const name of attrNames) {
+          try { push(el.getAttribute(name) || ''); } catch(e) {}
+        }
+      }
+      try { push(document.documentElement.innerHTML || ''); } catch(e) {}
+      try { for (const e of performance.getEntriesByType('resource')) push(e.name || ''); } catch(e) {}
+      return values;
+    }
+    '''
+    try:
+        raw_values = page.evaluate(js) or []
+    except Exception:
+        raw_values = []
+    candidates = []
+    patterns = [
+        r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/[^/?#&\"'<>\\\s]+/?",
+        r"/(?:p|reel|reels)/[^/?#&\"'<>\\\s]+/?",
+        r"\\u002f(?:p|reel|reels)\\u002f[^\\/?#&\"'<>\\\s]+\\u002f",
+        r"\\/(?:p|reel|reels)\\/[^\\/?#&\"'<>\\\s]+\\/",
+    ]
+    for value in raw_values:
+        text = html.unescape(unquote(str(value or "")))
+        if not text:
+            continue
+        text = text.replace('\u002f', '/').replace('\/', '/')
+        for pat in patterns:
+            for m in re.finditer(pat, text, flags=re.I):
+                candidates.append(m.group(0))
+    return _dedupe_profile_child_urls(candidates)
+
+
+def _get_profile_click_tile_records(page, limit: int = 18) -> list[dict]:
+    js = r'''
+    (limit) => {
+      const root = document.querySelector('main') || document;
+      const nodes = Array.from(root.querySelectorAll('a, div[role="button"], button, img, video'));
+      const out = [];
+      const seen = new Set();
+      const W = window.innerWidth || 1600;
+      const H = window.innerHeight || 1000;
+      function badSrc(src) {
+        const low = String(src || '').toLowerCase();
+        if (!low) return true;
+        if (low.includes('profile_pic') || low.includes('s150x150') || low.includes('s100x100')) return true;
+        if (low.includes('s64x64') || low.includes('s50x50') || low.includes('s40x40') || low.includes('s32x32')) return true;
+        if (low.includes('static.cdninstagram.com') || low.includes('/rsrc.php') || low.includes('emoji')) return true;
+        return false;
+      }
+      for (const n of nodes) {
+        let media = null;
+        if (n.tagName && ['IMG','VIDEO'].includes(n.tagName.toUpperCase())) media = n;
+        else media = n.querySelector && n.querySelector('img, video');
+        if (!media) continue;
+        const src = media.currentSrc || media.src || media.getAttribute('src') || '';
+        if (badSrc(src)) continue;
+        const mr = media.getBoundingClientRect();
+        const r = n.getBoundingClientRect();
+        const box = (mr.width * mr.height >= r.width * r.height) ? mr : r;
+        const w = box.width || 0;
+        const h = box.height || 0;
+        if (w < 120 || h < 120) continue;
+        if (box.bottom < 180 || box.top > H + 300 || box.right < 0 || box.left > W) continue;
+        const clicker = n.closest && (n.closest('a[href], div[role="button"], button') || n);
+        if (!clicker) continue;
+        const cr = clicker.getBoundingClientRect();
+        const cx = Math.max(5, Math.min(W - 5, cr.left + cr.width / 2));
+        const cy = Math.max(5, Math.min(H - 5, cr.top + cr.height / 2));
+        const key = Math.round(cx / 8) + ':' + Math.round(cy / 8) + ':' + String(src).slice(0, 80);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({x: cx, y: cy, top: box.top, left: box.left, area: w * h, src: src});
+      }
+      out.sort((a,b) => Math.abs(a.top-b.top) > 12 ? a.top-b.top : a.left-b.left);
+      return out.slice(0, limit || 18);
+    }
+    '''
+    try:
+        return page.evaluate(js, int(limit or 18)) or []
+    except Exception:
+        return []
+
+
+def _extract_profile_post_urls_by_click_probe(page, entry_url: str, already_seen: set[str] | None = None, max_clicks: int = 12) -> list[str]:
+    already_seen = already_seen or set()
+    found: list[str] = []
+    records = _get_profile_click_tile_records(page, limit=max_clicks)
+    if not records:
+        return []
+    for rec in records[:max_clicks]:
+        try:
+            page.mouse.click(float(rec.get('x') or 0), float(rec.get('y') or 0))
+            page.wait_for_timeout(1200)
+            u = _normalize_profile_child_url(page.url or '')
+            if u and u not in already_seen and u not in found:
+                found.append(u)
+            for u2 in _extract_profile_post_urls_from_page(page):
+                if u2 not in already_seen and u2 not in found:
+                    found.append(u2)
+            if _normalize_profile_child_url(page.url or ''):
+                try:
+                    page.go_back(wait_until='domcontentloaded', timeout=8000)
+                    page.wait_for_timeout(900)
+                except Exception:
+                    try:
+                        page.goto(entry_url, wait_until='domcontentloaded', timeout=12000)
+                        page.wait_for_timeout(900)
+                    except Exception:
+                        pass
+            else:
+                try:
+                    page.keyboard.press('Escape')
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                page.keyboard.press('Escape')
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+            continue
+    return _dedupe_profile_child_urls(found)
+
+
+def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tuple[str, list[str], str]:
+    """Scan an Instagram profile/reels tab and return discovered post / reel URLs.
+
+    This function only expands the profile into individual post tasks.  It does
+    not download media, so the existing stable single-post downloader remains the
+    only path that writes files and creates title/caption-based folders.
+    """
+    username = is_instagram_profile_url(profile_url)
+    if not username:
+        return "FAILED", [], "不是可展開的 Instagram 主頁網址"
+
+    scan_entry_urls = _profile_scan_entry_urls(profile_url, username)
+    user_data_dir = _get_project_ig_parser_profile_root()
+    profile_dir = _resolve_chrome_profile_directory()
+
+    if max_posts is None:
+        raw_max = _try_get_config_value("IG_PROFILE_SCAN_MAX_POSTS", 0)
+        try:
+            max_posts = int(raw_max or 0)
+        except Exception:
+            max_posts = 0
+
+    try:
+        max_scrolls = int(_try_get_config_value("IG_PROFILE_SCAN_MAX_SCROLLS", 250) or 250)
+    except Exception:
+        max_scrolls = 250
+    try:
+        wait_ms = int(_try_get_config_value("IG_PROFILE_SCAN_SCROLL_WAIT_MS", 1200) or 1200)
+    except Exception:
+        wait_ms = 1200
+    try:
+        stable_rounds = int(_try_get_config_value("IG_PROFILE_SCAN_STABLE_ROUNDS", 6) or 6)
+    except Exception:
+        stable_rounds = 6
+
+    max_scrolls = max(1, min(2000, max_scrolls))
+    wait_ms = max(300, min(10000, wait_ms))
+    stable_rounds = max(2, min(50, stable_rounds))
+    max_posts = max(0, int(max_posts or 0))
+
+    logger.info(
+        f"IG 主頁掃描開始: @{username}, entries={scan_entry_urls}, "
+        f"max_posts={max_posts or 'unlimited'}, max_scrolls={max_scrolls}, "
+        f"stable_rounds={stable_rounds}, profile={user_data_dir}"
+    )
+
+    context = None
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel="chrome",
+                headless=False,
+                no_viewport=True,
+                locale="zh-TW",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                args=[
+                    f"--profile-directory={profile_dir}",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--start-maximized",
+                ],
+            )
+
+            try:
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            except Exception:
+                pass
+
+            page = _get_fresh_persistent_target_page(context)
+            combined_urls: list[str] = []
+            seen_urls = set()
+            had_missing_page = False
+            had_blocked_page = False
+            blocked_message = ""
+
+            for entry_i, entry_url in enumerate(scan_entry_urls, start=1):
+                if max_posts and len(combined_urls) >= max_posts:
+                    break
+
+                logger.info(f"IG 主頁掃描 @{username}: open entry {entry_i}/{len(scan_entry_urls)} {entry_url}")
+                page.goto(entry_url, wait_until="domcontentloaded", timeout=60000)
+
+                try:
+                    page.wait_for_selector("main, article, body", timeout=20000)
+                except Exception:
+                    pass
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+
+                if _is_missing_ig_page(page):
+                    had_missing_page = True
+                    logger.warning(f"IG 主頁掃描 @{username}: entry missing/unavailable {entry_url}")
+                    continue
+
+                if _is_generic_ig_page(page):
+                    had_blocked_page = True
+                    blocked_message = "IG Parser Profile 尚未登入、遇到 checkpoint/challenge，或需要重新信任裝置"
+                    logger.warning(f"IG 主頁掃描 @{username}: entry blocked/generic {entry_url}")
+                    continue
+
+                stable = 0
+                last_count = len(combined_urls)
+
+                for round_i in range(max_scrolls + 1):
+                    current_urls = _extract_profile_post_urls_from_page(page)
+                    if not current_urls and round_i <= max(3, stable_rounds):
+                        current_urls = _extract_profile_post_urls_by_click_probe(
+                            page,
+                            entry_url,
+                            already_seen=seen_urls,
+                            max_clicks=12,
+                        )
+                    added_this_round = 0
+
+                    for u in current_urls:
+                        if u in seen_urls:
+                            continue
+                        seen_urls.add(u)
+                        combined_urls.append(u)
+                        added_this_round += 1
+                        if max_posts and len(combined_urls) >= max_posts:
+                            break
+
+                    logger.info(
+                        f"IG 主頁掃描 @{username}: entry={entry_i}, round={round_i}, "
+                        f"total={len(combined_urls)}, new={added_this_round}"
+                    )
+
+                    if max_posts and len(combined_urls) >= max_posts:
+                        break
+
+                    if len(combined_urls) == last_count:
+                        stable += 1
+                    else:
+                        stable = 0
+                        last_count = len(combined_urls)
+
+                    if stable >= stable_rounds:
+                        break
+
+                    try:
+                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                        page.wait_for_timeout(wait_ms)
+                    except Exception:
+                        time.sleep(wait_ms / 1000.0)
+
+                    try:
+                        if _is_generic_ig_page(page):
+                            had_blocked_page = True
+                            blocked_message = "掃描途中被導向登入 / checkpoint / challenge"
+                            break
+                    except Exception:
+                        pass
+
+            if not combined_urls:
+                if had_blocked_page:
+                    return "BLOCKED", [], blocked_message or "IG Parser Profile 尚未登入或沒有權限查看此主頁"
+                if had_missing_page:
+                    return "MISSING", [], f"Instagram 主頁不存在、已移除，或目前帳號沒有權限查看：@{username}"
+                return "RETRY", [], f"主頁 @{username} 未掃到貼文或 Reel；可能是尚未載入、貼文為空、或 IG 暫時限制"
+
+            _remember_profile_child_owner(username, combined_urls)
+            msg = f"IG 主頁 @{username} 掃描完成：發現 {len(combined_urls)} 筆貼文 / Reel"
+            logger.info(msg)
+            return "SUCCESS", combined_urls, msg
+
+    except PlaywrightTimeoutError as e:
+        return "RETRY", [], f"IG 主頁掃描逾時：{e}"
+    except Exception as e:
+        raw = _clean_error_text(str(e))
+        if "Target page, context or browser has been closed" in raw or "user data directory" in raw.lower():
+            return "RETRY", [], f"IG Parser Profile 可能被手動 Chrome 視窗鎖定，請關閉 IG Parser Chrome 後重試：{raw}"
+        status, err = _classify_error(raw)
+        if status == "FAILED" and any(k in raw.lower() for k in ["timeout", "timed out", "net::err_timed_out"]):
+            status = "RETRY"
+        return status, [], f"IG 主頁掃描失敗：{err}"
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
 
 
 def _is_ig_audience_restricted_page(page) -> bool:
@@ -3115,6 +3628,8 @@ def download(url: str):
     if _L is None:
         setup()
 
+    _set_current_profile_output_owner(_get_profile_owner_for_url(url))
+
     # 每筆 IG 任務開始前清理上一筆失敗 / 中斷殘留的 post/ 暫存檔。
     # 注意：SUCCESS 的清理由 move_files() 負責，避免誤刪正在搬移中的媒體。
     clear_temp()
@@ -3201,4 +3716,5 @@ def download(url: str):
     if status != "SUCCESS":
         _clear_temp_after_terminal_failure(status, reason)
 
+    _set_current_profile_output_owner("")
     return result
