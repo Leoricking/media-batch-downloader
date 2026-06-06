@@ -3,6 +3,7 @@ import http.cookiejar
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 from urllib.parse import urlparse, unquote
@@ -1346,6 +1347,40 @@ def _click_next_ig(page):
     return False
 
 
+def _click_next_ig_locked(page, target_shortcode: str) -> bool:
+    """Click Instagram carousel next while keeping the task scoped to one shortcode.
+
+    This intentionally keeps the older broad selector strategy that worked for
+    carousel flipping, but adds a guard immediately after each click.  If IG
+    navigates from the requested /p/<shortcode>/ or /reel/<shortcode>/ to a
+    different post/profile/recommendation page, collection stops before any media
+    from the wrong post can be added.
+    """
+    before_url = ""
+    try:
+        before_url = page.url or ""
+    except Exception:
+        before_url = ""
+
+    moved = _click_next_ig(page)
+    if not moved:
+        return False
+
+    if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
+        try:
+            logger.warning(
+                f"IG carousel scope guard: next click left target={target_shortcode}; "
+                f"before={before_url}; after={page.url}; stop collecting to avoid wrong post"
+            )
+        except Exception:
+            logger.warning(
+                f"IG carousel scope guard: next click left target={target_shortcode}; stop collecting to avoid wrong post"
+            )
+        return False
+
+    return True
+
+
 def _media_key_from_url(src: str) -> str:
     """Create a stable key for IG CDN URLs while preserving order and avoiding duplicates."""
     src = html.unescape(unquote((src or "").strip()))
@@ -1482,6 +1517,723 @@ def _download_with_playwright_request(context, url: str, dst: str, referer: str)
     raise Exception(last_error)
 
 
+
+def _try_get_config_value(name: str, default=None):
+    try:
+        import config  # local project config.py
+        return getattr(config, name, default)
+    except Exception:
+        return default
+
+
+def _get_project_ig_parser_profile_root() -> str:
+    """Project-local dedicated Chrome user-data directory for IG fallback.
+
+    This replaces the old external .bat profile isolation setup.  By default the
+    downloader uses downloader_GUI/data/chrome_ig_parser as its own browser
+    profile, so it does not compete with the user's daily Chrome Default profile.
+    """
+    configured = (
+        os.environ.get("IG_CHROME_USER_DATA_DIR")
+        or _try_get_config_value("IG_CHROME_USER_DATA_DIR", "")
+        or ""
+    )
+    configured = str(configured).strip().strip('"')
+    if configured:
+        os.makedirs(configured, exist_ok=True)
+        return configured
+
+    root = os.path.join(DATA_DIR, "chrome_ig_parser")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _resolve_chrome_user_data_dir() -> str:
+    """Resolve the dedicated IG parser Chrome profile root.
+
+    Default is project-local data/chrome_ig_parser.  This is intentionally not the
+    normal Chrome Default profile, so the downloader can run without closing the
+    user's daily browser and without profile-lock blank-window issues.
+
+    If a user explicitly wants to use the system Chrome profile, set:
+      IG_ALLOW_SYSTEM_CHROME_PROFILE=1
+    or define IG_CHROME_USER_DATA_DIR manually.
+    """
+    dedicated = _get_project_ig_parser_profile_root()
+    if dedicated:
+        return dedicated
+
+    allow_system = (
+        os.environ.get("IG_ALLOW_SYSTEM_CHROME_PROFILE")
+        or str(_try_get_config_value("IG_ALLOW_SYSTEM_CHROME_PROFILE", ""))
+    ).lower() in {"1", "true", "yes", "on"}
+
+    if not allow_system:
+        return ""
+
+    candidates = []
+    local_appdata = os.environ.get("LOCALAPPDATA") or ""
+    appdata = os.environ.get("APPDATA") or ""
+
+    if local_appdata:
+        candidates.extend([
+            os.path.join(local_appdata, "Google", "Chrome", "User Data"),
+            os.path.join(local_appdata, "Microsoft", "Edge", "User Data"),
+            os.path.join(local_appdata, "BraveSoftware", "Brave-Browser", "User Data"),
+        ])
+
+    if appdata:
+        candidates.append(os.path.join(appdata, "Opera Software", "Opera Stable"))
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+
+    return ""
+
+
+def _resolve_chrome_profile_directory() -> str:
+    configured = (
+        os.environ.get("IG_CHROME_PROFILE_DIRECTORY")
+        or _try_get_config_value("IG_CHROME_PROFILE_DIRECTORY", "")
+        or ""
+    )
+    configured = str(configured).strip().strip('"')
+    return configured or "Default"
+
+
+def open_ig_parser_profile(start_url: str = "https://www.instagram.com/") -> str:
+    """Open the project-local IG_Parser Chrome profile for one-time login/trust setup.
+
+    Called by the GUI button.  This replaces setup_ig_parser_profile.bat and keeps
+    the workflow inside the app.
+    """
+    user_data_dir = _get_project_ig_parser_profile_root()
+    profile_dir = _resolve_chrome_profile_directory()
+
+    chrome = (
+        shutil.which("chrome")
+        or shutil.which("chrome.exe")
+        or os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe")
+        or os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe")
+    )
+
+    if not chrome or not os.path.exists(chrome):
+        raise Exception("找不到 Google Chrome；請先安裝 Chrome，或把 chrome.exe 加入 PATH。")
+
+    args = [
+        chrome,
+        f"--user-data-dir={user_data_dir}",
+        f"--profile-directory={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        start_url or "https://www.instagram.com/",
+    ]
+
+    subprocess.Popen(args)
+    return user_data_dir
+
+
+
+
+def _get_persistent_manual_wait_seconds(default: int = 45) -> int:
+    """Seconds to keep headed Chrome Profile fallback open for manual IG confirmation.
+
+    Default is intentionally longer than the original 25s because age/audience
+    restriction pages often need a visible browser round-trip before media
+    requests are released.
+    """
+    raw = (
+        os.environ.get("IG_PERSISTENT_MANUAL_WAIT_SECONDS")
+        or _try_get_config_value("IG_PERSISTENT_MANUAL_WAIT_SECONDS", default)
+        or default
+    )
+    try:
+        value = int(raw)
+    except Exception:
+        value = default
+    return max(5, min(180, value))
+
+
+def _manual_wait_persistent_profile(page, reason: str = ""):
+    """Bring the visible Chrome fallback window forward and wait for user action."""
+    wait_sec = _get_persistent_manual_wait_seconds()
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    logger.info(
+        "IG persistent fallback 視窗已開啟；若看到『未滿18歲 / 特定對象 / 確認觀看 / 登入驗證』提示，"
+        f"請在 Chrome 視窗手動確認。等待 {wait_sec}s 後重新擷取媒體。reason={reason or 'manual-check'}"
+    )
+
+    try:
+        page.wait_for_timeout(wait_sec * 1000)
+    except Exception:
+        time.sleep(wait_sec)
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    _warmup_ig_page_for_media(page, is_reel=_is_ig_reel_url(page.url or ""))
+
+
+def _get_persistent_context_page(context):
+    """Reuse persistent context's first page instead of opening a second blank tab.
+
+    launch_persistent_context usually creates an initial about:blank page.  If we
+    immediately call new_page(), the visible front tab can remain blank while the
+    real IG tab is hidden behind it.  Reusing the first page prevents the
+    "Chrome window opens but shows nothing" symptom.
+    """
+    try:
+        pages = list(context.pages)
+    except Exception:
+        pages = []
+
+    if pages:
+        page = pages[0]
+    else:
+        page = context.new_page()
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    # Close extra blank pages only.  Do not close pages with non-blank URLs because
+    # the user's profile may restore legitimate tabs.
+    for extra in pages[1:]:
+        try:
+            extra_url = (extra.url or "").lower()
+            if extra_url in {"about:blank", "chrome://newtab/"}:
+                extra.close()
+        except Exception:
+            pass
+
+    return page
+def _is_ig_audience_restricted_page(page) -> bool:
+    """Detect IG age/audience restriction pages.
+
+    These are not MISSING.  They mean cookies.txt/headless context is not trusted
+    enough, while the user's real browser profile may still be able to view it.
+    """
+    body = ""
+    title = ""
+
+    try:
+        body = page.locator("body").first.inner_text(timeout=2500) or ""
+    except Exception:
+        body = ""
+
+    try:
+        title = page.title() or ""
+    except Exception:
+        title = ""
+
+    text = f"{body}\n{title}".lower()
+
+    markers = [
+        "未滿18歲的用戶無法觀看此內容",
+        "未滿 18 歲的用戶無法觀看此內容",
+        "僅向特定對象顯示其個人檔案和內容",
+        "僅向特定對象顯示",
+        "此帳號已設定限制",
+        "age-restricted",
+        "age restricted",
+        "not available to everyone",
+        "specific audience",
+        "restricted profile",
+        "restricted account",
+    ]
+
+    return any(marker.lower() in text for marker in markers)
+
+
+def _warmup_ig_page_for_media(page, is_reel: bool = False):
+    """Nudge IG's lazy-loaded media to appear in DOM/network."""
+    try:
+        page.wait_for_timeout(900)
+    except Exception:
+        pass
+
+    for js in [
+        "() => window.scrollBy(0, 260)",
+        "() => document.querySelector('article, main, div[role=\"dialog\"]')?.scrollIntoView({block:'center'})",
+        "() => { const v=document.querySelector('video'); if (v) { try { v.muted=true; v.play().catch(()=>{}); } catch(e){} } }",
+    ]:
+        try:
+            page.evaluate(js)
+            page.wait_for_timeout(700)
+        except Exception:
+            pass
+
+    try:
+        page.mouse.click(700, 460)
+        page.wait_for_timeout(900)
+    except Exception:
+        pass
+
+    if is_reel:
+        try:
+            page.keyboard.press("Space")
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=6500)
+    except Exception:
+        pass
+
+
+def _get_video_current_sources(page):
+    items = []
+    try:
+        raw = page.evaluate(
+            """
+            () => {
+              const out = [];
+              for (const v of Array.from(document.querySelectorAll('video'))) {
+                const urls = [
+                  v.currentSrc || '',
+                  v.src || '',
+                  v.getAttribute('src') || ''
+                ];
+                for (const s of Array.from(v.querySelectorAll('source'))) {
+                  urls.push(s.src || s.getAttribute('src') || '');
+                }
+                for (const u of urls) {
+                  if (u) out.push(u);
+                }
+              }
+              return out;
+            }
+            """
+        ) or []
+    except Exception:
+        raw = []
+
+    for src in raw:
+        if _looks_like_real_ig_media_url(src):
+            items.append({
+                "src": src,
+                "type": "video",
+                "score": 1200000 + _media_quality_score(src),
+            })
+
+    return _dedupe_media(items)
+
+
+def _get_performance_ig_media(page):
+    items = []
+    try:
+        raw = page.evaluate(
+            """
+            () => performance.getEntriesByType('resource')
+              .map(e => e.name || '')
+              .filter(Boolean)
+              .slice(-800)
+            """
+        ) or []
+    except Exception:
+        raw = []
+
+    for src in raw:
+        if _looks_like_real_ig_media_url(src):
+            media_type = "video" if any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]) else "image"
+            items.append({
+                "src": src,
+                "type": media_type,
+                "score": 700000 + _media_quality_score(src),
+            })
+
+    return _dedupe_media(items)
+
+
+def _extract_ig_media_from_text(text: str):
+    items = []
+    if not text:
+        return items
+
+    decoded = html.unescape(str(text))
+    decoded = decoded.replace("\\u0026", "&").replace("\\/", "/").replace("\\/", "/")
+
+    patterns = [
+        r'https?://[^"\'<>\s]+?(?:\.mp4|\.m4v|\.mov|\.jpg|\.jpeg|\.png|\.webp)(?:\?[^"\'<>\s]*)?',
+        r'https?://[^"\'<>\s]+?(?:cdninstagram\.com|fbcdn\.net|instagram\.f)[^"\'<>\s]+',
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, decoded, flags=re.I):
+            src = html.unescape(unquote(m.group(0)))
+            if _looks_like_real_ig_media_url(src):
+                media_type = "video" if any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]) else "image"
+                items.append({
+                    "src": src,
+                    "type": media_type,
+                    "score": 500000 + _media_quality_score(src),
+                })
+
+    return _dedupe_media(items)
+
+
+def _download_filtered_items_from_context(context, filtered, harvested_media, title: str, shortcode: str, referer: str):
+    """Write filtered IG media items and move them using existing move_files()."""
+    success_count = 0
+
+    for i, item in enumerate(filtered, 1):
+        media_type = item.get("type", "image")
+        media_url = item.get("src", "")
+
+        ext = (
+            ".mp4"
+            if media_type == "video" or any(x in media_url.lower() for x in [".mp4", ".m4v", ".mov"])
+            else _ext_from_url(media_url, ".jpg")
+        )
+
+        dst = os.path.join(TEMP_DIR, f"ig_{i}{ext}")
+        media_key = _media_key_from_url(media_url)
+
+        try:
+            harvested = harvested_media.get(media_key)
+            if harvested and harvested.get("body"):
+                _write_media_body(
+                    dst,
+                    harvested.get("body"),
+                    media_url=media_url,
+                    content_type=harvested.get("content_type", ""),
+                )
+                logger.info(f"IG 使用 browser network cache 寫入第 {i} 個媒體")
+            else:
+                _download_with_playwright_request(
+                    context,
+                    media_url,
+                    dst,
+                    referer=referer,
+                )
+            success_count += 1
+
+        except Exception as e:
+            logger.warning(f"IG 略過無效媒體: {media_url[:180]} | {e}")
+
+    if success_count <= 0:
+        return "RETRY", "Playwright 有抓到媒體 URL，但本輪全部下載失敗或過小；可能是 IG CDN 暫時空回應，建議稍後重試"
+
+    temp_files_after_capture = _list_media_files(TEMP_DIR)
+    logger.info(
+        f"IG Playwright 已成功寫入 {success_count} 個媒體；"
+        f"TEMP 有效檔案={len(temp_files_after_capture)}，準備搬移"
+    )
+
+    if move_files(title, fallback_name=shortcode or "Instagram_Post"):
+        logger.info(f"確認 Playwright 成功擷取 {success_count} 個媒體資源")
+        return "SUCCESS", ""
+
+    if _list_media_files(TEMP_DIR):
+        if move_files(shortcode or "Instagram_Post", fallback_name="Instagram_Post"):
+            logger.info(f"確認 Playwright 備援搬移成功：{success_count} 個媒體資源")
+            return "SUCCESS", ""
+
+    return "FAILED", "Playwright 已寫入媒體，但搬移檔案失敗；請檢查下載資料夾權限或路徑長度"
+
+
+def _is_target_shortcode_context(page, target_shortcode: str) -> bool:
+    """Return True only when the visible page is still the requested post/reel.
+
+    IG restricted posts can briefly redirect from /p/<shortcode>/ to an account
+    grid.  If we keep scanning performance/html/network in that state, we may
+    collect the whole account or the "more posts" recommendations.  This guard
+    keeps a task scoped to the original shortcode.
+    """
+    if not target_shortcode:
+        return True
+
+    current = ""
+    try:
+        current = page.url or ""
+    except Exception:
+        current = ""
+
+    if f"/p/{target_shortcode}" in current or f"/reel/{target_shortcode}" in current or f"/reels/{target_shortcode}" in current:
+        return True
+
+    try:
+        canonical = page.locator('link[rel="canonical"]').first.get_attribute("href") or ""
+        if target_shortcode in canonical:
+            return True
+    except Exception:
+        pass
+
+    try:
+        og_url = page.locator('meta[property="og:url"]').first.get_attribute("content") or ""
+        if target_shortcode in og_url:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _collect_visible_target_media(page, target_shortcode: str, include_meta: bool = True):
+    """Collect only the visible post/reel media, never profile-grid media.
+
+    Based on the older working carousel flow, but every round is guarded by the
+    requested shortcode.  This preserves the working flip behavior while avoiding
+    the regression where a /p/ task navigates into another post or profile grid.
+    """
+    if not _is_target_shortcode_context(page, target_shortcode):
+        try:
+            logger.warning(
+                f"IG shortcode scope guard: page left target shortcode={target_shortcode}; "
+                f"current_url={page.url}，停止掃描帳號頁/推薦貼文"
+            )
+        except Exception:
+            pass
+        return []
+
+    collected = []
+    seen_media_keys = set()
+
+    for round_index in range(_MAX_CAROUSEL_ITEMS):
+        if not _is_target_shortcode_context(page, target_shortcode):
+            try:
+                logger.warning(
+                    f"IG shortcode scope guard: before collect round={round_index}, "
+                    f"page left target={target_shortcode}; current_url={page.url}; stop before wrong post"
+                )
+            except Exception:
+                pass
+            break
+
+        current = _get_current_slide_main_media(page)
+        if not current and include_meta and not collected:
+            current = _get_meta_ig_media(page)[:1]
+        if not current:
+            break
+
+        item = current[0]
+        src = item.get("src", "")
+        key = _media_key_from_url(src)
+
+        if key not in seen_media_keys:
+            seen_media_keys.add(key)
+            collected.append(item)
+
+        moved = _click_next_ig_locked(page, target_shortcode)
+        if not moved:
+            break
+
+    return _dedupe_media(collected)
+
+
+def _collect_limited_target_fallback_media(page, harvested_media, target_shortcode: str, allow_broad_fallback: bool = False):
+    """Fallback media collection that is safe for single post/reel tasks.
+
+    Performance/html/network sources are broad and can contain profile-grid or
+    recommendation images.  They are allowed only when explicitly requested and
+    the page is still scoped to the original shortcode.  The result is capped so
+    it cannot turn a single /p/ task into an account dump.
+    """
+    if not _is_target_shortcode_context(page, target_shortcode):
+        return []
+
+    items = []
+    items.extend(_get_video_current_sources(page))
+    items.extend(_get_meta_ig_media(page)[:1])
+
+    if allow_broad_fallback:
+        items.extend(_get_performance_ig_media(page)[:3])
+        try:
+            items.extend(_extract_ig_media_from_text(page.content())[:3])
+        except Exception:
+            pass
+        for harvested in sorted(harvested_media.values(), key=lambda x: x.get("score", 0), reverse=True)[:3]:
+            if _looks_like_real_ig_media_url(harvested.get("src", "")):
+                items.append({
+                    "src": harvested.get("src", ""),
+                    "type": harvested.get("type", "image"),
+                    "score": harvested.get("score", 0),
+                    "from": "network",
+                })
+
+    # If the DOM did not expose a carousel, do not allow broad fallback to exceed
+    # a tiny number.  This prevents downloading "more posts from this account".
+    return _dedupe_media(items)[:3]
+
+
+def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
+    """Fallback using the project-local logged-in Chrome profile.
+
+    This version is strictly shortcode-scoped.  It never scans or finalizes media
+    after IG redirects the visible page to a profile/account grid.
+    """
+    enabled = _try_get_config_value("IG_PERSISTENT_PROFILE_ENABLED", True)
+    if str(enabled).lower() in {"0", "false", "no", "off"}:
+        return "RETRY", "IG persistent Chrome profile fallback disabled"
+
+    user_data_dir = _resolve_chrome_user_data_dir()
+    profile_dir = _resolve_chrome_profile_directory()
+    shortcode = _extract_shortcode(url) or ""
+
+    if not shortcode:
+        return "FAILED", "無法解析 Instagram shortcode；為避免誤抓整個帳號，已停止"
+
+    if not user_data_dir:
+        return "RETRY", "找不到 Chrome User Data；請先按『初始化 IG_Parser』完成專用 Profile 登入"
+
+    context = None
+    try:
+        logger.info(
+            f"IG 啟用已登入 Chrome Profile fallback: user_data_dir={user_data_dir}, "
+            f"profile={profile_dir}, target_shortcode={shortcode}, reason={reason or 'network harvest=0'}"
+        )
+
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            channel="chrome",
+            headless=False,
+            no_viewport=True,
+            locale="zh-TW",
+            args=[
+                f"--profile-directory={profile_dir}",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--start-maximized",
+            ],
+        )
+
+        try:
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        except Exception:
+            pass
+
+        harvested_media = {}
+        page = _get_persistent_context_page(context) if '_get_persistent_context_page' in globals() else context.pages[0] if context.pages else context.new_page()
+        page.on("response", lambda response: _capture_playwright_response(response, harvested_media))
+
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except PlaywrightTimeoutError:
+            logger.warning("IG persistent profile goto 超時，改用目前頁面")
+        except Exception as e:
+            logger.warning(f"IG persistent profile goto 失敗，改用目前頁面: {e}")
+
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+
+        _warmup_ig_page_for_media(page, is_reel=_is_ig_reel_url(url))
+
+        if _is_missing_ig_page(page):
+            return "MISSING", "Instagram 顯示：很抱歉，此頁面無法使用；連結可能故障或頁面已遭移除"
+
+        if not _is_target_shortcode_context(page, shortcode):
+            return "RETRY", (
+                f"IG 頁面已離開目標貼文 {shortcode}，目前可能停在帳號首頁或推薦區。"
+                "為避免誤抓整個帳號，已停止本輪下載；請在專用 Chrome 直接開目標貼文並完成確認後重試。"
+            )
+
+        if _is_generic_ig_page(page) or _is_ig_audience_restricted_page(page):
+            _manual_wait_persistent_profile(page, reason="age/audience/login page before harvest")
+
+            if _is_missing_ig_page(page):
+                return "MISSING", "Instagram 顯示：很抱歉，此頁面無法使用；連結可能故障或頁面已遭移除"
+            if not _is_target_shortcode_context(page, shortcode):
+                return "RETRY", (
+                    f"手動確認後頁面離開目標貼文 {shortcode}；為避免誤抓整個帳號，已停止。"
+                    "請重新貼目標貼文 URL 後重試。"
+                )
+
+        title = _get_ig_title(page, fallback_shortcode=shortcode or "Instagram_Post")
+
+        visible_media = _collect_visible_target_media(page, shortcode)
+        filtered = _dedupe_media(visible_media)
+
+        # Only when visible DOM has no media do we use a very limited fallback.
+        # Never append broad performance/html/network data after visible media,
+        # otherwise IG profile grids and "more posts" thumbnails may be downloaded.
+        if not filtered:
+            filtered = _collect_limited_target_fallback_media(
+                page,
+                harvested_media,
+                shortcode,
+                allow_broad_fallback=True,
+            )
+
+        logger.info(
+            f"IG persistent profile scoped media count={len(filtered)}; "
+            f"visible={len(visible_media)}, network harvest={len(harvested_media)}, target={shortcode}"
+        )
+
+        if not filtered:
+            _manual_wait_persistent_profile(page, reason="persistent scoped media count=0")
+            if not _is_target_shortcode_context(page, shortcode):
+                return "RETRY", (
+                    f"二次掃描時頁面已離開目標貼文 {shortcode}；為避免誤抓整個帳號，已停止。"
+                )
+            visible_media = _collect_visible_target_media(page, shortcode)
+            filtered = _dedupe_media(visible_media)
+            if not filtered:
+                filtered = _collect_limited_target_fallback_media(
+                    page,
+                    harvested_media,
+                    shortcode,
+                    allow_broad_fallback=True,
+                )
+            logger.info(
+                f"IG persistent profile second-pass scoped media count={len(filtered)}; "
+                f"visible={len(visible_media)}, network harvest={len(harvested_media)}, target={shortcode}"
+            )
+
+        if not filtered:
+            return "RETRY", "已登入 IG_Parser Profile 但仍未抓到目標貼文媒體；請確認專用 Profile 已完成年齡/帳號驗證後重試"
+
+        # Final post lock before writing files.  The collected media were gathered
+        # only while the page was scoped to the target shortcode; if a later Next
+        # click left the post, do not continue scanning or append anything else.
+        # We still allow writing already collected scoped media instead of falling
+        # back to yt-dlp, because yt-dlp cannot use the project-local IG_Parser
+        # trust state.
+        return _download_filtered_items_from_context(
+            context,
+            filtered,
+            harvested_media,
+            title,
+            shortcode,
+            referer=url,
+        )
+
+    except Exception as e:
+        msg = str(e)
+        if "user data directory is already in use" in msg.lower() or "process singleton" in msg.lower():
+            return "RETRY", (
+                "IG_Parser Chrome Profile 目前被同一個專用 Chrome 視窗佔用。"
+                "請關閉 IG_Parser 視窗後重試；日常 Chrome 不需要關閉。"
+            )
+        return _classify_error(msg)
+
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+
+
 def _collect_ig_media_playwright(url: str):
     clear_temp()
 
@@ -1493,7 +2245,13 @@ def _collect_ig_media_playwright(url: str):
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                ],
+            )
 
             context = browser.new_context(
                 viewport={
@@ -1510,6 +2268,11 @@ def _collect_ig_media_playwright(url: str):
 
             cookie_path = _cookie_file if (_cookie_file and os.path.exists(_cookie_file)) else COOKIES_FILE
             ig_cookies = _load_netscape_cookies(cookie_path, "instagram.com")
+
+            try:
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            except Exception:
+                pass
 
             if ig_cookies:
                 try:
@@ -1540,11 +2303,30 @@ def _collect_ig_media_playwright(url: str):
             except Exception:
                 pass
 
+            _warmup_ig_page_for_media(page, is_reel=_is_ig_reel_url(url))
+
             if _is_missing_ig_page(page):
                 return "MISSING", "Instagram 顯示：很抱歉，此頁面無法使用；連結可能故障或頁面已遭移除"
 
+            if _is_ig_audience_restricted_page(page):
+                status_p, error_p = _collect_ig_media_playwright_persistent(
+                    p,
+                    url,
+                    reason="IG age/audience restricted page in cookies.txt context",
+                )
+                if status_p == "SUCCESS":
+                    return status_p, error_p
+                return status_p, error_p
+
             if _is_generic_ig_page(page):
-                return "BLOCKED", "Playwright 看到的是 login / challenge / checkpoint 頁面，不是貼文主體"
+                status_p, error_p = _collect_ig_media_playwright_persistent(
+                    p,
+                    url,
+                    reason="IG login/challenge page in cookies.txt context",
+                )
+                if status_p == "SUCCESS":
+                    return status_p, error_p
+                return "BLOCKED", error_p or "Playwright 看到的是 login / challenge / checkpoint 頁面，不是貼文主體"
 
             title = _get_ig_title(
                 page,
@@ -1571,36 +2353,57 @@ def _collect_ig_media_playwright(url: str):
                     seen_media_keys.add(key)
                     collected.append(item)
 
-                moved = _click_next_ig(page)
+                moved = _click_next_ig_locked(page, shortcode)
 
                 if not moved:
                     break
 
             filtered = _dedupe_media(collected)
 
-            # Merge browser-harvested media as a non-invasive fallback.
-            # This keeps the original DOM extraction intact while fixing carousel posts
-            # where direct CDN requests are rejected even though the browser already
-            # loaded the full images on screen.
-            for harvested in sorted(harvested_media.values(), key=lambda x: x.get("score", 0), reverse=True):
-                if not _looks_like_real_ig_media_url(harvested.get("src", "")):
-                    continue
-                h_key = _media_key_from_url(harvested.get("src", ""))
-                exists = any(_media_key_from_url(x.get("src", "")) == h_key for x in filtered)
-                if not exists:
-                    filtered.append({
-                        "src": harvested.get("src", ""),
-                        "type": harvested.get("type", "image"),
-                        "score": harvested.get("score", 0),
-                        "from": "network",
-                    })
+            # Shortcode scope guard:
+            # If the target post/reel DOM is visible, do not append broad
+            # performance/html/network candidates.  Those often include profile-grid
+            # thumbnails or "more posts" recommendations and can make one task look
+            # like an account dump.  The network cache is still used later when a
+            # filtered media URL has the same media key.
+            fallback_video = []
+            fallback_perf = []
+            fallback_html = []
+            if not filtered:
+                fallback_video = _get_video_current_sources(page)
+                if _is_target_shortcode_context(page, shortcode):
+                    fallback_perf = _get_performance_ig_media(page)[:3]
+                    try:
+                        fallback_html = _extract_ig_media_from_text(page.content())[:3]
+                    except Exception:
+                        fallback_html = []
+                filtered = _dedupe_media(fallback_video + fallback_perf + fallback_html)[:3]
 
-            filtered = _dedupe_media(filtered)
-
-            logger.info(f"IG filtered media count={len(filtered)}; network harvest={len(harvested_media)}")
+            logger.info(
+                f"IG filtered media count={len(filtered)}; network harvest={len(harvested_media)}; "
+                f"fallback source counts: video_current={len(fallback_video)}, "
+                f"performance={len(fallback_perf)}, html={len(fallback_html)}, target={shortcode}"
+            )
 
             if not filtered:
-                return "RETRY", "Playwright 頁面已開啟，但本輪未抓到有效貼文主媒體；可能是 IG lazy-load / 暫時空回應，建議稍後重試"
+                status_p, error_p = _collect_ig_media_playwright_persistent(
+                    p,
+                    url,
+                    reason="normal Playwright network harvest=0",
+                )
+                if status_p == "SUCCESS":
+                    return status_p, error_p
+                return "RETRY", error_p or "Playwright 頁面已開啟，但本輪未抓到有效貼文主媒體；可能是 IG lazy-load / 暫時空回應，建議稍後重試"
+
+            status_write, error_write = _download_filtered_items_from_context(
+                context,
+                filtered,
+                harvested_media,
+                title,
+                shortcode,
+                referer=url,
+            )
+            return status_write, error_write
 
             success_count = 0
 

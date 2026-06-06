@@ -152,6 +152,13 @@ class App:
         self._tree_context_status_snapshot = ""
         self._tree_context_retry_snapshot = ""
         self._tree_context_menu = None
+        self._tree_sort_col = None
+        self._tree_sort_reverse = False
+        self._tree_heading_base = {
+            "url": "URL",
+            "status": "狀態",
+            "retry": "Retry",
+        }
 
         self._elapsed_start_ts = None
         self._completion_notified = False
@@ -239,7 +246,7 @@ class App:
         y = top + max(0, (work_h - height) // 2)
 
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        min_w = 940 if self._compact_ui else 980
+        min_w = 1120 if self._compact_ui else 1180
         min_h = min(680, max(540, work_h - 80)) if self._compact_ui else min(700, max(560, work_h - 80))
         self.root.minsize(min_w, min_h)
 
@@ -250,17 +257,17 @@ class App:
         # heights scale together on FHD / 2K / 4K / Windows 125%-175% setups.
         self._pad_x = self._ui_px(10)
         self._pad_y = self._ui_px(6)
-        self._gap_x = self._ui_px(4)
+        self._gap_x = self._ui_px(3)
         self._gap_y = self._ui_px(4)
-        self._button_padx = self._ui_px(10)
+        self._button_padx = self._ui_px(6)
         self._button_pady_main = self._ui_px(5)
         self._bottom_button_pady = self._ui_px(4)
         self._status_padx = self._ui_px(6)
-        self._filter_width = 9 if self._compact_ui else 11
-        self._filter_downloading_width = 12 if self._compact_ui else 14
-        self._url_col_width = self._ui_px(720)
-        self._status_col_width = self._ui_px(150)
-        self._retry_col_width = self._ui_px(64)
+        self._filter_width = 8 if self._compact_ui else 9
+        self._filter_downloading_width = 10 if self._compact_ui else 12
+        self._url_col_width = self._ui_px(620)
+        self._status_col_width = self._ui_px(110)
+        self._retry_col_width = self._ui_px(58)
 
         # ttk style tuning must happen after Tk exists.  It keeps Treeview rows
         # readable on 4K without bloating the whole window on FHD.
@@ -382,11 +389,10 @@ class App:
         btn_area.pack(fill=tk.X, pady=(0, self._ui_px(4)))
         btn_row = tk.Frame(btn_area)
         btn_row.pack(anchor="w", fill=tk.X)
-        btn_row2 = tk.Frame(btn_area)
-        if self._compact_ui:
-            btn_row2.pack(anchor="w", fill=tk.X, pady=(self._ui_px(4), 0))
-        else:
-            btn_row2 = btn_row
+        # Keep the original single-row toolbar look.  Instead of wrapping into
+        # an ugly second row, use shorter labels and smaller padding so the
+        # toolbar fits typical FHD windows without covering the Treeview.
+        btn_row2 = btn_row
 
         tk.Button(
             btn_row,
@@ -403,7 +409,7 @@ class App:
 
         tk.Button(
             btn_row,
-            text="🧹 清空輸入框",
+            text="🧹 清空",
             command=self._clear_input,
             bg="#F57C00",
             fg="white",
@@ -416,7 +422,7 @@ class App:
 
         tk.Button(
             btn_row,
-            text="📂 匯入 txt（自動預處理）",
+            text="📂 匯入txt",
             command=self._import_txt,
             bg="#6A1B9A",
             fg="white",
@@ -429,7 +435,7 @@ class App:
 
         tk.Button(
             btn_row,
-            text="🧩 預處理分類",
+            text="🧩 預處理",
             command=self._preprocess_links,
             bg="#00897B",
             fg="white",
@@ -442,7 +448,7 @@ class App:
 
         tk.Button(
             btn_row,
-            text="📥 載入可下載清單",
+            text="📥 載入清單",
             command=self._load_preprocessed_downloads,
             bg="#5E35B1",
             fg="white",
@@ -455,7 +461,7 @@ class App:
 
         tk.Button(
             btn_row,
-            text="📁 開啟下載資料夾",
+            text="📁 下載資料夾",
             command=self._open_downloads,
             bg="#F57C00",
             fg="white",
@@ -468,7 +474,7 @@ class App:
 
         tk.Button(
             btn_row2,
-            text="📂 開啟預處理 output",
+            text="📂 預處理output",
             command=self._open_preprocess_output,
             bg="#37474F",
             fg="white",
@@ -477,11 +483,11 @@ class App:
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        ).pack(side=tk.LEFT, padx=(0, 4))
 
         tk.Button(
             btn_row2,
-            text="🧼 清除已下載紀錄",
+            text="🧼 清除紀錄",
             command=self._clear_processed_log,
             bg="#455A64",
             fg="white",
@@ -490,7 +496,7 @@ class App:
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        ).pack(side=tk.LEFT, padx=(0, 4))
 
         self.login_btn = tk.Button(
             btn_row2,
@@ -504,7 +510,20 @@ class App:
             relief=tk.FLAT,
             cursor="hand2",
         )
-        self.login_btn.pack(side=tk.LEFT)
+        self.login_btn.pack(side=tk.LEFT, padx=(0, self._gap_x))
+
+        tk.Button(
+            btn_row2,
+            text="🌐 IG_Parser",
+            command=self._open_ig_parser_profile,
+            bg="#1565C0",
+            fg="white",
+            padx=self._button_padx,
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
 
         ttk.Separator(self.root, orient="horizontal").pack(fill=tk.X, padx=self._ui_px(8), pady=(0, self._ui_px(4)))
 
@@ -513,9 +532,7 @@ class App:
 
         cols = ("url", "status", "retry")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
-        self.tree.heading("url", text="URL")
-        self.tree.heading("status", text="狀態", anchor="center")
-        self.tree.heading("retry", text="Retry", anchor="center")
+        self._bind_tree_sort_headings()
         self.tree.column("url", width=self._url_col_width, stretch=True, minwidth=self._ui_px(300))
         self.tree.column("status", width=self._status_col_width, stretch=False, anchor="center")
         self.tree.column("retry", width=self._retry_col_width, stretch=False, anchor="center")
@@ -545,10 +562,7 @@ class App:
         bot.pack(fill=tk.X)
 
         filter_frame = tk.LabelFrame(bot, text="篩選", padx=self._ui_px(4), pady=self._ui_px(2))
-        if self._compact_ui:
-            filter_frame.pack(anchor="w", fill=tk.X, pady=(0, self._ui_px(4)))
-        else:
-            filter_frame.pack(side=tk.LEFT)
+        filter_frame.pack(side=tk.LEFT)
 
         filter_defs = [
             ("全部", "ALL"),
@@ -556,6 +570,7 @@ class App:
             ("FAILED", "FAILED"),
             ("BLOCKED", "BLOCKED"),
             ("MISSING", "MISSING"),
+            ("RETRY", "RETRY"),
             ("DOWNLOADING", "DOWNLOADING"),
         ]
         for label, key in filter_defs:
@@ -575,33 +590,30 @@ class App:
             ).pack(side=tk.LEFT, padx=self._ui_px(2), pady=self._ui_px(1))
 
         act_frame = tk.Frame(bot)
-        if self._compact_ui:
-            act_frame.pack(anchor="e", fill=tk.X)
-        else:
-            act_frame.pack(side=tk.RIGHT)
+        act_frame.pack(side=tk.RIGHT)
 
         tk.Button(
             act_frame,
-            text="📄 查看失敗",
+            text="📄 失敗",
             command=self._show_failed_links_window,
             bg="#6D4C41",
             fg="white",
             padx=self._button_padx,
             pady=self._bottom_button_pady,
-            font=("Microsoft JhengHei UI", self._base_font_size),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             act_frame,
-            text="🚫 複製BLOCKED",
+            text="🚫 BLOCKED",
             command=lambda: self._copy_status_urls("BLOCKED"),
             bg="#EF6C00",
             fg="white",
             padx=self._button_padx,
             pady=self._bottom_button_pady,
-            font=("Microsoft JhengHei UI", self._base_font_size),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=self._gap_x)
@@ -614,7 +626,7 @@ class App:
             fg="white",
             padx=self._button_padx,
             pady=self._bottom_button_pady,
-            font=("Microsoft JhengHei UI", self._base_font_size),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
@@ -628,7 +640,7 @@ class App:
             fg="white",
             padx=self._button_padx,
             pady=self._bottom_button_pady,
-            font=("Microsoft JhengHei UI", self._base_font_size),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
@@ -642,7 +654,7 @@ class App:
             fg="white",
             padx=self._button_padx,
             pady=self._bottom_button_pady,
-            font=("Microsoft JhengHei UI", self._base_font_size),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         )
@@ -650,26 +662,26 @@ class App:
 
         tk.Button(
             act_frame,
-            text="🔁 重試失敗",
+            text="🔁 重試",
             command=self._retry_failed,
             bg="#E65100",
             fg="white",
             padx=self._button_padx,
             pady=self._bottom_button_pady,
-            font=("Microsoft JhengHei UI", self._base_font_size),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=self._gap_x)
 
         tk.Button(
             act_frame,
-            text="🗑 清空任務",
+            text="🗑 清空",
             command=self._clear_tasks,
             bg="#C62828",
             fg="white",
             padx=self._button_padx,
             pady=self._bottom_button_pady,
-            font=("Microsoft JhengHei UI", self._base_font_size),
+            font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
             cursor="hand2",
         ).pack(side=tk.LEFT)
@@ -685,6 +697,82 @@ class App:
             fg="#333333",
             padx=self._status_padx,
         ).pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _bind_tree_sort_headings(self):
+        """Bind clickable Treeview column headings for display-only sorting."""
+        for col, label in self._tree_heading_base.items():
+            anchor = "center" if col in {"status", "retry"} else "w"
+            self.tree.heading(
+                col,
+                text=label,
+                anchor=anchor,
+                command=lambda c=col: self._on_tree_heading_click(c),
+            )
+        self._update_tree_heading_labels()
+
+    def _on_tree_heading_click(self, col: str):
+        """Toggle Treeview sort column without changing queue execution order."""
+        if self._tree_sort_col == col:
+            self._tree_sort_reverse = not self._tree_sort_reverse
+        else:
+            self._tree_sort_col = col
+            self._tree_sort_reverse = False
+        self._update_tree_heading_labels()
+        self._schedule_refresh(0)
+
+    def _update_tree_heading_labels(self):
+        """Show ▲ / ▼ on the active Treeview sort column."""
+        if not hasattr(self, "tree"):
+            return
+        for col, label in self._tree_heading_base.items():
+            suffix = ""
+            if self._tree_sort_col == col:
+                suffix = " ▼" if self._tree_sort_reverse else " ▲"
+            anchor = "center" if col in {"status", "retry"} else "w"
+            try:
+                self.tree.heading(
+                    col,
+                    text=f"{label}{suffix}",
+                    anchor=anchor,
+                    command=lambda c=col: self._on_tree_heading_click(c),
+                )
+            except Exception:
+                pass
+
+    def _apply_tree_sort(self, rows: list[dict]) -> list[dict]:
+        """Return a sorted copy of rows for display only; downloader queue order is untouched."""
+        col = self._tree_sort_col
+        if not col:
+            return list(rows)
+
+        status_rank = {
+            "DOWNLOADING": 0,
+            "PENDING": 1,
+            "RETRY": 2,
+            "FAILED": 3,
+            "BLOCKED": 4,
+            "MISSING": 5,
+            "UNAVAILABLE": 6,
+            "SUCCESS": 7,
+        }
+
+        def key_func(task: dict):
+            if col == "retry":
+                try:
+                    return int(task.get("retry", 0) or 0)
+                except Exception:
+                    return 0
+            if col == "status":
+                status = str(task.get("status", "") or "").upper()
+                return (status_rank.get(status, 99), status)
+            if col == "url":
+                return str(task.get("url", "") or "").lower()
+            return str(task.get(col, "") or "").lower()
+
+        try:
+            return sorted(list(rows), key=key_func, reverse=bool(self._tree_sort_reverse))
+        except Exception:
+            return list(rows)
 
     def _build_tree_context_menu(self):
         """建立任務清單右鍵選單。"""
@@ -832,10 +920,34 @@ class App:
     def _init_session(self):
         if os.path.exists(COOKIES_FILE):
             instagram.use_cookies(COOKIES_FILE)
-            self.status_var.set("使用 cookies.txt 模式  •  點擊「🔑 登入 IG」可切換帳號登入")
+            self.status_var.set("使用 cookies.txt 模式  •  限制貼文 fallback 會自動使用 data/chrome_ig_parser 專用 Profile")
         else:
             instagram.setup()
-            self.status_var.set("匿名模式  •  點擊「🔑 登入 IG」可登入帳號")
+            self.status_var.set("匿名模式  •  建議先點「🌐 初始化 IG_Parser」登入專用 Profile")
+
+    def _open_ig_parser_profile(self):
+        """Open project-local IG_Parser Chrome profile for one-time login / trust setup."""
+        try:
+            profile_root = instagram.open_ig_parser_profile("https://www.instagram.com/")
+            messagebox.showinfo(
+                "IG_Parser 專用 Profile",
+                "已開啟 IG_Parser 專用 Chrome Profile。\n\n"
+                "請在該 Chrome 視窗中完成：\n"
+                "1. 登入 Instagram\n"
+                "2. 勾選 / 確認記住這台設備\n"
+                "3. 打開限制貼文並完成未滿18歲 / 特定對象確認\n\n"
+                "完成後關閉該 Chrome 視窗，再回到下載器繼續下載。\n\n"
+                f"Profile 位置：\n{profile_root}",
+                parent=self.root,
+            )
+            self.status_var.set(f"已開啟 IG_Parser 專用 Profile：{profile_root}")
+        except Exception as e:
+            messagebox.showerror(
+                "無法開啟 IG_Parser Profile",
+                f"開啟 IG_Parser 專用 Chrome Profile 失敗：\n{e}",
+                parent=self.root,
+            )
+            self.status_var.set(f"IG_Parser Profile 開啟失敗：{e}")
 
     def _manual_login(self):
         if self._login_in_progress:
@@ -1471,7 +1583,7 @@ class App:
 
         tk.Button(
             btn_row,
-            text="📁 開啟下載資料夾",
+            text="📁 下載資料夾",
             command=lambda: self._open_path(DOWNLOAD_DIR),
             bg="#F57C00",
             fg="white",
@@ -1479,12 +1591,12 @@ class App:
             pady=self._button_pady,
             relief=tk.FLAT,
             cursor="hand2",
-        ).pack(side=tk.LEFT, padx=(0, 8))
+        ).pack(side=tk.LEFT, padx=(0, 4))
 
         if problem_total:
             tk.Button(
                 btn_row,
-                text="📄 查看失敗",
+                text="📄 失敗",
                 command=self._show_failed_links_window,
                 bg="#6D4C41",
                 fg="white",
@@ -1492,7 +1604,7 @@ class App:
                 pady=self._button_pady,
                 relief=tk.FLAT,
                 cursor="hand2",
-            ).pack(side=tk.LEFT, padx=(0, 8))
+            ).pack(side=tk.LEFT, padx=(0, 4))
 
         tk.Button(
             btn_row,
@@ -1515,7 +1627,8 @@ class App:
         runtime = queue_manager.get_runtime()
         processed_count = queue_manager.get_processed_count()
 
-        display = snapshot if self._active_filter == "ALL" else [t for t in snapshot if t["status"] == self._active_filter]
+        display = snapshot if self._active_filter == "ALL" else [t for t in snapshot if t.get("status") == self._active_filter]
+        display = self._apply_tree_sort(display)
 
         self._tree_url_by_iid.clear()
 
