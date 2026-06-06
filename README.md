@@ -1,4 +1,4 @@
-﻿# 🚀 Media Batch Downloader
+# 🚀 Media Batch Downloader
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。它支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、失敗清單整理，以及 Instagram / Facebook 的多引擎下載 fallback。
 
@@ -12,10 +12,10 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 支援 `facebook.com/share/...`、`facebook.com/share/r/...`、`fb.watch/...` 等分享格式
 - 支援批次 URL 匯入與預處理分類
 - 支援 GUI 拖放 `.txt` 檔案
-- 支援 IG Parser / FB Parser 專用 Chrome Profile 登入模式，不再需要手動匯出 cookies.txt
+- 支援 IG_Parser / FB_Parser 專用 Chrome Profile 登入模式，不再需要手動匯出 cookies.txt
 - 保留 cookies.txt 作為 legacy / emergency fallback
-- 支援 IG Parser 專用 Chrome Profile，處理年齡 / 特定對象限制貼文
-- 支援 FB Parser 專用 Chrome Profile，處理 Facebook 登入、2FA、相簿與 Reel fallback
+- 支援 IG_Parser 專用 Chrome Profile，處理年齡 / 特定對象限制貼文
+- 支援 FB_Parser 專用 Chrome Profile，處理 Facebook 登入、2FA、相簿與 Reel fallback
 - 支援 Instagram 受限 Carousel 的 post 鎖定、完整數量檢查、順序保留與防推薦貼文污染
 - 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
 - 支援自動簡體轉繁體
@@ -46,8 +46,8 @@ media-batch-downloader/
 │  │  ├─ instagram.py
 │  │  └─ facebook.py
 │  ├─ data/
-│  │  ├─ chrome_ig_parser/      # IG Parser 專用 Chrome Profile，用於 IG 登入 / 受限貼文 fallback
-│  │  ├─ playwright_fb_profile/ # FB Parser 專用 Chrome Profile，用於 FB 登入 / 相簿 / Reel fallback
+│  │  ├─ chrome_ig_parser/      # IG_Parser 專用 Chrome Profile，用於 IG 登入 / 受限貼文 fallback
+│  │  ├─ playwright_fb_profile/ # FB_Parser 專用 Chrome Profile，用於 FB 登入 / 相簿 / Reel fallback
 │  │  ├─ processed_links.log
 │  │  ├─ failed_links.log
 │  │  ├─ retry_needed.txt
@@ -124,13 +124,13 @@ release/MediaBatchDownloader.exe
 
 ---
 
-## IG Parser / FB Parser 專用登入模式（推薦）
+## IG_Parser / FB_Parser 專用登入模式（推薦）
 
 新版推薦使用 GUI 內建的專用 Chrome Persistent Profile，不再需要手動匯出 cookies.txt。
 
-### IG Parser 第一次登入
+### IG_Parser 第一次登入
 
-1. 在 GUI 點「🌐 IG Parser 登入/初始化」。
+1. 在 GUI 點「🌐 IG_Parser 登入/初始化」。
 2. 下載器會開啟專案專用 Chrome Profile：
 
 ```text
@@ -144,9 +144,9 @@ downloader_GUI/data/chrome_ig_parser
 
 之後 IG Playwright fallback 會優先使用這個 Profile 的登入 / 年齡確認 / trust state。
 
-### FB Parser 第一次登入
+### FB_Parser 第一次登入
 
-1. 在 GUI 點「🌐 FB Parser 登入/初始化」。
+1. 在 GUI 點「🌐 FB_Parser 登入/初始化」。
 2. 下載器會開啟專案專用 Chrome Profile：
 
 ```text
@@ -162,8 +162,8 @@ downloader_GUI/data/playwright_fb_profile
 
 注意：
 
-- 下載時請先關閉手動登入用的 IG Parser / FB Parser Chrome 視窗，避免 Chrome profile lock。
-- IG Parser 與 FB Parser 是專案內的獨立 Profile，不會使用你日常 Chrome Default Profile。
+- 下載時請先關閉手動登入用的 IG_Parser / FB_Parser Chrome 視窗，避免 Chrome profile lock。
+- IG_Parser 與 FB_Parser 是專案內的獨立 Profile，不會使用你日常 Chrome Default Profile。
 - 不要把 `data/chrome_ig_parser/`、`data/playwright_fb_profile/`、`cookies.txt`、`accounts.json` 提交到 Git。
 
 ---
@@ -180,7 +180,7 @@ downloader_GUI/data/playwright_fb_profile
 注意：
 
 - 同一份 `cookies.txt` 可同時包含 `.instagram.com` 與 `.facebook.com`
-- 若瀏覽器看得到但程式抓不到，優先重新初始化 IG Parser / FB Parser Profile，而不是先更新 cookies.txt
+- 若瀏覽器看得到但程式抓不到，優先重新初始化 IG_Parser / FB_Parser Profile，而不是先更新 cookies.txt
 - 請勿將 `cookies.txt`、`accounts.json` 或任何登入 Profile 目錄提交到 Git
 
 ---
@@ -211,49 +211,9 @@ Instaloader
 
 對 `/reel/` 或 `/reels/`，仍優先使用 yt-dlp，失敗後再由 Playwright fallback。
 
+### IG_Parser 專用 Chrome Profile 與受限貼文
 
-### Instagram 主頁全自動展開下載
-
-可直接貼 Instagram 帳號主頁網址，也支援 Reels 分頁網址，例如：
-
-```text
-https://www.instagram.com/bubu.dudu_hk/
-https://www.instagram.com/duolastudy/reels/
-```
-
-系統會自動判斷這是 IG 主頁 / Reels 分頁，而不是單篇貼文。`/<username>/reels/` 會先展開成真正的 `/reel/<shortcode>/` 單篇任務，不會直接下載主頁網格縮圖。處理流程如下：
-
-```text
-IG 主頁 URL / IG Reels 分頁 URL
-→ 使用 IG Parser 專用 Chrome Profile 掃描主頁與 Reels 分頁
-→ 自動收集 /p/ 與 /reel/ 貼文連結
-→ 展開成多筆單篇任務加入 GUI 佇列
-→ 每篇仍走原本穩定的單篇 IG 下載流程
-→ 輸出仍依原本 post title / caption 規則建立資料夾
-```
-
-設計原則：
-
-- 主頁 / Reels 分頁任務只負責「掃描與展開」，不直接在同一個任務內下載全部媒體。
-- 每一篇子任務仍使用原本 v11.26 已驗證的單篇下載流程；Reels 會進入單篇 Reel 下載，不會只抓預覽縮圖。
-- 保留 `img_index=` 預分流、restricted Carousel post lock、`total_count` 檢查、scoped network fill、WEBP/JPEG magic bytes 檢查。
-- 已在 `processed_links.log` 內的貼文會自動略過。
-- 佇列中已存在的貼文不會重複加入。
-- 不抓 Stories；Stories 需未來另外做獨立模組。
-- 私人帳號、checkpoint、challenge、權限不足會回 `BLOCKED`。
-- 若主頁貼文很多，掃描時間會較久，建議先完成 IG Parser 登入與信任裝置初始化。
-
-使用方式：
-
-1. 先點「🌐 IG Parser」完成 Instagram 登入、2FA、信任裝置。
-2. 關閉手動登入用 Chrome 視窗，避免 profile lock。
-3. 在 GUI 輸入框貼上 IG 主頁網址或 Reels 分頁網址，例如 `https://www.instagram.com/duolastudy/reels/`。
-4. 按「🚀 開始下載」。
-5. GUI 會先顯示主頁掃描狀態，展開完成後會自動新增多筆 `/p/` 或 `/reel/` 任務。
-
-### IG Parser 專用 Chrome Profile 與受限貼文
-
-當 Instagram 貼文出現年齡限制、特定對象限制，或 `Instaloader` / `yt-dlp` 回傳 `empty media response` 時，下載器會啟用專案內建的 IG Parser 專用 Chrome Profile：
+當 Instagram 貼文出現年齡限制、特定對象限制，或 `Instaloader` / `yt-dlp` 回傳 `empty media response` 時，下載器會啟用專案內建的 IG_Parser 專用 Chrome Profile：
 
 ```text
 downloader_GUI/data/chrome_ig_parser
@@ -270,7 +230,7 @@ downloader_GUI/data/chrome_ig_parser
 - 掃描前會清除 persistent profile 的預載 network cache，避免推薦貼文或上一筆任務圖片混入
 - 下載時會保留 Carousel 翻頁順序，避免依圖片品質分數重新排序
 
-若第一次使用 IG Parser，請先在 GUI 點「🌐 IG Parser 登入/初始化」，登入 Instagram 並完成必要的年齡或帳號確認。完成後即可回到下載器批次執行，不需要手動匯出 cookies.txt。
+若第一次使用 IG_Parser，請先在 GUI 點「🌐 IG_Parser 登入/初始化」，登入 Instagram 並完成必要的年齡或帳號確認。完成後即可回到下載器批次執行，不需要手動匯出 cookies.txt。
 
 ### IG 媒體格式與 WEBP 處理
 
@@ -330,7 +290,7 @@ Facebook 下載器針對多圖、Reel、Viewer 模式做了防污染保護。
 - `facebook.com/story.php...`
 - `fb.watch/...`
 
-### FB Parser 專用 Chrome Profile
+### FB_Parser 專用 Chrome Profile
 
 Facebook Playwright fallback 會優先使用：
 
@@ -338,7 +298,7 @@ Facebook Playwright fallback 會優先使用：
 downloader_GUI/data/playwright_fb_profile
 ```
 
-這個 Profile 會保留 Facebook 登入、雙重驗證、保持登入與信任裝置狀態。第一次使用請先在 GUI 點「🌐 FB Parser 登入/初始化」完成登入。完成後，FB 一般貼文、多圖相簿、大相簿、share/r 與 Reel fallback 都會使用此 Profile。
+這個 Profile 會保留 Facebook 登入、雙重驗證、保持登入與信任裝置狀態。第一次使用請先在 GUI 點「🌐 FB_Parser 登入/初始化」完成登入。完成後，FB 一般貼文、多圖相簿、大相簿、share/r 與 Reel fallback 都會使用此 Profile。
 
 `cookies.txt` 只保留為 legacy / emergency fallback，不再是主要推薦流程。
 
@@ -373,8 +333,8 @@ python main.py
    - 「🔁 重試失敗」
    - 「📄 查看失敗」
    - 「🚫 複製 BLOCKED」
-   - 「🌐 IG Parser 登入/初始化」
-   - 「🌐 FB Parser 登入/初始化」
+   - 「🌐 IG_Parser 登入/初始化」
+   - 「🌐 FB_Parser 登入/初始化」
 5. 任務完成後會跳出下載結果摘要視窗。
 
 ### 下載完成通知
@@ -585,32 +545,11 @@ python main.py
 
 ## 版本紀錄
 
-### v11.33 IG Profile/Reels Auto Expand Fix
-
-- 修正 `https://www.instagram.com/<username>/reels/` 會被誤當成單一 Reel 任務的問題
-- IG 主頁掃描會同時掃描主頁與 Reels 分頁，避免只抓網格預覽縮圖
-- Reels 分頁會展開成真正的 `/reel/<shortcode>/` 子任務，再沿用原本單篇 Reel 下載與 title/caption 分類規則
-- 保留 v11.32 的 queue 展開架構，不把整個帳號下載塞進單一任務
-
-### v11.32 IG Profile Auto Expand
-
-- 新增 Instagram 主頁 URL 偵測，例如 `https://www.instagram.com/bubu.dudu_hk/`
-- 使用 IG Parser persistent Chrome Profile 掃描主頁貼文
-- 自動收集 `/p/` 與 `/reel/` shortcode
-- 自動展開成單篇 post / Reel 任務加入 GUI queue
-- 每篇子任務仍使用原本穩定的單篇 IG 下載流程
-- 保留原本 post title / caption 輸出分類規則
-- 保留 processed-link 去重與 queue 去重
-- 保留 v11.26 restricted Carousel routing、shortcode lock、total_count validation、scoped network fill、媒體順序與 WEBP/JPEG 檔頭處理
-- 不抓 Stories，避免與貼文下載流程混線
-- 不影響 Facebook 下載流程
-
-
 ### v11.27 Parser Login Profiles
 
-- 新增 IG Parser / FB Parser 專用 Chrome Persistent Profile 登入模式
-- GUI 新增「🌐 FB Parser 登入/初始化」
-- GUI 將 IG Parser 改為「🌐 IG Parser 登入/初始化」
+- 新增 IG_Parser / FB_Parser 專用 Chrome Persistent Profile 登入模式
+- GUI 新增「🌐 FB_Parser 登入/初始化」
+- GUI 將 IG_Parser 改為「🌐 IG_Parser 登入/初始化」
 - FB Playwright fallback 優先使用 `data/playwright_fb_profile`
 - IG Playwright fallback 繼續使用 `data/chrome_ig_parser`
 - `cookies.txt` 改為 legacy / emergency fallback，不再是主要推薦流程
@@ -620,7 +559,7 @@ python main.py
 ### v11.26 IG Restricted Carousel Lock
 
 - 修正 Instagram 年齡 / 特定對象限制貼文的 Carousel fallback
-- 新增 IG Parser 專用 Chrome Profile 路徑策略，避免與日常 Chrome profile 搶鎖
+- 新增 IG_Parser 專用 Chrome Profile 路徑策略，避免與日常 Chrome profile 搶鎖
 - 保留 v7 / v8 A/B 測試後的穩定路徑：
   - `img_index=` 圖文貼文預先走 v7 clean persistent page
   - 其他受限長 Carousel 走 v8 fresh tab
@@ -674,15 +613,3 @@ build.bat
 ```text
 release/MediaBatchDownloader.exe
 ```
-
-
-### v11.34 IG Reels Click-Scan + Profile Folder Output
-
-- 修正 `https://www.instagram.com/<username>/reels/` 在部分 IG 版面中掃描不到 `a[href]` 的問題。
-- 主頁 / Reels 頁掃描會先嘗試 DOM / HTML / performance URL 擷取；若仍為 0，會用 visible tile click-probe 點開格子，只收集真正的 `/p/<shortcode>/` 與 `/reel/<shortcode>/`。
-- 不再把 Reels grid 預覽縮圖當成正式下載結果。
-- 主頁展開後的每一篇仍走原本穩定單篇下載流程，所以 Reel 會下載真正影片 `.mp4`，圖文 / Carousel 仍保留原本完整數量與順序保護。
-- 從主頁 / Reels 頁展開出的子任務會輸出到 `downloads/<username>/`，例如 `downloads/duolastudy/`。
-- 子任務檔名 / 資料夾名稱仍沿用單篇貼文 title / caption，例如 `找工作，什麼樣的公司不能去？` 或長文案標題。
-- 保留 `processed_links.log` 的 canonical URL 去重，不為了 profile folder 改寫 post URL。
-
