@@ -24,6 +24,11 @@ except Exception:
 
 _cc = OpenCC("s2t") if OpenCC else None
 
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
 
 def _to_traditional(text: str) -> str:
     if not text:
@@ -44,11 +49,13 @@ logger = get_logger("instagram")
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
 _DL_TIMEOUT = 300
 _MAX_CAROUSEL_ITEMS = 40
-_MIN_FILE_SIZE = 18 * 1024
+_MIN_FILE_SIZE = 5 * 1024
 
 _L = None
 _cookie_file = None
 _is_logged_in = False
+_LAST_CAROUSEL_EXPECTED_COUNT = 0
+_LAST_CAROUSEL_TARGET = ""
 
 
 def setup():
@@ -687,7 +694,7 @@ def _ext_from_url(url: str, default_ext=".jpg"):
     return default_ext
 
 
-def _dedupe_media(items):
+def _dedupe_media(items, preserve_order: bool = False):
     out = []
     seen = set()
 
@@ -725,7 +732,29 @@ def _dedupe_media(items):
 
         out.append(item)
 
+    if preserve_order:
+        return out
+
     return sorted(out, key=lambda x: x.get("score", 0), reverse=True)
+
+
+def _natural_media_sort_key(path: str):
+    """Sort ig_1, ig_2, ..., ig_10 in numeric carousel order.
+
+    A normal string sort puts ig_10 before ig_2, which can scramble final
+    move_files() numbering even when the downloader wrote temp files in the
+    correct carousel order.  Keep this helper local and conservative so it
+    does not affect download logic outside file ordering.
+    """
+    name = os.path.basename(path or "").lower()
+    parts = re.split(r"(\d+)", name)
+    key = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return key
 
 
 def _list_media_files(root_dir: str):
@@ -751,7 +780,7 @@ def _list_media_files(root_dir: str):
             if size >= _MIN_FILE_SIZE:
                 out.append(path)
 
-    out.sort()
+    out.sort(key=_natural_media_sort_key)
     return out
 
 
@@ -818,7 +847,7 @@ def move_files(title: str, fallback_name: str = "Instagram_Post") -> bool:
             if len(files) == 1:
                 src = files[0]
                 ext = os.path.splitext(src)[1].lower()
-                final_ext = ".mp4" if ext in {".mp4", ".m4v", ".mov"} else ".jpg"
+                final_ext = _real_ext_for_file(src)
 
                 dst = _unique_path(os.path.join(DOWNLOAD_DIR, f"{name}{final_ext}"))
                 shutil.move(src, dst)
@@ -831,7 +860,7 @@ def move_files(title: str, fallback_name: str = "Instagram_Post") -> bool:
 
                 for i, src in enumerate(files, 1):
                     ext = os.path.splitext(src)[1].lower()
-                    final_ext = ".mp4" if ext in {".mp4", ".m4v", ".mov"} else ".jpg"
+                    final_ext = _real_ext_for_file(src)
 
                     dst = os.path.join(folder, f"{i}{final_ext}")
                     shutil.move(src, dst)
@@ -1224,15 +1253,30 @@ def _get_current_slide_main_media(page):
         const centerX = left + w / 2;
         const centerY = top + h / 2;
 
-        const dx = Math.abs(centerX - window.innerWidth / 2);
-        const dy = Math.abs(centerY - window.innerHeight / 2);
+        // Instagram carousel keeps adjacent slides/preload images in the DOM.
+        // Those preloaded images can have a higher natural resolution than the
+        // currently visible slide.  The old score used naturalArea heavily, so
+        // it could pick slide 03 while the active slide was actually 01.
+        // Prefer the image closest to the visible media area's center; use
+        // natural size only as a very small tie-breaker.
+        const mediaCenterX = (left < window.innerWidth * 0.55) ? (window.innerWidth * 0.33) : (window.innerWidth / 2);
+        const mediaCenterY = window.innerHeight / 2;
+        const dx = Math.abs(centerX - mediaCenterX);
+        const dy = Math.abs(centerY - mediaCenterY);
+        const viewportOverlapX = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+        const viewportOverlapY = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+        const viewportOverlap = viewportOverlapX * viewportOverlapY;
 
         result.push({
           type: el.tagName.toLowerCase() === 'video' ? 'video' : 'image',
           src,
-          score: (w * h) + ((naturalW || 0) * (naturalH || 0) / 4) - (dx * 3 + dy * 3),
+          score: (viewportOverlap * 8) + (w * h) - (dx * 6000 + dy * 80) + (((naturalW || 0) * (naturalH || 0)) / 2000),
           area: w * h,
-          naturalArea: (naturalW || 0) * (naturalH || 0)
+          naturalArea: (naturalW || 0) * (naturalH || 0),
+          centerX,
+          centerY,
+          dx,
+          dy
         });
       }
 
@@ -1422,14 +1466,127 @@ def _is_probably_valid_media_body(body: bytes, media_url: str = "", content_type
     return False
 
 
+def _detect_media_format_from_bytes(body: bytes, media_url: str = "", content_type: str = "") -> str:
+    """Detect the real media format from bytes/content-type/URL.
+
+    Returns: jpg, png, webp, mp4, or unknown.
+    This prevents WEBP bytes from being saved as a fake .jpg.
+    """
+    head = body[:32] if body else b""
+    ct = (content_type or "").lower()
+    low = (media_url or "").lower()
+
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head.startswith(b"RIFF") and b"WEBP" in head[:16]:
+        return "webp"
+    if b"ftyp" in head[:16]:
+        return "mp4"
+
+    if "image/jpeg" in ct or "image/jpg" in ct:
+        return "jpg"
+    if "image/png" in ct:
+        return "png"
+    if "image/webp" in ct:
+        return "webp"
+    if ct.startswith("video/"):
+        return "mp4"
+
+    if ".mp4" in low or ".m4v" in low or ".mov" in low:
+        return "mp4"
+    if ".webp" in low or "format=webp" in low:
+        return "webp"
+    if ".png" in low or "format=png" in low:
+        return "png"
+    if ".jpg" in low or ".jpeg" in low or "format=jpg" in low or "format=jpeg" in low:
+        return "jpg"
+
+    return "unknown"
+
+
+def _replace_file_ext(path: str, ext: str) -> str:
+    if not ext.startswith("."):
+        ext = "." + ext
+    base, _ = os.path.splitext(path)
+    return base + ext
+
+
+def _convert_webp_bytes_to_jpeg(body: bytes):
+    """Return real JPEG bytes for WEBP input, or None if Pillow is unavailable."""
+    if Image is None:
+        return None
+    try:
+        from io import BytesIO
+        with Image.open(BytesIO(body)) as img:
+            if img.mode in ("RGBA", "LA"):
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            else:
+                img = img.convert("RGB")
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=95, optimize=True)
+            return out.getvalue()
+    except Exception as e:
+        logger.warning(f"IG WEBP 轉 JPEG 失敗，保留 .webp: {e}")
+        return None
+
+
 def _write_media_body(dst: str, body: bytes, media_url: str = "", content_type: str = "") -> int:
     if not _is_probably_valid_media_body(body, media_url=media_url, content_type=content_type):
         raise Exception(f"媒體內容無效或過小: {len(body) if body else 0} bytes")
 
-    with open(dst, "wb") as f:
-        f.write(body)
+    real_fmt = _detect_media_format_from_bytes(body, media_url=media_url, content_type=content_type)
+    out_body = body
+    out_path = dst
 
-    return len(body)
+    if real_fmt == "webp":
+        jpeg_body = _convert_webp_bytes_to_jpeg(body)
+        if jpeg_body:
+            out_body = jpeg_body
+            out_path = _replace_file_ext(dst, ".jpg")
+            logger.info(f"IG WEBP 已轉換為真正 JPEG: {os.path.basename(out_path)}")
+        else:
+            out_path = _replace_file_ext(dst, ".webp")
+            logger.info(f"IG Pillow 不可用，WEBP 保留真實副檔名: {os.path.basename(out_path)}")
+    elif real_fmt == "jpg":
+        out_path = _replace_file_ext(dst, ".jpg")
+    elif real_fmt == "png":
+        out_path = _replace_file_ext(dst, ".png")
+    elif real_fmt == "mp4":
+        out_path = _replace_file_ext(dst, ".mp4")
+
+    if out_path != dst and os.path.exists(dst):
+        try:
+            os.remove(dst)
+        except Exception:
+            pass
+
+    with open(out_path, "wb") as f:
+        f.write(out_body)
+
+    return len(out_body)
+
+
+def _real_ext_for_file(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            body = f.read(64)
+    except Exception:
+        body = b""
+    fmt = _detect_media_format_from_bytes(body, media_url=path)
+    if fmt == "jpg":
+        return ".jpg"
+    if fmt == "png":
+        return ".png"
+    if fmt == "webp":
+        return ".webp"
+    if fmt == "mp4":
+        return ".mp4"
+    ext = os.path.splitext(path)[1].lower()
+    return ext if ext in _MEDIA_EXTS else ".jpg"
 
 
 def _capture_playwright_response(response, harvested: dict):
@@ -1717,6 +1874,40 @@ def _get_persistent_context_page(context):
             pass
 
     return page
+
+
+def _get_fresh_persistent_target_page(context):
+    """Create a brand-new tab for each IG task and close restored/stale tabs.
+
+    The dedicated IG_Parser profile is persistent, so Chrome can restore the
+    previous post's SPA/dialog DOM.  Reusing that tab can make the next task's
+    first carousel item come from the previous or recommended post even when
+    the URL already shows the requested shortcode.  A fresh tab keeps the
+    existing login/trust cookies but discards old DOM, old dialog state, and old
+    page-local performance entries.
+    """
+    try:
+        old_pages = list(context.pages)
+    except Exception:
+        old_pages = []
+
+    page = context.new_page()
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    for old in old_pages:
+        try:
+            if old != page:
+                old.close()
+        except Exception:
+            pass
+
+    return page
+
+
 def _is_ig_audience_restricted_page(page) -> bool:
     """Detect IG age/audience restriction pages.
 
@@ -1980,13 +2171,287 @@ def _is_target_shortcode_context(page, target_shortcode: str) -> bool:
     return False
 
 
+
+def _wait_for_target_shortcode_context(page, target_shortcode: str, timeout_ms: int = 9000) -> bool:
+    """Wait until Instagram SPA/canonical state belongs to the requested shortcode.
+
+    Persistent Chrome profiles can keep old IG DOM/dialog nodes during navigation.
+    If collection starts while the old DOM is still visible, the first media can
+    be taken from the previous post even though the URL already changed.  This
+    helper waits for the target shortcode context before harvesting media.
+    """
+    if not target_shortcode:
+        return True
+    deadline = time.time() + max(0.5, timeout_ms / 1000.0)
+    while time.time() < deadline:
+        if _is_target_shortcode_context(page, target_shortcode):
+            return True
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            time.sleep(0.25)
+    return _is_target_shortcode_context(page, target_shortcode)
+
+
+def _goto_instagram_target_clean(page, target_url: str, target_shortcode: str = "", timeout: int = 60000):
+    """Hard-reset the visible tab before opening a new IG post/reel.
+
+    This is intentionally conservative: it does not change carousel collection,
+    order logic, WEBP conversion, move_files(), or download strategy.  It only
+    prevents stale DOM/network state from a previously opened post in the
+    persistent IG_Parser profile from being treated as the first slide of the
+    next task.
+    """
+    normalized = _normalize_ig_url(target_url)
+
+    try:
+        page.goto("about:blank", wait_until="domcontentloaded", timeout=15000)
+        page.wait_for_timeout(450)
+    except Exception:
+        pass
+
+    try:
+        page.evaluate("() => { try { performance.clearResourceTimings(); } catch(e){} }")
+    except Exception:
+        pass
+
+    page.goto(normalized, wait_until="domcontentloaded", timeout=timeout)
+    _wait_for_target_shortcode_context(page, target_shortcode, timeout_ms=12000)
+
+    try:
+        page.wait_for_selector("article, div[role='dialog']", timeout=12000)
+    except Exception:
+        pass
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=9000)
+    except Exception:
+        pass
+
+
+def _get_carousel_total_count(page) -> int:
+    """Detect carousel page count from dots/indicators near the main media.
+
+    This is intentionally advisory only.  It is used to stop repeated flipping
+    and to know whether network cache should fill 1 missing carousel item.
+    """
+    js = r"""
+    () => {
+      const scope = document.querySelector('div[role="dialog"]') || document.querySelector('article') || document;
+      const medias = Array.from(scope.querySelectorAll('img, video'))
+        .map(el => {
+          const r = el.getBoundingClientRect();
+          const st = getComputedStyle(el);
+          return {el, r, area: Math.max(0, r.width) * Math.max(0, r.height), visible: st.display !== 'none' && st.visibility !== 'hidden' && r.width > 120 && r.height > 120};
+        })
+        .filter(x => x.visible)
+        .sort((a,b) => b.area - a.area);
+      if (!medias.length) return 0;
+      const mr = medias[0].r;
+      const candidates = [];
+      const nodes = Array.from(document.querySelectorAll('div, span, button, svg, circle'));
+      for (const el of nodes) {
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        const w = r.width, h = r.height;
+        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') <= 0) continue;
+        if (w < 3 || h < 3 || w > 22 || h > 22) continue;
+        const cx = r.left + w / 2;
+        const cy = r.top + h / 2;
+        const nearX = cx >= mr.left + mr.width * 0.25 && cx <= mr.right - mr.width * 0.25;
+        const nearY = cy >= mr.bottom - 90 && cy <= mr.bottom + 35;
+        if (!nearX || !nearY) continue;
+        candidates.push({x: Math.round(cx), y: Math.round(cy), w, h});
+      }
+      candidates.sort((a,b) => a.x - b.x);
+      const grouped = [];
+      for (const c of candidates) {
+        if (!grouped.length || Math.abs(grouped[grouped.length - 1].x - c.x) > 7) grouped.push(c);
+      }
+      const n = grouped.length;
+      return (n >= 2 && n <= 20) ? n : 0;
+    }
+    """
+    try:
+        return int(page.evaluate(js) or 0)
+    except Exception:
+        return 0
+
+
+def _get_current_media_key(page) -> str:
+    try:
+        current = _get_current_slide_main_media(page)
+        if current:
+            return _media_key_from_url(current[0].get("src", ""))
+    except Exception:
+        pass
+    return ""
+
+
+def _click_prev_ig(page) -> bool:
+    selectors = [
+        'button[aria-label="Previous"]',
+        'button[aria-label="上一張"]',
+        'button[aria-label="上一則"]',
+        'button[aria-label="上一步"]',
+        'div[role="button"][aria-label="Previous"]',
+        'div[role="button"][aria-label="上一張"]',
+        'div[role="button"][aria-label="上一則"]',
+        'svg[aria-label="Previous"]',
+        'svg[aria-label="上一張"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                target = loc.first
+                try:
+                    target.click(timeout=1500)
+                except Exception:
+                    handle = target.element_handle()
+                    if handle:
+                        page.evaluate("(el) => el.closest('button, div[role=button]')?.click()", handle)
+                page.wait_for_timeout(1200)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _click_prev_ig_locked(page, target_shortcode: str) -> bool:
+    before_key = _get_current_media_key(page)
+    before_url = ""
+    try:
+        before_url = page.url or ""
+    except Exception:
+        pass
+    moved = _click_prev_ig(page)
+    if not moved:
+        return False
+    if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
+        logger.warning(
+            f"IG carousel prev guard: click left target={target_shortcode}; before={before_url}; after={getattr(page, 'url', '')}; stop"
+        )
+        return False
+    after_key = _get_current_media_key(page)
+    return bool(after_key and after_key != before_key)
+
+
+def _rewind_carousel_to_first(page, target_shortcode: str, max_steps: int = 8) -> int:
+    moved = 0
+    for _ in range(max_steps):
+        if not _click_prev_ig_locked(page, target_shortcode):
+            break
+        moved += 1
+    if moved:
+        logger.info(f"IG carousel rewind to first slide: moved_previous={moved}, target={target_shortcode}")
+    return moved
+
+
+def _click_next_ig_locked_keycheck(page, target_shortcode: str) -> bool:
+    before_key = _get_current_media_key(page)
+    before_url = ""
+    try:
+        before_url = page.url or ""
+    except Exception:
+        pass
+
+    moved = _click_next_ig(page)
+    if not moved:
+        try:
+            page.keyboard.press("ArrowRight")
+            page.wait_for_timeout(1200)
+            moved = True
+        except Exception:
+            moved = False
+
+    if not moved:
+        return False
+
+    if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
+        logger.warning(
+            f"IG carousel scope guard: next click left target={target_shortcode}; before={before_url}; after={getattr(page, 'url', '')}; stop collecting to avoid wrong post"
+        )
+        return False
+
+    after_key = _get_current_media_key(page)
+    if before_key and after_key and after_key == before_key:
+        return False
+    return True
+
+
+def _fill_filtered_from_network_cache(filtered, harvested_media, expected_count: int):
+    """Fill only from the *fresh* carousel-walk network cache.
+
+    The caller clears harvested_media immediately before walking the target
+    carousel.  Therefore this function must not be used with stale page-load
+    cache.  It also preserves already visible/DOM-collected media first and only
+    appends fresh network candidates until expected_count is reached.
+    """
+    if not expected_count or expected_count <= len(filtered):
+        return filtered
+
+    out = list(filtered)
+    seen = {_media_key_from_url(x.get("src", "")) for x in out}
+    appended = 0
+
+    for harvested in sorted(harvested_media.values(), key=lambda x: x.get("score", 0), reverse=True):
+        src = harvested.get("src", "")
+        if not _looks_like_real_ig_media_url(src):
+            continue
+
+        low = src.lower()
+        # Extra physical noise guard: do not allow profile pictures, icons, or
+        # tiny UI assets to fill carousel slots.
+        if any(k in low for k in [
+            "profile_pic", "s150x150", "s100x100", "s32x32", "s40x40",
+            "s50x50", "s64x64", "emoji", "sprite", "icon", "favicon",
+        ]):
+            continue
+
+        key = _media_key_from_url(src)
+        if key in seen:
+            continue
+
+        out.append({
+            "src": src,
+            "type": harvested.get("type", "image"),
+            "score": harvested.get("score", 0),
+            "from": "network-fill-scoped",
+        })
+        seen.add(key)
+        appended += 1
+
+        if len(out) >= expected_count:
+            break
+
+    if appended:
+        logger.info(
+            f"IG carousel scoped network fill appended={appended}, "
+            f"expected={expected_count}, final={len(out)}"
+        )
+
+    return _dedupe_media(out, preserve_order=True)[:expected_count]
+
+
 def _collect_visible_target_media(page, target_shortcode: str, include_meta: bool = True):
     """Collect only the visible post/reel media, never profile-grid media.
 
-    Based on the older working carousel flow, but every round is guarded by the
-    requested shortcode.  This preserves the working flip behavior while avoiding
-    the regression where a /p/ task navigates into another post or profile grid.
+    This keeps the older working carousel selector flow, but:
+    - rewinds to the first slide when possible,
+    - detects carousel total count from dots,
+    - advances only up to the detected total to avoid repeated flipping,
+    - verifies the page is still scoped to target_shortcode after every move.
+
+    Important:
+    The detected total count is stored for the caller.  Instagram may move or
+    hide the dot indicators after carousel navigation, so calling the detector
+    again after collection can return 0 and accidentally skip network fill.
     """
+    global _LAST_CAROUSEL_EXPECTED_COUNT, _LAST_CAROUSEL_TARGET
+    _LAST_CAROUSEL_EXPECTED_COUNT = 0
+    _LAST_CAROUSEL_TARGET = target_shortcode or ""
+
     if not _is_target_shortcode_context(page, target_shortcode):
         try:
             logger.warning(
@@ -1997,10 +2462,18 @@ def _collect_visible_target_media(page, target_shortcode: str, include_meta: boo
             pass
         return []
 
+    expected_count = _get_carousel_total_count(page)
+    if expected_count:
+        _LAST_CAROUSEL_EXPECTED_COUNT = expected_count
+        _LAST_CAROUSEL_TARGET = target_shortcode or ""
+        logger.info(f"IG carousel detected total_count={expected_count}, target={target_shortcode}")
+        _rewind_carousel_to_first(page, target_shortcode, max_steps=min(expected_count + 2, 12))
+
+    max_rounds = expected_count if expected_count and expected_count <= _MAX_CAROUSEL_ITEMS else _MAX_CAROUSEL_ITEMS
     collected = []
     seen_media_keys = set()
 
-    for round_index in range(_MAX_CAROUSEL_ITEMS):
+    for round_index in range(max_rounds):
         if not _is_target_shortcode_context(page, target_shortcode):
             try:
                 logger.warning(
@@ -2025,12 +2498,25 @@ def _collect_visible_target_media(page, target_shortcode: str, include_meta: boo
             seen_media_keys.add(key)
             collected.append(item)
 
+        if expected_count and len(collected) >= expected_count:
+            break
+
+        # Preserve the older working carousel selector flow from instagram_git.py.
+        # The stricter key-check variant can stop early on IG desktop because the
+        # current visible key may be recycled while the next slide is still loading.
+        # _click_next_ig_locked() still guards target_shortcode after every click,
+        # so it keeps the task locked to this post without blocking valid carousel
+        # navigation.
         moved = _click_next_ig_locked(page, target_shortcode)
         if not moved:
             break
 
-    return _dedupe_media(collected)
+    if expected_count and len(collected) < expected_count:
+        logger.info(
+            f"IG carousel visible collected below expected: visible={len(collected)}, expected={expected_count}, target={target_shortcode}"
+        )
 
+    return _dedupe_media(collected, preserve_order=True)
 
 def _collect_limited_target_fallback_media(page, harvested_media, target_shortcode: str, allow_broad_fallback: bool = False):
     """Fallback media collection that is safe for single post/reel tasks.
@@ -2067,7 +2553,7 @@ def _collect_limited_target_fallback_media(page, harvested_media, target_shortco
     return _dedupe_media(items)[:3]
 
 
-def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
+def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", use_fresh_tab: bool = True):
     """Fallback using the project-local logged-in Chrome profile.
 
     This version is strictly shortcode-scoped.  It never scans or finalizes media
@@ -2116,7 +2602,14 @@ def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
             pass
 
         harvested_media = {}
-        page = _get_persistent_context_page(context) if '_get_persistent_context_page' in globals() else context.pages[0] if context.pages else context.new_page()
+        if use_fresh_tab:
+            # v8 strategy: fresh tab prevents long-carousel stale DOM/profile pollution.
+            page = _get_fresh_persistent_target_page(context)
+        else:
+            # v7 strategy: reuse cleaned persistent page; this is safer for short
+            # carousel posts whose first slide can be polluted by Chrome restored
+            # tabs when opening a brand-new page too early.
+            page = _get_persistent_context_page(context)
         page.on("response", lambda response: _capture_playwright_response(response, harvested_media))
 
         try:
@@ -2125,7 +2618,7 @@ def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
             pass
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            _goto_instagram_target_clean(page, url, target_shortcode=shortcode, timeout=60000)
         except PlaywrightTimeoutError:
             logger.warning("IG persistent profile goto 超時，改用目前頁面")
         except Exception as e:
@@ -2160,8 +2653,63 @@ def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
 
         title = _get_ig_title(page, fallback_shortcode=shortcode or "Instagram_Post")
 
+        # Critical scope fix:
+        # The initial page load can fetch comments, avatars, recommendation posts,
+        # restored tabs, or previous-profile resources in the persistent Chrome
+        # profile.  Those responses are not guaranteed to belong to this shortcode.
+        # Clear the harvested cache immediately before the controlled carousel walk;
+        # after this point, network-fill can only use media triggered by this
+        # target-post collection pass instead of stale/broad page-load noise.
+        preload_harvest_count = len(harvested_media)
+        if preload_harvest_count:
+            logger.info(
+                f"IG 清除 persistent profile 預載 network cache：preload={preload_harvest_count}, "
+                f"target={shortcode}，避免用推薦貼文/舊快取補圖"
+            )
+            harvested_media.clear()
+
         visible_media = _collect_visible_target_media(page, shortcode)
-        filtered = _dedupe_media(visible_media)
+        filtered = _dedupe_media(visible_media, preserve_order=True)
+
+        # Use the count detected before/while flipping.  Re-detecting after
+        # carousel navigation can return 0 on IG desktop, which caused 10-slide
+        # posts to be marked SUCCESS after only the 4 visible slides.
+        expected_count = 0
+        if _LAST_CAROUSEL_TARGET == shortcode:
+            expected_count = _LAST_CAROUSEL_EXPECTED_COUNT or 0
+        if not expected_count:
+            expected_count = _get_carousel_total_count(page)
+
+        # A/B hybrid guard:
+        # - v8 fresh tab is required for long carousel posts (ex: DYGxXdEiZkt, 10 slides).
+        # - v7 cleaned persistent page is more stable for short carousel posts
+        #   (ex: DZNGYtXDQHk, 3 slides) because IG/Chrome can briefly expose
+        #   restored/recommended media in a new tab before the real first slide settles.
+        # Do the strategy switch before writing/downloading anything, so no wrong
+        # files are moved and all existing WEBP/magic-bytes/move_files logic stays unchanged.
+        if use_fresh_tab and expected_count and expected_count <= 3:
+            logger.info(
+                f"IG carousel short-post strategy switch: expected={expected_count}, "
+                f"target={shortcode}; retry collect with v7 clean persistent page before writing files"
+            )
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            return _collect_ig_media_playwright_persistent_impl(
+                p,
+                url,
+                reason=(reason or "") + " | short-carousel-v7-clean-page",
+                use_fresh_tab=False,
+            )
+
+        if expected_count and len(filtered) < expected_count:
+            before_fill = len(filtered)
+            filtered = _fill_filtered_from_network_cache(filtered, harvested_media, expected_count)
+            logger.info(
+                f"IG carousel network fill: expected={expected_count}, before={before_fill}, after={len(filtered)}, target={shortcode}"
+            )
 
         # Only when visible DOM has no media do we use a very limited fallback.
         # Never append broad performance/html/network data after visible media,
@@ -2179,6 +2727,12 @@ def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
             f"visible={len(visible_media)}, network harvest={len(harvested_media)}, target={shortcode}"
         )
 
+        if expected_count and filtered and len(filtered) < expected_count:
+            logger.warning(
+                f"IG carousel incomplete after scoped collection/network fill: expected={expected_count}, got={len(filtered)}, target={shortcode}; mark RETRY instead of false SUCCESS"
+            )
+            return "RETRY", f"IG carousel incomplete: expected {expected_count}, got {len(filtered)}"
+
         if not filtered:
             _manual_wait_persistent_profile(page, reason="persistent scoped media count=0")
             if not _is_target_shortcode_context(page, shortcode):
@@ -2186,7 +2740,20 @@ def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
                     f"二次掃描時頁面已離開目標貼文 {shortcode}；為避免誤抓整個帳號，已停止。"
                 )
             visible_media = _collect_visible_target_media(page, shortcode)
-            filtered = _dedupe_media(visible_media)
+            filtered = _dedupe_media(visible_media, preserve_order=True)
+
+            expected_count = 0
+            if _LAST_CAROUSEL_TARGET == shortcode:
+                expected_count = _LAST_CAROUSEL_EXPECTED_COUNT or 0
+            if not expected_count:
+                expected_count = _get_carousel_total_count(page)
+
+            if expected_count and len(filtered) < expected_count:
+                before_fill = len(filtered)
+                filtered = _fill_filtered_from_network_cache(filtered, harvested_media, expected_count)
+                logger.info(
+                    f"IG carousel second-pass network fill: expected={expected_count}, before={before_fill}, after={len(filtered)}, target={shortcode}"
+                )
             if not filtered:
                 filtered = _collect_limited_target_fallback_media(
                     page,
@@ -2198,6 +2765,12 @@ def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
                 f"IG persistent profile second-pass scoped media count={len(filtered)}; "
                 f"visible={len(visible_media)}, network harvest={len(harvested_media)}, target={shortcode}"
             )
+
+        if expected_count and filtered and len(filtered) < expected_count:
+            logger.warning(
+                f"IG carousel incomplete after second pass: expected={expected_count}, got={len(filtered)}, target={shortcode}; mark RETRY instead of false SUCCESS"
+            )
+            return "RETRY", f"IG carousel incomplete: expected {expected_count}, got {len(filtered)}"
 
         if not filtered:
             return "RETRY", "已登入 IG_Parser Profile 但仍未抓到目標貼文媒體；請確認專用 Profile 已完成年齡/帳號驗證後重試"
@@ -2232,6 +2805,49 @@ def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
                 context.close()
         except Exception:
             pass
+
+
+def _should_use_v7_clean_persistent_page_for_url(url: str) -> bool:
+    """Choose the known-good persistent-page path before opening Chrome.
+
+    Regression guard from A/B testing:
+    - v7 clean persistent page downloads IG post URLs containing img_index=...
+      correctly, especially short restricted carousel posts.
+    - v8 fresh tab downloads long restricted carousel posts correctly.
+
+    The previous v10 detected the short-carousel count *after* opening a fresh
+    tab, then switched to v7.  That was too late for some restricted posts
+    because the fresh tab could already expose restored/recommended media and
+    pollute the first collected slide.  This pre-routing keeps the already-fixed
+    v7/v8 behavior without touching carousel collection, ordering, WEBP/JPEG
+    conversion, network fill, or move_files().
+    """
+    low = (url or "").lower()
+    return "img_index=" in low
+
+
+def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
+    """Hybrid persistent IG fallback.
+
+    Keep the two known-good paths from the user's A/B test:
+    - img_index carousel URLs use v7 clean persistent page from the start.
+    - other posts use v8 fresh tab.
+
+    Do not start with v8 and switch later for img_index posts; that can already
+    introduce first-slide pollution before the v7 retry begins.
+    """
+    use_v7_clean = _should_use_v7_clean_persistent_page_for_url(url)
+    if use_v7_clean:
+        logger.info(
+            "IG strategy pre-route: img_index URL detected; "
+            "use v7 clean persistent page from start to avoid first-slide pollution"
+        )
+    return _collect_ig_media_playwright_persistent_impl(
+        p,
+        url,
+        reason=reason,
+        use_fresh_tab=not use_v7_clean,
+    )
 
 
 def _collect_ig_media_playwright(url: str):
@@ -2287,9 +2903,10 @@ def _collect_ig_media_playwright(url: str):
             page.on("response", lambda response: _capture_playwright_response(response, harvested_media))
 
             try:
-                page.goto(
+                _goto_instagram_target_clean(
+                    page,
                     url,
-                    wait_until="domcontentloaded",
+                    target_shortcode=shortcode,
                     timeout=45000,
                 )
 

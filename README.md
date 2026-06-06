@@ -13,6 +13,9 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 支援批次 URL 匯入與預處理分類
 - 支援 GUI 拖放 `.txt` 檔案
 - 支援 cookies.txt 登入狀態，提高 IG / FB 下載成功率
+- 支援 IG_Parser 專用 Chrome Profile，處理年齡 / 特定對象限制貼文
+- 支援 Instagram 受限 Carousel 的 post 鎖定、完整數量檢查、順序保留與防推薦貼文污染
+- 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
 - 支援自動簡體轉繁體
 - 支援安全檔名與資料夾命名
 - 支援已下載 checkpoint，避免重複下載
@@ -41,6 +44,7 @@ media-batch-downloader/
 │  │  ├─ instagram.py
 │  │  └─ facebook.py
 │  ├─ data/
+│  │  ├─ chrome_ig_parser/      # IG_Parser 專用 Chrome Profile，用於受限貼文 fallback
 │  │  ├─ processed_links.log
 │  │  ├─ failed_links.log
 │  │  ├─ retry_needed.txt
@@ -161,6 +165,46 @@ Instaloader
 ### Reel / 影片
 
 對 `/reel/` 或 `/reels/`，仍優先使用 yt-dlp，失敗後再由 Playwright fallback。
+
+### IG_Parser 專用 Chrome Profile 與受限貼文
+
+當 Instagram 貼文出現年齡限制、特定對象限制，或 `Instaloader` / `yt-dlp` 回傳 `empty media response` 時，下載器會啟用專案內建的 IG_Parser 專用 Chrome Profile：
+
+```text
+downloader_GUI/data/chrome_ig_parser
+```
+
+設計原則：
+
+- 不使用日常 Chrome `Default` Profile，避免與平常瀏覽器搶鎖或造成空白視窗
+- 保留登入狀態、年齡確認與裝置信任狀態
+- 每筆任務仍會鎖定原始 shortcode，避免跳到推薦貼文、帳號頁或其他 post
+- Carousel 會偵測 `total_count`，缺圖不會假成功，會回 `RETRY`
+- 若網址包含 `img_index=`，會優先走已驗證穩定的 clean persistent page 路徑
+- 其他受限長 Carousel 會走 fresh tab 路徑，避免舊 DOM / 舊 dialog 污染
+- 掃描前會清除 persistent profile 的預載 network cache，避免推薦貼文或上一筆任務圖片混入
+- 下載時會保留 Carousel 翻頁順序，避免依圖片品質分數重新排序
+
+若第一次使用 IG_Parser，請先在 GUI 使用初始化 / 開啟 IG_Parser Profile 功能，登入 Instagram 並完成必要的年齡或帳號確認。完成後即可回到下載器批次執行。
+
+### IG 媒體格式與 WEBP 處理
+
+Instagram 可能回傳 WEBP bytes，但 URL 或暫存檔名看起來像 `.jpg`。新版會以檔頭 magic bytes 判斷真實格式：
+
+| 格式 | 判斷方式 |
+|---|---|
+| JPEG | `FF D8 FF` |
+| WEBP | `RIFF ... WEBP` |
+| PNG | PNG header |
+| MP4 | `ftyp` |
+
+處理規則：
+
+- 若回傳 WEBP 且已安裝 Pillow，會轉成真正 JPEG
+- 若未安裝 Pillow，會保留 `.webp` 真實副檔名
+- 不再把 WEBP bytes 假裝命名成 `.jpg`
+- `move_files()` 搬移前會再次檢查真實檔案格式
+- 多檔搬移會使用自然排序，避免 `ig_10` 排在 `ig_2` 前面
 
 ### Instagram 狀態分類
 
@@ -354,6 +398,10 @@ network harvest=
 IG 使用 browser network cache 寫入
 IG Playwright 已成功寫入
 IG 清理暫存 post/
+IG strategy pre-route: img_index URL detected
+IG 清除 persistent profile 預載 network cache
+IG carousel detected total_count=
+IG carousel network fill:
 ```
 
 若看到：
@@ -437,6 +485,24 @@ python main.py
 ---
 
 ## 版本紀錄
+
+### v11.26 IG Restricted Carousel Lock
+
+- 修正 Instagram 年齡 / 特定對象限制貼文的 Carousel fallback
+- 新增 IG_Parser 專用 Chrome Profile 路徑策略，避免與日常 Chrome profile 搶鎖
+- 保留 v7 / v8 A/B 測試後的穩定路徑：
+  - `img_index=` 圖文貼文預先走 v7 clean persistent page
+  - 其他受限長 Carousel 走 v8 fresh tab
+- 修正受限 Carousel 第一張被上一筆任務、推薦貼文或舊 dialog 污染
+- 修正 3 張 Carousel 頭尾漏檔問題
+- 修正 10 張 Carousel 只抓 4 張卻誤判 SUCCESS 問題
+- 修正 Carousel 順序被圖片品質分數排序打亂問題
+- 新增 `total_count` 檢查，若 expected / got 不一致則回 `RETRY`，不假成功
+- 新增 scoped network fill，只用目標 post 翻頁期間的新鮮快取補圖
+- 新增 WEBP / JPEG / PNG / MP4 檔頭判斷
+- WEBP 內容預設轉成真正 JPEG；沒有 Pillow 時保留 `.webp`
+- `move_files()` 搬移前再次檢查真實副檔名
+- 多檔搬移改自然排序，避免 `ig_10` 排在 `ig_2` 前面
 
 ### v11.25 Stable Cleanup
 
