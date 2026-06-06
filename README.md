@@ -300,7 +300,7 @@ python main.py
 若你有大量原始文字或混合連結，可以先放進：
 
 ```text
-pre-processing/20260420.txt
+EX: pre-processing/xxx.txt
 ```
 
 然後在 GUI 按：
