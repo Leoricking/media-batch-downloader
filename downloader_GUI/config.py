@@ -67,6 +67,16 @@ DOWNLOAD_DIR = os.path.join(_RT, "downloads")
 TEMP_DIR = os.path.join(_RT, "temp_insta_dl")
 DATA_DIR = os.path.join(_RT, "data")
 
+# Parser dedicated persistent browser profiles.
+# These are the preferred login/trust-state storage locations for Playwright / Chrome fallback.
+# cookies.txt is kept only as a legacy emergency fallback.
+IG_PARSER_PROFILE_DIR = os.path.join(DATA_DIR, "chrome_ig_parser")
+FB_PARSER_PROFILE_DIR = os.path.join(DATA_DIR, "playwright_fb_profile")
+
+# Backward-compatible aliases used by older downloader modules / environment overrides.
+IG_CHROME_USER_DATA_DIR = IG_PARSER_PROFILE_DIR
+FB_CHROME_USER_DATA_DIR = FB_PARSER_PROFILE_DIR
+
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "processed_links.log")
 FAILED_LOG_FILE = os.path.join(DATA_DIR, "failed_links.log")
 RETRY_NEEDED_FILE = os.path.join(DATA_DIR, "retry_needed.txt")

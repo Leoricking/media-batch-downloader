@@ -1,4 +1,4 @@
-# 🚀 Media Batch Downloader
+﻿# 🚀 Media Batch Downloader
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。它支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、失敗清單整理，以及 Instagram / Facebook 的多引擎下載 fallback。
 
@@ -12,8 +12,10 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 支援 `facebook.com/share/...`、`facebook.com/share/r/...`、`fb.watch/...` 等分享格式
 - 支援批次 URL 匯入與預處理分類
 - 支援 GUI 拖放 `.txt` 檔案
-- 支援 cookies.txt 登入狀態，提高 IG / FB 下載成功率
-- 支援 IG_Parser 專用 Chrome Profile，處理年齡 / 特定對象限制貼文
+- 支援 IG Parser / FB Parser 專用 Chrome Profile 登入模式，不再需要手動匯出 cookies.txt
+- 保留 cookies.txt 作為 legacy / emergency fallback
+- 支援 IG Parser 專用 Chrome Profile，處理年齡 / 特定對象限制貼文
+- 支援 FB Parser 專用 Chrome Profile，處理 Facebook 登入、2FA、相簿與 Reel fallback
 - 支援 Instagram 受限 Carousel 的 post 鎖定、完整數量檢查、順序保留與防推薦貼文污染
 - 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
 - 支援自動簡體轉繁體
@@ -44,7 +46,8 @@ media-batch-downloader/
 │  │  ├─ instagram.py
 │  │  └─ facebook.py
 │  ├─ data/
-│  │  ├─ chrome_ig_parser/      # IG_Parser 專用 Chrome Profile，用於受限貼文 fallback
+│  │  ├─ chrome_ig_parser/      # IG Parser 專用 Chrome Profile，用於 IG 登入 / 受限貼文 fallback
+│  │  ├─ playwright_fb_profile/ # FB Parser 專用 Chrome Profile，用於 FB 登入 / 相簿 / Reel fallback
 │  │  ├─ processed_links.log
 │  │  ├─ failed_links.log
 │  │  ├─ retry_needed.txt
@@ -121,22 +124,64 @@ release/MediaBatchDownloader.exe
 
 ---
 
-## cookies.txt 說明
+## IG Parser / FB Parser 專用登入模式（推薦）
 
-`cookies.txt` 是 Instagram / Facebook 的登入 cookie，建議使用瀏覽器外掛匯出 Netscape 格式 cookie 後放在 `downloader_GUI/cookies.txt`。
+新版推薦使用 GUI 內建的專用 Chrome Persistent Profile，不再需要手動匯出 cookies.txt。
+
+### IG Parser 第一次登入
+
+1. 在 GUI 點「🌐 IG Parser 登入/初始化」。
+2. 下載器會開啟專案專用 Chrome Profile：
+
+```text
+downloader_GUI/data/chrome_ig_parser
+```
+
+3. 在該 Chrome 視窗登入 Instagram。
+4. 完成 2FA、裝置驗證、記住這台設備。
+5. 若有年齡限制、特定對象限制貼文，請在該視窗手動打開並完成確認。
+6. 完成後關閉 Chrome 視窗，回到下載器繼續下載。
+
+之後 IG Playwright fallback 會優先使用這個 Profile 的登入 / 年齡確認 / trust state。
+
+### FB Parser 第一次登入
+
+1. 在 GUI 點「🌐 FB Parser 登入/初始化」。
+2. 下載器會開啟專案專用 Chrome Profile：
+
+```text
+downloader_GUI/data/playwright_fb_profile
+```
+
+3. 在該 Chrome 視窗登入 Facebook。
+4. 完成 2FA、保持登入、信任此裝置。
+5. 建議打開一個需要下載的貼文、相簿或 Reel，確認瀏覽器可以正常觀看。
+6. 完成後關閉 Chrome 視窗，回到下載器繼續下載。
+
+之後 Facebook Playwright fallback 會優先使用這個 Profile，不再依賴手動匯出的 FB cookies。
+
+注意：
+
+- 下載時請先關閉手動登入用的 IG Parser / FB Parser Chrome 視窗，避免 Chrome profile lock。
+- IG Parser 與 FB Parser 是專案內的獨立 Profile，不會使用你日常 Chrome Default Profile。
+- 不要把 `data/chrome_ig_parser/`、`data/playwright_fb_profile/`、`cookies.txt`、`accounts.json` 提交到 Git。
+
+---
+
+## cookies.txt 說明（Legacy / Emergency Fallback）
+
+`cookies.txt` 仍支援，但新版不再把它當主要登入方式。它只保留給 Instaloader / yt-dlp 或特殊情況作為備援。
 
 用途：
 
-- 提高可下載成功率
-- 減少 IG / FB 2FA 與登入流程不穩定問題
-- 讓 Playwright / Instaloader / yt-dlp 共享登入狀態
+- 作為 IG / FB parser profile 失效時的 emergency fallback
+- 讓 Instaloader / yt-dlp 在部分情境下可讀取舊式 Netscape cookie
 
 注意：
 
 - 同一份 `cookies.txt` 可同時包含 `.instagram.com` 與 `.facebook.com`
-- 請使用你平常能正常瀏覽 IG / FB 的同一個帳號匯出 cookies
-- 若瀏覽器看得到，但程式抓不到，請優先更新 cookies.txt
-- 請勿將 `cookies.txt` 或 `accounts.json` 提交到 Git
+- 若瀏覽器看得到但程式抓不到，優先重新初始化 IG Parser / FB Parser Profile，而不是先更新 cookies.txt
+- 請勿將 `cookies.txt`、`accounts.json` 或任何登入 Profile 目錄提交到 Git
 
 ---
 
@@ -166,9 +211,9 @@ Instaloader
 
 對 `/reel/` 或 `/reels/`，仍優先使用 yt-dlp，失敗後再由 Playwright fallback。
 
-### IG_Parser 專用 Chrome Profile 與受限貼文
+### IG Parser 專用 Chrome Profile 與受限貼文
 
-當 Instagram 貼文出現年齡限制、特定對象限制，或 `Instaloader` / `yt-dlp` 回傳 `empty media response` 時，下載器會啟用專案內建的 IG_Parser 專用 Chrome Profile：
+當 Instagram 貼文出現年齡限制、特定對象限制，或 `Instaloader` / `yt-dlp` 回傳 `empty media response` 時，下載器會啟用專案內建的 IG Parser 專用 Chrome Profile：
 
 ```text
 downloader_GUI/data/chrome_ig_parser
@@ -185,7 +230,7 @@ downloader_GUI/data/chrome_ig_parser
 - 掃描前會清除 persistent profile 的預載 network cache，避免推薦貼文或上一筆任務圖片混入
 - 下載時會保留 Carousel 翻頁順序，避免依圖片品質分數重新排序
 
-若第一次使用 IG_Parser，請先在 GUI 使用初始化 / 開啟 IG_Parser Profile 功能，登入 Instagram 並完成必要的年齡或帳號確認。完成後即可回到下載器批次執行。
+若第一次使用 IG Parser，請先在 GUI 點「🌐 IG Parser 登入/初始化」，登入 Instagram 並完成必要的年齡或帳號確認。完成後即可回到下載器批次執行，不需要手動匯出 cookies.txt。
 
 ### IG 媒體格式與 WEBP 處理
 
@@ -245,6 +290,18 @@ Facebook 下載器針對多圖、Reel、Viewer 模式做了防污染保護。
 - `facebook.com/story.php...`
 - `fb.watch/...`
 
+### FB Parser 專用 Chrome Profile
+
+Facebook Playwright fallback 會優先使用：
+
+```text
+downloader_GUI/data/playwright_fb_profile
+```
+
+這個 Profile 會保留 Facebook 登入、雙重驗證、保持登入與信任裝置狀態。第一次使用請先在 GUI 點「🌐 FB Parser 登入/初始化」完成登入。完成後，FB 一般貼文、多圖相簿、大相簿、share/r 與 Reel fallback 都會使用此 Profile。
+
+`cookies.txt` 只保留為 legacy / emergency fallback，不再是主要推薦流程。
+
 ### 多圖貼文保護
 
 Facebook 多圖貼文會使用 Playwright viewer-intercept 收集候選媒體，並比對原生 Grid / Photo link 數量。
@@ -276,6 +333,8 @@ python main.py
    - 「🔁 重試失敗」
    - 「📄 查看失敗」
    - 「🚫 複製 BLOCKED」
+   - 「🌐 IG Parser 登入/初始化」
+   - 「🌐 FB Parser 登入/初始化」
 5. 任務完成後會跳出下載結果摘要視窗。
 
 ### 下載完成通知
@@ -486,10 +545,21 @@ python main.py
 
 ## 版本紀錄
 
+### v11.27 Parser Login Profiles
+
+- 新增 IG Parser / FB Parser 專用 Chrome Persistent Profile 登入模式
+- GUI 新增「🌐 FB Parser 登入/初始化」
+- GUI 將 IG Parser 改為「🌐 IG Parser 登入/初始化」
+- FB Playwright fallback 優先使用 `data/playwright_fb_profile`
+- IG Playwright fallback 繼續使用 `data/chrome_ig_parser`
+- `cookies.txt` 改為 legacy / emergency fallback，不再是主要推薦流程
+- 保留 v11.26 IG restricted Carousel routing、total_count、scoped network fill、WEBP/JPEG 檔頭檢查
+- 保留 Facebook 貼文、多圖相簿、大相簿、share/r、Reel fallback 與完整性檢查
+
 ### v11.26 IG Restricted Carousel Lock
 
 - 修正 Instagram 年齡 / 特定對象限制貼文的 Carousel fallback
-- 新增 IG_Parser 專用 Chrome Profile 路徑策略，避免與日常 Chrome profile 搶鎖
+- 新增 IG Parser 專用 Chrome Profile 路徑策略，避免與日常 Chrome profile 搶鎖
 - 保留 v7 / v8 A/B 測試後的穩定路徑：
   - `img_index=` 圖文貼文預先走 v7 clean persistent page
   - 其他受限長 Carousel 走 v8 fresh tab
@@ -543,3 +613,4 @@ build.bat
 ```text
 release/MediaBatchDownloader.exe
 ```
+

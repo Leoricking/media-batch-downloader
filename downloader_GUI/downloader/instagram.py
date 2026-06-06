@@ -14,6 +14,11 @@ import yt_dlp
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from config import DOWNLOAD_DIR, TEMP_DIR, DATA_DIR, COOKIES_FILE
+
+try:
+    from config import IG_PARSER_PROFILE_DIR
+except Exception:
+    IG_PARSER_PROFILE_DIR = os.path.join(DATA_DIR, "chrome_ig_parser")
 from utils.filename import safe_title
 from utils.logger import get_logger
 
@@ -1700,7 +1705,7 @@ def _get_project_ig_parser_profile_root() -> str:
         os.makedirs(configured, exist_ok=True)
         return configured
 
-    root = os.path.join(DATA_DIR, "chrome_ig_parser")
+    root = str(IG_PARSER_PROFILE_DIR or os.path.join(DATA_DIR, "chrome_ig_parser"))
     os.makedirs(root, exist_ok=True)
     return root
 
@@ -1762,8 +1767,10 @@ def _resolve_chrome_profile_directory() -> str:
 def open_ig_parser_profile(start_url: str = "https://www.instagram.com/") -> str:
     """Open the project-local IG_Parser Chrome profile for one-time login/trust setup.
 
-    Called by the GUI button.  This replaces setup_ig_parser_profile.bat and keeps
-    the workflow inside the app.
+    This is the preferred login workflow. The profile keeps Instagram login, 2FA,
+    trust-device and age/audience confirmation state so normal downloads do not
+    require manually exported cookies.txt. cookies.txt remains only as a legacy
+    emergency fallback for Instaloader / yt-dlp compatibility.
     """
     user_data_dir = _get_project_ig_parser_profile_root()
     profile_dir = _resolve_chrome_profile_directory()

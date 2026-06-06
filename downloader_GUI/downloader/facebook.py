@@ -4,6 +4,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import threading
 from urllib.parse import urlparse, unquote, parse_qs, urlencode
 
@@ -12,6 +13,12 @@ import yt_dlp
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from config import DOWNLOAD_DIR, TEMP_DIR, COOKIES_FILE
+
+try:
+    from config import FB_PARSER_PROFILE_DIR
+except Exception:
+    from config import DATA_DIR
+    FB_PARSER_PROFILE_DIR = os.path.join(DATA_DIR, "playwright_fb_profile")
 
 try:
     from config import FB_HEADLESS
@@ -232,6 +239,88 @@ def _resolve_share_url(url: str):
         pass
 
     return url
+
+
+def _get_fb_parser_profile_root() -> str:
+    """Project-local dedicated Chrome user-data directory for FB_Parser.
+
+    This is the preferred Facebook login / trust-state storage. It replaces the
+    old workflow that required exporting cookies.txt. cookies.txt is still used
+    only as a legacy emergency fallback for yt-dlp or when the profile has not
+    been initialized yet.
+    """
+    configured = (
+        os.environ.get("FB_CHROME_USER_DATA_DIR")
+        or str(FB_PARSER_PROFILE_DIR or "")
+        or ""
+    )
+    configured = configured.strip().strip('"')
+    if configured:
+        os.makedirs(configured, exist_ok=True)
+        return configured
+
+    root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "playwright_fb_profile")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _resolve_fb_chrome_profile_directory() -> str:
+    configured = os.environ.get("FB_CHROME_PROFILE_DIRECTORY") or "Default"
+    configured = str(configured).strip().strip('"')
+    return configured or "Default"
+
+
+def open_fb_parser_profile(start_url: str = "https://www.facebook.com/") -> str:
+    """Open the project-local FB_Parser Chrome profile for one-time login/trust setup."""
+    user_data_dir = _get_fb_parser_profile_root()
+    profile_dir = _resolve_fb_chrome_profile_directory()
+
+    chrome = (
+        shutil.which("chrome")
+        or shutil.which("chrome.exe")
+        or os.path.join(os.environ.get("PROGRAMFILES", ""), "Google", "Chrome", "Application", "chrome.exe")
+        or os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Google", "Chrome", "Application", "chrome.exe")
+    )
+
+    if not chrome or not os.path.exists(chrome):
+        raise Exception("找不到 Google Chrome；請先安裝 Chrome，或把 chrome.exe 加入 PATH。")
+
+    args = [
+        chrome,
+        f"--user-data-dir={user_data_dir}",
+        f"--profile-directory={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        start_url or "https://www.facebook.com/",
+    ]
+
+    subprocess.Popen(args)
+    return user_data_dir
+
+
+def _get_fresh_fb_profile_page(context):
+    """Open one fresh task tab while keeping FB_Parser cookies/session state."""
+    try:
+        old_pages = list(context.pages)
+    except Exception:
+        old_pages = []
+
+    page = context.new_page()
+
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+
+    for old in old_pages:
+        try:
+            if old != page:
+                old.close()
+        except Exception:
+            pass
+
+    return page
 
 
 def _load_netscape_cookies(path: str, domain_keyword: str):
@@ -3927,39 +4016,53 @@ def _collect_fb_media_playwright(url: str):
         network_items = []
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=FB_HEADLESS,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                ],
+            user_data_dir = _get_fb_parser_profile_root()
+            profile_dir = _resolve_fb_chrome_profile_directory()
+            logger.info(
+                f"FB 啟用 FB_Parser persistent profile: user_data_dir={user_data_dir}, "
+                f"profile={profile_dir}, cookies.txt=legacy-fallback"
             )
 
-            context = browser.new_context(
-                viewport={
-                    "width": 1920,
-                    "height": 1200,
-                },
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel="chrome",
+                headless=FB_HEADLESS,
+                no_viewport=True,
+                locale="zh-TW",
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/123.0.0.0 Safari/537.36"
                 ),
-                locale="zh-TW",
+                args=[
+                    f"--profile-directory={profile_dir}",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--start-maximized",
+                ],
             )
 
+            try:
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            except Exception:
+                pass
+
+            # Legacy emergency fallback only: if a cookies.txt exists, merge it into
+            # the persistent profile context without making cookies.txt the primary workflow.
             cookies = _load_netscape_cookies(COOKIES_FILE, "facebook.com")
 
             if cookies:
                 try:
                     context.add_cookies(cookies)
-                    logger.info(f"已從 cookies.txt 載入 FB cookies 到 Playwright: {len(cookies)}")
+                    logger.info(f"已從 cookies.txt 載入 FB cookies 到 Playwright 備援 context: {len(cookies)}")
 
                 except Exception as e:
-                    logger.warning(f"FB add_cookies 失敗: {e}")
+                    logger.warning(f"FB add_cookies 備援失敗: {e}")
 
-            page = context.new_page()
+            page = _get_fresh_fb_profile_page(context)
 
             def on_response(resp):
                 try:
