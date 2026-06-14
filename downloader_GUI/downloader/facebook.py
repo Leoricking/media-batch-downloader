@@ -52,7 +52,7 @@ try:
 except Exception:
     load_netscape_cookies_to_playwright = None
 
-# v11.35 FB Reel Caption Filename: v11.23.2 Full Build + Reel visible-caption filename resolution
+# v11.23.2 Full Build: v11.22.1 Fast Retry Guard + Grid Tile Mode + Strict no-video fallback for incomplete galleries
 
 _cc = OpenCC("s2t") if OpenCC else None
 
@@ -109,17 +109,10 @@ def _clear_temp_after_terminal_failure(status: str, reason: str = ""):
 
 
 def _is_fb_reel_url(url: str) -> bool:
-    """Detect Facebook Reel / short-video share URLs without affecting normal /share/ photo posts.
-
-    v11.35:
-    - Treat /share/v/<id>/ as a video-like Facebook Reel/share-video route.
-    - This lets the Playwright Reel branch resolve the visible caption and use it as
-      the output filename instead of falling back to Facebook_Reel_<id>.
-    """
+    """Detect Facebook Reel / short-video share URLs without affecting normal /share/ photo posts."""
     low = (url or "").lower()
     return any(x in low for x in [
         "/share/r/",
-        "/share/v/",
         "/reel/",
         "/reels/",
         "/watch/reel/",
@@ -163,210 +156,6 @@ def _fb_reel_fallback_title(url: str) -> str:
 def _is_fallback_fb_title(title: str) -> bool:
     clean = _clean_fb_post_title_for_path(title or "", fallback="Facebook_Post")
     return clean in {"Facebook_Post", "Facebook", "Facebook_Video", "Facebook_Watch"}
-
-
-def _is_bad_fb_reel_caption_line(text: str) -> bool:
-    """Return True for FB Reel UI/chrome text that should never become a filename."""
-    if not text:
-        return True
-
-    t = " ".join(str(text).split()).strip()
-    if not t:
-        return True
-
-    low = t.lower()
-
-    bad_exact = {
-        "facebook",
-        "reels",
-        "watch",
-        "like",
-        "comment",
-        "share",
-        "留言",
-        "分享",
-        "讚",
-        "按讚",
-        "回覆",
-        "查看更多",
-        "隱藏翻譯",
-        "顯示較少",
-        "發佈",
-        "原始音訊",
-        "訂閱",
-        "追蹤",
-        "已追蹤",
-        "傳送",
-        "搜尋",
-        "首頁",
-        "通知",
-    }
-    if low in bad_exact or t in bad_exact:
-        return True
-
-    bad_contains = [
-        "facebook watch",
-        "facebook reel",
-        "log in",
-        "sign up",
-        "原始音訊",
-        "留言……",
-        "留言...",
-        "發表留言",
-        "查看回覆",
-        "則留言",
-        "個讚",
-        "萬個讚",
-        "次分享",
-        "瀏覽次數",
-    ]
-    if any(x in low or x in t for x in bad_contains):
-        return True
-
-    # Pure counts / dates / hashtags-only / profile names are not captions.
-    if re.fullmatch(r"[\d,.\s]+[kKmM萬千百]?", t):
-        return True
-    if re.fullmatch(r"\d+\s*(個讚|則留言|次分享|天前|小時|分鐘|週|月|年)", t):
-        return True
-    if re.fullmatch(r"[#＃][\w\-\u4e00-\u9fff\s#＃]+", t):
-        return True
-    if re.fullmatch(r"[@A-Za-z0-9_.\-\s&]+", t) and not re.search(r"[\u4e00-\u9fff]", t):
-        return True
-
-    return False
-
-
-def _clean_fb_reel_caption_for_title(text: str) -> str:
-    """Clean a visible FB Reel caption into a short Windows-safe title candidate."""
-    if not text:
-        return ""
-
-    raw = _to_traditional(html.unescape(str(text))).replace("\u200b", " ")
-    raw = raw.replace("\\n", "\n").replace("\r", "\n")
-    lines = []
-    for part in re.split(r"[\n\r]+", raw):
-        part = " ".join(part.split()).strip()
-        if not part:
-            continue
-
-        # Drop hashtags from the filename but keep caption before tags.
-        part = re.sub(r"\s*[#＃][^\n\r]+$", "", part).strip()
-
-        # FB sometimes prefixes the author name before the caption in the same text block.
-        # Keep the first meaningful caption-looking segment.
-        part = re.sub(r"^\s*[^：:]{1,30}\s*[：:]\s*", "", part).strip()
-
-        if _is_bad_fb_reel_caption_line(part):
-            continue
-
-        clean = _clean_fb_post_title_for_path(part, fallback="")
-        if clean:
-            lines.append(clean)
-
-    if not lines:
-        return ""
-
-    # Prefer a line that contains CJK or sentence punctuation; otherwise use the longest meaningful line.
-    preferred = [
-        x for x in lines
-        if re.search(r"[\u4e00-\u9fff]", x) or re.search(r"[，。！？!?]", x)
-    ] or lines
-    preferred.sort(key=lambda x: (len(x) < 6, -len(x)))
-    return preferred[0][:90].strip(" ._-，,。") or ""
-
-
-def _get_fb_reel_caption_title(page, fallback: str = "") -> str:
-    """Resolve Facebook Reel filename from visible caption / overlay / meta text.
-
-    v11.35 FB Reel Caption Filename:
-    - Prefer the actual visible Reel caption shown on the left/bottom overlay.
-    - Fall back to meta description/title only when visible text is not available.
-    - Keep the old Facebook_Reel_<id> fallback only as the last resort.
-    """
-    candidates: list[str] = []
-
-    # 1) Visible overlay / dialog / main text. This is the most important path for
-    # logged-in FB Reels where page title/meta often stay generic.
-    js = r"""
-    () => {
-      const out = [];
-      const roots = [];
-      const dialog = document.querySelector('div[role="dialog"]');
-      const main = document.querySelector('div[role="main"]');
-      if (dialog) roots.push(dialog);
-      if (main) roots.push(main);
-      roots.push(document);
-
-      function visible(el) {
-        const r = el.getBoundingClientRect();
-        const st = window.getComputedStyle(el);
-        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') <= 0) return false;
-        if (r.width < 20 || r.height < 8) return false;
-        if (r.bottom < -20 || r.top > window.innerHeight + 80) return false;
-        if (r.right < -20 || r.left > window.innerWidth + 80) return false;
-        return true;
-      }
-
-      for (const root of roots) {
-        const nodes = Array.from(root.querySelectorAll(
-          'div[data-ad-preview="message"], div[dir="auto"], span[dir="auto"], [data-visualcompletion="ignore-dynamic"] div[dir="auto"]'
-        ));
-        for (const el of nodes) {
-          if (!visible(el)) continue;
-          const txt = (el.innerText || el.textContent || '').trim();
-          if (!txt) continue;
-          out.push(txt);
-        }
-      }
-      return out.slice(0, 120);
-    }
-    """
-    try:
-        visible_items = page.evaluate(js) or []
-        for raw in visible_items:
-            if raw:
-                candidates.append(str(raw))
-    except Exception:
-        pass
-
-    # 2) Meta descriptions often contain the Reel caption when the DOM overlay is lazy.
-    for sel in [
-        'meta[property="og:description"]',
-        'meta[name="description"]',
-        'meta[property="og:title"]',
-        'meta[name="twitter:title"]',
-    ]:
-        try:
-            val = page.locator(sel).first.get_attribute("content")
-            if val:
-                candidates.append(val.strip())
-        except Exception:
-            pass
-
-    # 3) Browser title is last because FB often uses generic titles.
-    try:
-        pt = page.title() or ""
-        if pt:
-            candidates.append(pt)
-    except Exception:
-        pass
-
-    seen = set()
-    for raw in candidates:
-        clean = _clean_fb_reel_caption_for_title(raw)
-        if not clean:
-            continue
-        key = clean.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if not _is_fallback_fb_title(clean):
-            logger.info(f"FB Reel title resolved from visible caption: {clean}")
-            return clean
-
-    fallback_clean = _clean_fb_post_title_for_path(fallback or "Facebook_Reel", fallback="Facebook_Reel")
-    return fallback_clean
 
 
 def _find_ffmpeg():
@@ -1130,6 +919,95 @@ def _get_fb_title(page):
 
     return "Facebook_Post"
 
+
+
+_FB_PREFETCHED_TITLES: dict[str, str] = {}
+_FB_PREFETCHED_TITLES_LOCK = threading.RLock()
+
+
+def _fb_task_key(url: str) -> str:
+    return html.unescape(unquote(str(url or ""))).strip()
+
+
+def _publish_fb_task_title(task_url: str, title: str) -> str:
+    clean = _clean_fb_post_title_for_path(title, fallback="")
+    if not clean:
+        return ""
+    key = _fb_task_key(task_url)
+    if key:
+        with _FB_PREFETCHED_TITLES_LOCK:
+            _FB_PREFETCHED_TITLES[key] = clean
+    try:
+        import queue_manager
+        queue_manager.update_task_title(task_url, clean)
+    except Exception as e:
+        logger.debug(f"FB task title publish skipped: {e}")
+    return clean
+
+
+def prefetch_post_title(url: str) -> tuple[str, str]:
+    """Resolve FB post/Reel title before media download and publish it to GUI."""
+    key = _fb_task_key(url)
+    with _FB_PREFETCHED_TITLES_LOCK:
+        cached = _FB_PREFETCHED_TITLES.get(key, "")
+    if cached:
+        _publish_fb_task_title(url, cached)
+        return cached, "cached"
+
+    context = None
+    try:
+        resolved = _resolve_share_url(url)
+        with sync_playwright() as p:
+            user_data_dir = _get_fb_parser_profile_root()
+            profile_dir = _resolve_fb_chrome_profile_directory()
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel="chrome",
+                headless=FB_HEADLESS,
+                no_viewport=True,
+                locale="zh-TW",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                args=[
+                    f"--profile-directory={profile_dir}",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--start-maximized",
+                ],
+            )
+            page = _get_fresh_fb_profile_page(context)
+            page.goto(resolved, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1800)
+
+            if _is_fb_reel_url(url) or _is_fb_reel_url(resolved):
+                title = _get_fb_reel_caption_title(page, fallback=_fb_reel_fallback_title(url))
+            else:
+                title = _get_post_folder_name(page)
+                if not title or title == "Facebook_Post":
+                    title = _get_fb_title(page)
+
+            clean = _publish_fb_task_title(url, title)
+            if resolved and resolved != url and clean:
+                _publish_fb_task_title(resolved, clean)
+            if clean:
+                logger.info(f"FB title prefetch completed before download: {clean}")
+                return clean, ""
+            return "", "未取得有效 FB 標題"
+    except Exception as e:
+        logger.info(f"FB title prefetch skipped: {e}")
+        return "", str(e)
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
 
 def _extract_media_from_html_text(text: str):
     items = []
@@ -4370,17 +4248,6 @@ def _collect_fb_media_playwright(url: str):
                     except Exception:
                         pass
 
-                    # v11.35 FB Reel Caption Filename:
-                    # Resolve the actual visible Reel caption after the page has had
-                    # time to render the overlay.  This must happen before move_files()
-                    # so share/v links are named by caption instead of Facebook_Reel_<id>.
-                    resolved_reel_title = _get_fb_reel_caption_title(
-                        page,
-                        fallback=reel_title or _fb_reel_fallback_title(resolved or url),
-                    )
-                    if resolved_reel_title and not _is_fallback_fb_title(resolved_reel_title):
-                        reel_title = resolved_reel_title
-
                     reel_candidates = _collect_current_page_candidates(
                         page,
                         network_items=network_items,
@@ -4494,6 +4361,11 @@ def _collect_fb_media_playwright(url: str):
             else:
                 title = _get_post_folder_name(page)
 
+            # v11.40: publish the resolved caption/folder title to the GUI immediately.
+            _publish_fb_task_title(url, title)
+            if resolved and resolved != url:
+                _publish_fb_task_title(resolved, title)
+
             expected_photo_count = _estimate_expected_photo_count(
                 page,
                 ordered_links,
@@ -4532,6 +4404,35 @@ def _collect_fb_media_playwright(url: str):
             manifest_ids = _manifest_ids_from_packs(link_items)
             if manifest_ids:
                 logger.info(f"FB v11.17 manifest whitelist ids={len(manifest_ids)}")
+
+            # v11.47 scoped ghost-link correction:
+            # Some /share/ posts expose one extra set=pcb link that points to the post
+            # container rather than a fourth photo.  In the failing 18uZbg4XsQ case,
+            # scoped links reported 4 while grid, normalized photo records and manifest
+            # all independently proved there are exactly 3 real photos.  Correct only
+            # this narrow one-extra-link case; +N and real larger galleries stay strict.
+            try:
+                normalized_count = len(link_items or [])
+                if (
+                    expected_photo_count
+                    and not plus_count_before
+                    and normalized_count >= 2
+                    and int(expected_photo_count) == normalized_count + 1
+                    and len(ordered_links or []) == int(expected_photo_count)
+                    and len(ordered_grid_items or []) <= normalized_count
+                    and len(manifest_ids or []) == normalized_count
+                    and not large_album_mode
+                ):
+                    logger.info(
+                        "FB v11.47 corrected one ghost photo link target: "
+                        f"expected {expected_photo_count}->{normalized_count}, "
+                        f"ordered_links={len(ordered_links or [])}, "
+                        f"grid={len(ordered_grid_items or [])}, "
+                        f"normalized={normalized_count}, manifest={len(manifest_ids or [])}"
+                    )
+                    expected_photo_count = normalized_count
+            except Exception as _e:
+                logger.debug(f"FB v11.47 ghost-link correction skipped: {_e}")
 
             # v11.46 Single-photo duplicate-link target correction:
             # Some Facebook share/p posts expose two ordered photo links even though
