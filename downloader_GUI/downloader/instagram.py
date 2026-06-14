@@ -51,6 +51,10 @@ def _to_traditional(text: str) -> str:
 
 logger = get_logger("instagram")
 
+# v11.52 Canonical First-Slide Navigation Lock
+# v11.50 Dynamic Carousel End-Walk Lock
+# v11.49 Sponsored Carousel Full-Slide Lock
+
 # v11.48 IG Caption Lock + Full-Frame Media Validation
 
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
@@ -63,6 +67,7 @@ _cookie_file = None
 _is_logged_in = False
 _LAST_CAROUSEL_EXPECTED_COUNT = 0
 _LAST_CAROUSEL_TARGET = ""
+_LAST_CAROUSEL_WALK_COMPLETE = True
 
 # v11.38 Title Prefetch Before Download + v11.37 Full-frame Carousel Capture
 # v11.34 profile-batch context: shortcode -> username map for downloads/<username>/ output.
@@ -70,6 +75,8 @@ _PROFILE_SHORTCODE_OWNER: dict[str, str] = {}
 _DOWNLOAD_CONTEXT = threading.local()
 _PREFETCHED_TITLES: dict[str, str] = {}
 _PREFETCHED_TITLES_LOCK = threading.RLock()
+_PREFETCHED_ACCOUNTS: dict[str, str] = {}
+_PREFETCHED_ACCOUNTS_LOCK = threading.RLock()
 
 
 def setup():
@@ -291,6 +298,42 @@ def _normalize_ig_url(url: str) -> str:
 
     return normalized
 
+
+
+def _get_requested_img_index(url: str) -> int:
+    """Return the requested Instagram carousel index from the original URL."""
+    try:
+        parsed = urlparse(url or "")
+        query = parse_qs(parsed.query or "")
+        raw = (query.get("img_index") or ["1"])[0]
+        value = int(str(raw).strip())
+        return value if value > 0 else 1
+    except Exception:
+        return 1
+
+
+def _has_visible_carousel_next(page) -> bool:
+    """Detect a visible carousel next control without relying on IG CSS classes."""
+    selectors = [
+        'button[aria-label="Next"]',
+        'button[aria-label="下一張"]',
+        'button[aria-label="下一則"]',
+        'button[aria-label="下一步"]',
+        'div[role="button"][aria-label="Next"]',
+        'div[role="button"][aria-label="下一張"]',
+        'div[role="button"][aria-label="下一則"]',
+        'svg[aria-label="Next"]',
+        'svg[aria-label="下一張"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 4)):
+                if loc.nth(i).is_visible(timeout=250):
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def _is_ig_reel_url(url: str) -> bool:
@@ -1213,16 +1256,111 @@ def _get_prefetched_title(url: str) -> str:
         return _PREFETCHED_TITLES.get(shortcode, "") or ""
 
 
-def prefetch_post_title(url: str) -> tuple[str, str]:
-    """Resolve and publish the actual Instagram caption before media download."""
+def _clean_ig_account(raw: str) -> str:
+    text = html.unescape(str(raw or "")).strip().lstrip("@").strip()
+    if not text:
+        return ""
+    m = re.search(r"(?:instagram\.com/)?([A-Za-z0-9._]{1,30})(?:/|$)", text, flags=re.I)
+    if m and "/" in text:
+        text = m.group(1)
+    text = text.strip().lstrip("@").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", text):
+        return ""
+    if text.lower() in _IG_PROFILE_RESERVED_PATHS:
+        return ""
+    return text
+
+
+def _cache_prefetched_account(url: str, account: str) -> str:
+    shortcode = _extract_shortcode(url) or ""
+    clean = _clean_ig_account(account)
+    if shortcode and clean:
+        with _PREFETCHED_ACCOUNTS_LOCK:
+            _PREFETCHED_ACCOUNTS[shortcode] = clean
+    return clean
+
+
+def _get_prefetched_account(url: str) -> str:
     shortcode = _extract_shortcode(url) or ""
     if not shortcode:
-        return "", "無法解析 Instagram shortcode"
+        return ""
+    with _PREFETCHED_ACCOUNTS_LOCK:
+        return _PREFETCHED_ACCOUNTS.get(shortcode, "") or ""
 
-    cached = _get_prefetched_title(url)
-    if cached:
-        _publish_ig_task_title(url, cached)
-        return cached, "cached"
+
+def _get_ig_post_account(page) -> str:
+    # Prefer the author link inside the target post header.  Avoid comment users
+    # by checking the first few links nearest the article/dialog header.
+    selectors = [
+        'article header a[href^="/"]',
+        'div[role="dialog"] header a[href^="/"]',
+        'article a[href^="/"]',
+        'div[role="dialog"] a[href^="/"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 12)):
+                node = loc.nth(i)
+                href = node.get_attribute("href") or ""
+                account = _clean_ig_account(href)
+                if not account:
+                    text = node.inner_text(timeout=500) or ""
+                    account = _clean_ig_account(text)
+                if account:
+                    return account
+        except Exception:
+            continue
+
+    # Metadata fallback. Common examples include:
+    # "successful101_official on Instagram: ..." or
+    # "ju.littleshop • Instagram photos and videos".
+    for sel in ['meta[property="og:title"]', 'meta[name="twitter:title"]']:
+        try:
+            value = page.locator(sel).first.get_attribute("content") or ""
+            patterns = [
+                r'^\s*([A-Za-z0-9._]{1,30})\s+(?:on|在)\s+Instagram',
+                r'^\s*([A-Za-z0-9._]{1,30})\s*[•·-]\s*Instagram',
+                r'@([A-Za-z0-9._]{1,30})',
+            ]
+            for pat in patterns:
+                m = re.search(pat, value, flags=re.I)
+                if m:
+                    account = _clean_ig_account(m.group(1))
+                    if account:
+                        return account
+        except Exception:
+            pass
+    return ""
+
+
+def _publish_ig_task_account(task_url: str, account: str) -> None:
+    clean = _clean_ig_account(account)
+    if not clean:
+        return
+    try:
+        import queue_manager
+        queue_manager.update_task_account(task_url, clean)
+    except Exception as e:
+        logger.debug(f"IG task account publish skipped: {e}")
+
+
+def prefetch_post_info(url: str) -> tuple[str, str, str]:
+    """Resolve post caption and author account before media download.
+
+    Returns: (title, account, error).  Both values are published to queue/UI as
+    soon as they are available.
+    """
+    shortcode = _extract_shortcode(url) or ""
+    if not shortcode:
+        return "", "", "無法解析 Instagram shortcode"
+
+    cached_title = _get_prefetched_title(url)
+    cached_account = _get_prefetched_account(url)
+    if cached_title and cached_account:
+        _publish_ig_task_title(url, cached_title)
+        _publish_ig_task_account(url, cached_account)
+        return cached_title, cached_account, "cached"
 
     normalized = _normalize_ig_url(url)
     context = None
@@ -1258,23 +1396,33 @@ def prefetch_post_title(url: str) -> tuple[str, str]:
             try:
                 _goto_instagram_target_clean(page, normalized, target_shortcode=shortcode, timeout=35000)
             except PlaywrightTimeoutError:
-                logger.info(f"IG title prefetch goto timeout, use current page: {shortcode}")
+                logger.info(f"IG info prefetch goto timeout, use current page: {shortcode}")
             page.wait_for_timeout(1800)
             if _is_missing_ig_page(page):
-                return "", "MISSING"
+                return "", "", "MISSING"
             if _is_generic_ig_page(page) or _is_ig_audience_restricted_page(page):
-                return "", "需要 IG Parser Profile"
+                return "", "", "需要 IG Parser Profile"
 
-            title = _get_ig_full_caption_title(page, fallback_shortcode=shortcode)
-            clean = _cache_prefetched_title(url, title)
-            if clean and not _is_bad_ig_caption_candidate(clean, shortcode):
-                _publish_ig_task_title(url, clean)
-                logger.info(f"IG title prefetch completed before download: {clean}")
-                return clean, ""
-            return "", "未取得有效標題"
+            title = cached_title or _get_ig_full_caption_title(page, fallback_shortcode=shortcode)
+            account = cached_account or _get_ig_post_account(page)
+            clean_title = _cache_prefetched_title(url, title)
+            clean_account = _cache_prefetched_account(url, account)
+
+            if clean_title and not _is_bad_ig_caption_candidate(clean_title, shortcode):
+                _publish_ig_task_title(url, clean_title)
+            if clean_account:
+                _publish_ig_task_account(url, clean_account)
+
+            if clean_title or clean_account:
+                logger.info(
+                    f"IG info prefetch completed before download: "
+                    f"account={clean_account or 'unknown'}, title={clean_title or 'unknown'}"
+                )
+                return clean_title, clean_account, ""
+            return "", "", "未取得有效標題或帳號"
     except Exception as e:
-        logger.info(f"IG title prefetch skipped: {e}")
-        return "", str(e)
+        logger.info(f"IG info prefetch skipped: {e}")
+        return "", "", str(e)
     finally:
         try:
             if context:
@@ -1286,6 +1434,12 @@ def prefetch_post_title(url: str) -> tuple[str, str]:
                 browser.close()
         except Exception:
             pass
+
+
+def prefetch_post_title(url: str) -> tuple[str, str]:
+    """Backward-compatible title-only API used by older worker versions."""
+    title, _account, error = prefetch_post_info(url)
+    return title, error
 
 
 def _publish_ig_task_title(task_url: str, title: str) -> None:
@@ -2867,9 +3021,13 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
             w, h = im.size
         if w <= 0 or h <= 0:
             return False, "圖片尺寸無效"
+        if w < 320 or h < 320:
+            return False, f"下載圖片尺寸過小：size={w}x{h}"
         actual = w / h
+        if actual > 2.25 or actual < 0.44:
+            return False, f"下載圖片比例異常，疑似裁切殘片：actual={actual:.3f}, size={w}x{h}"
         delta = abs(actual - expected) / max(expected, 0.01)
-        if delta > 0.18:
+        if delta > 0.14:
             return False, f"下載圖片比例與貼文畫面不符：expected={expected:.3f}, actual={actual:.3f}, size={w}x{h}"
         return True, ""
     except Exception as e:
@@ -3009,6 +3167,37 @@ def _wait_for_target_shortcode_context(page, target_shortcode: str, timeout_ms: 
     return _is_target_shortcode_context(page, target_shortcode)
 
 
+
+def _get_first_slide_navigation_url(target_url: str) -> str:
+    """Return the same IG post URL without img_index so navigation starts at slide 1.
+
+    Route selection still uses the original URL, therefore the verified v7/v8
+    restricted-carousel strategy is preserved.  Only the browser navigation URL
+    is canonicalized.  This avoids relying on Instagram's locale-dependent
+    Previous button, which may be absent even when an img_index share URL opens
+    directly on slide 2 or later.
+    """
+    try:
+        parsed = urlparse(str(target_url or ""))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query.pop("img_index", None)
+
+        clean_pairs = []
+        for key, values in query.items():
+            for value in values:
+                clean_pairs.append((key, value))
+
+        clean_query = urlencode(clean_pairs, doseq=True)
+        clean_path = parsed.path
+        if clean_path and not clean_path.endswith("/"):
+            clean_path += "/"
+
+        return parsed._replace(path=clean_path, query=clean_query, fragment="").geturl()
+    except Exception:
+        return target_url
+
+
+
 def _goto_instagram_target_clean(page, target_url: str, target_shortcode: str = "", timeout: int = 60000):
     """Hard-reset the visible tab before opening a new IG post/reel.
 
@@ -3019,6 +3208,14 @@ def _goto_instagram_target_clean(page, target_url: str, target_shortcode: str = 
     next task.
     """
     normalized = _normalize_ig_url(target_url)
+    requested_img_index = _get_requested_img_index(target_url)
+    navigation_url = _get_first_slide_navigation_url(normalized)
+
+    if requested_img_index > 1 and navigation_url != normalized:
+        logger.info(
+            f"IG canonical first-slide navigation lock: requested_img_index={requested_img_index}, "
+            f"target={target_shortcode}; remove img_index only for browser navigation"
+        )
 
     try:
         page.goto("about:blank", wait_until="domcontentloaded", timeout=15000)
@@ -3031,7 +3228,7 @@ def _goto_instagram_target_clean(page, target_url: str, target_shortcode: str = 
     except Exception:
         pass
 
-    page.goto(normalized, wait_until="domcontentloaded", timeout=timeout)
+    page.goto(navigation_url, wait_until="domcontentloaded", timeout=timeout)
     _wait_for_target_shortcode_context(page, target_shortcode, timeout_ms=12000)
 
     try:
@@ -3104,17 +3301,65 @@ def _get_current_media_key(page) -> str:
     return ""
 
 
+
+def _is_actionable_carousel_previous(page) -> bool:
+    """Return True when a visible enabled Previous control still exists."""
+    selectors = [
+        'button[aria-label="Previous"]',
+        'button[aria-label="上一張"]',
+        'button[aria-label="上一則"]',
+        'button[aria-label="上一步"]',
+        'button[aria-label="往前"]',
+        'div[role="button"][aria-label="Previous"]',
+        'div[role="button"][aria-label="上一張"]',
+        'div[role="button"][aria-label="上一則"]',
+        'div[role="button"][aria-label="往前"]',
+        'svg[aria-label="Previous"]',
+        'svg[aria-label="上一張"]',
+        'svg[aria-label="往前"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 8)):
+                node = loc.nth(i)
+                if not node.is_visible(timeout=250):
+                    continue
+                disabled = False
+                try:
+                    disabled = bool(node.is_disabled())
+                except Exception:
+                    pass
+                try:
+                    disabled = disabled or (node.get_attribute("aria-disabled") or "").lower() == "true"
+                except Exception:
+                    pass
+                try:
+                    disabled = disabled or "disabled" in (node.get_attribute("class") or "").lower()
+                except Exception:
+                    pass
+                if not disabled:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+
 def _click_prev_ig(page) -> bool:
     selectors = [
         'button[aria-label="Previous"]',
         'button[aria-label="上一張"]',
         'button[aria-label="上一則"]',
         'button[aria-label="上一步"]',
+        'button[aria-label="往前"]',
         'div[role="button"][aria-label="Previous"]',
         'div[role="button"][aria-label="上一張"]',
         'div[role="button"][aria-label="上一則"]',
+        'div[role="button"][aria-label="往前"]',
         'svg[aria-label="Previous"]',
         'svg[aria-label="上一張"]',
+        'svg[aria-label="往前"]',
     ]
     for sel in selectors:
         try:
@@ -3134,6 +3379,24 @@ def _click_prev_ig(page) -> bool:
     return False
 
 
+def _wait_for_ig_media_key_change(page, before_key: str, timeout_ms: int = 5200) -> str:
+    """Wait for React/lazy carousel transition to expose a genuinely new media key."""
+    deadline = time.time() + max(0.8, timeout_ms / 1000.0)
+    last = ""
+    while time.time() < deadline:
+        try:
+            last = _get_current_media_key(page)
+        except Exception:
+            last = ""
+        if last and (not before_key or last != before_key):
+            return last
+        try:
+            page.wait_for_timeout(220)
+        except Exception:
+            time.sleep(0.22)
+    return last
+
+
 def _click_prev_ig_locked(page, target_shortcode: str) -> bool:
     before_key = _get_current_media_key(page)
     before_url = ""
@@ -3149,7 +3412,7 @@ def _click_prev_ig_locked(page, target_shortcode: str) -> bool:
             f"IG carousel prev guard: click left target={target_shortcode}; before={before_url}; after={getattr(page, 'url', '')}; stop"
         )
         return False
-    after_key = _get_current_media_key(page)
+    after_key = _wait_for_ig_media_key_change(page, before_key, timeout_ms=5200)
     return bool(after_key and after_key != before_key)
 
 
@@ -3164,7 +3427,83 @@ def _rewind_carousel_to_first(page, target_shortcode: str, max_steps: int = 8) -
     return moved
 
 
+def _is_actionable_carousel_next(page) -> bool:
+    """Return True only when a visible, enabled Next control still exists.
+
+    IG sponsored carousels can keep hidden or disabled chevrons in the DOM.
+    Those must not be treated as another slide.
+    """
+    selectors = [
+        'button[aria-label="Next"]',
+        'button[aria-label="下一張"]',
+        'button[aria-label="下一則"]',
+        'button[aria-label="下一步"]',
+        'div[role="button"][aria-label="Next"]',
+        'div[role="button"][aria-label="下一張"]',
+        'div[role="button"][aria-label="下一則"]',
+        'svg[aria-label="Next"]',
+        'svg[aria-label="下一張"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 8)):
+                node = loc.nth(i)
+                if not node.is_visible(timeout=250):
+                    continue
+                disabled = False
+                try:
+                    disabled = bool(node.is_disabled())
+                except Exception:
+                    pass
+                try:
+                    aria_disabled = (node.get_attribute("aria-disabled") or "").lower()
+                    disabled = disabled or aria_disabled == "true"
+                except Exception:
+                    pass
+                try:
+                    cls = (node.get_attribute("class") or "").lower()
+                    disabled = disabled or "disabled" in cls
+                except Exception:
+                    pass
+                if not disabled:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_current_media_key_change(page, before_key: str, target_shortcode: str, timeout_ms: int = 6500) -> str:
+    """Wait for React/lazy-load to replace the active slide media.
+
+    The initial dot count is not trusted.  A click counts as a real carousel
+    advance only after the target shortcode remains locked and the main-media
+    key changes.
+    """
+    deadline = time.time() + max(0.8, timeout_ms / 1000.0)
+    last_key = ""
+    while time.time() < deadline:
+        if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
+            return ""
+        try:
+            last_key = _get_current_media_key(page) or ""
+        except Exception:
+            last_key = ""
+        if last_key and (not before_key or last_key != before_key):
+            return last_key
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            time.sleep(0.25)
+    return ""
+
+
 def _click_next_ig_locked_keycheck(page, target_shortcode: str) -> bool:
+    """Advance one real slide and verify the active media changed.
+
+    This is used only by confirmed carousel posts.  It does not run for normal
+    single-image posts or Reels.
+    """
     before_key = _get_current_media_key(page)
     before_url = ""
     try:
@@ -3172,29 +3511,46 @@ def _click_next_ig_locked_keycheck(page, target_shortcode: str) -> bool:
     except Exception:
         pass
 
-    moved = _click_next_ig(page)
-    if not moved:
-        try:
-            page.keyboard.press("ArrowRight")
-            page.wait_for_timeout(1200)
-            moved = True
-        except Exception:
-            moved = False
+    if not _is_actionable_carousel_next(page):
+        return False
 
+    moved = _click_next_ig(page)
     if not moved:
         return False
 
     if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
         logger.warning(
-            f"IG carousel scope guard: next click left target={target_shortcode}; before={before_url}; after={getattr(page, 'url', '')}; stop collecting to avoid wrong post"
+            f"IG carousel scope guard: next click left target={target_shortcode}; "
+            f"before={before_url}; after={getattr(page, 'url', '')}; stop collecting to avoid wrong post"
         )
         return False
 
-    after_key = _get_current_media_key(page)
-    if before_key and after_key and after_key == before_key:
-        return False
-    return True
+    after_key = _wait_for_current_media_key_change(
+        page,
+        before_key,
+        target_shortcode,
+        timeout_ms=6500,
+    )
+    if after_key:
+        return True
 
+    # One conservative keyboard retry helps layouts whose visible chevron receives
+    # the click but React does not advance on the first event.
+    if _is_actionable_carousel_next(page):
+        try:
+            page.keyboard.press("ArrowRight")
+            after_key = _wait_for_current_media_key_change(
+                page,
+                before_key,
+                target_shortcode,
+                timeout_ms=4500,
+            )
+            if after_key:
+                return True
+        except Exception:
+            pass
+
+    return False
 
 def _fill_filtered_from_network_cache(filtered, harvested_media, expected_count: int):
     """Fill only from the *fresh* carousel-walk network cache.
@@ -3251,22 +3607,22 @@ def _fill_filtered_from_network_cache(filtered, harvested_media, expected_count:
 
 
 def _collect_visible_target_media(page, target_shortcode: str, include_meta: bool = True):
-    """Collect only the visible post/reel media, never profile-grid media.
+    """Walk a target post carousel until the real Next control can no longer advance.
 
-    This keeps the older working carousel selector flow, but:
-    - rewinds to the first slide when possible,
-    - detects carousel total count from dots,
-    - advances only up to the detected total to avoid repeated flipping,
-    - verifies the page is still scoped to target_shortcode after every move.
+    v11.50 rules:
+    - dot/indicator count is advisory only; it is never a hard stop,
+    - rewind to the first slide,
+    - collect one visible full-frame item per successful media-key change,
+    - stop only when Next is gone/disabled or cannot change the active media,
+    - remain locked to the requested shortcode on every step.
 
-    Important:
-    The detected total count is stored for the caller.  Instagram may move or
-    hide the dot indicators after carousel navigation, so calling the detector
-    again after collection can return 0 and accidentally skip network fill.
+    The dynamic walk is activated only for confirmed carousel posts.  Normal
+    single-image posts and Reels keep their existing one-item path.
     """
-    global _LAST_CAROUSEL_EXPECTED_COUNT, _LAST_CAROUSEL_TARGET
+    global _LAST_CAROUSEL_EXPECTED_COUNT, _LAST_CAROUSEL_TARGET, _LAST_CAROUSEL_WALK_COMPLETE
     _LAST_CAROUSEL_EXPECTED_COUNT = 0
     _LAST_CAROUSEL_TARGET = target_shortcode or ""
+    _LAST_CAROUSEL_WALK_COMPLETE = True
 
     if not _is_target_shortcode_context(page, target_shortcode):
         try:
@@ -3278,17 +3634,55 @@ def _collect_visible_target_media(page, target_shortcode: str, include_meta: boo
             pass
         return []
 
-    expected_count = _get_carousel_total_count(page)
-    if expected_count:
-        _LAST_CAROUSEL_EXPECTED_COUNT = expected_count
-        _LAST_CAROUSEL_TARGET = target_shortcode or ""
-        logger.info(f"IG carousel detected total_count={expected_count}, target={target_shortcode}")
-        _rewind_carousel_to_first(page, target_shortcode, max_steps=min(expected_count + 2, 12))
+    detected_hint = _get_carousel_total_count(page)
+    requested_img_index = _get_requested_img_index(getattr(page, "url", ""))
+    has_next_initially = _is_actionable_carousel_next(page)
+    carousel_mode = bool(detected_hint >= 2 or requested_img_index > 1 or has_next_initially)
 
-    max_rounds = expected_count if expected_count and expected_count <= _MAX_CAROUSEL_ITEMS else _MAX_CAROUSEL_ITEMS
+    if carousel_mode:
+        expected_floor = max(2, requested_img_index, detected_hint or 0)
+        logger.info(
+            f"IG dynamic carousel walk start: hint={detected_hint or 0}, "
+            f"expected_floor={expected_floor}, requested_img_index={requested_img_index}, "
+            f"visible_next={has_next_initially}, target={target_shortcode}"
+        )
+        # Do not limit rewind by the unreliable dots count.  A shared URL may open
+        # at any img_index, and sponsored layouts can reveal only two indicators.
+        rewind_steps = _rewind_carousel_to_first(page, target_shortcode, max_steps=_MAX_CAROUSEL_ITEMS)
+        # First-slide lock: after rewind, wait for the first frame to settle before
+        # any Next click.  This prevents the shared img_index slide from becoming
+        # item 1 and dropping the real first slide (total count -1).
+        try:
+            page.wait_for_timeout(900 if rewind_steps else 450)
+        except Exception:
+            time.sleep(0.9 if rewind_steps else 0.45)
+        first_key = _get_current_media_key(page)
+        prev_still_actionable = _is_actionable_carousel_previous(page)
+        logger.info(
+            f"IG carousel first-slide lock: rewind_steps={rewind_steps}, "
+            f"first_key={'ready' if first_key else 'missing'}, "
+            f"previous_actionable={prev_still_actionable}, target={target_shortcode}"
+        )
+
+        # A first-slide lock is valid only when no usable Previous control remains.
+        # If IG still exposes Previous, starting collection here would silently
+        # omit slide 1 and return a false SUCCESS with total_count - 1.
+        if prev_still_actionable:
+            logger.warning(
+                f"IG carousel first-slide lock failed: Previous remains actionable after rewind; "
+                f"requested_img_index={requested_img_index}, target={target_shortcode}; refuse false SUCCESS"
+            )
+            _LAST_CAROUSEL_WALK_COMPLETE = False
+            return []
+    else:
+        expected_floor = 1
+
     collected = []
     seen_media_keys = set()
+    ended_at_real_end = not carousel_mode
+    stalled_with_next = False
 
+    max_rounds = _MAX_CAROUSEL_ITEMS if carousel_mode else 1
     for round_index in range(max_rounds):
         if not _is_target_shortcode_context(page, target_shortcode):
             try:
@@ -3298,39 +3692,79 @@ def _collect_visible_target_media(page, target_shortcode: str, include_meta: boo
                 )
             except Exception:
                 pass
+            _LAST_CAROUSEL_WALK_COMPLETE = False
             break
 
         current = _get_current_slide_main_media(page)
         if not current and include_meta and not collected:
             current = _get_meta_ig_media(page)[:1]
         if not current:
+            if carousel_mode and _is_actionable_carousel_next(page):
+                stalled_with_next = True
+                _LAST_CAROUSEL_WALK_COMPLETE = False
             break
 
         item = current[0]
         src = item.get("src", "")
         key = _media_key_from_url(src)
 
-        if key not in seen_media_keys:
+        if key and key not in seen_media_keys:
             seen_media_keys.add(key)
             collected.append(item)
+            if carousel_mode:
+                logger.info(
+                    f"IG dynamic carousel walk: slide={len(collected)}, "
+                    f"round={round_index + 1}, target={target_shortcode}"
+                )
 
-        if expected_count and len(collected) >= expected_count:
+        if not carousel_mode:
             break
 
-        # Preserve the older working carousel selector flow from instagram_git.py.
-        # The stricter key-check variant can stop early on IG desktop because the
-        # current visible key may be recycled while the next slide is still loading.
-        # _click_next_ig_locked() still guards target_shortcode after every click,
-        # so it keeps the task locked to this post without blocking valid carousel
-        # navigation.
-        moved = _click_next_ig_locked(page, target_shortcode)
+        if not _is_actionable_carousel_next(page):
+            ended_at_real_end = True
+            break
+
+        moved = _click_next_ig_locked_keycheck(page, target_shortcode)
         if not moved:
+            # If an enabled Next still exists, the lazy-loaded next slide failed to
+            # materialize.  Mark the traversal incomplete so the caller returns
+            # RETRY instead of accepting a partial SUCCESS.
+            if _is_actionable_carousel_next(page):
+                stalled_with_next = True
+                _LAST_CAROUSEL_WALK_COMPLETE = False
+                logger.warning(
+                    f"IG dynamic carousel walk stalled while Next remains actionable: "
+                    f"collected={len(collected)}, target={target_shortcode}; refuse partial SUCCESS"
+                )
+            else:
+                ended_at_real_end = True
             break
+    else:
+        # Reaching the safety ceiling means the true end was not proven.
+        if carousel_mode and _is_actionable_carousel_next(page):
+            _LAST_CAROUSEL_WALK_COMPLETE = False
+            stalled_with_next = True
 
-    if expected_count and len(collected) < expected_count:
-        logger.info(
-            f"IG carousel visible collected below expected: visible={len(collected)}, expected={expected_count}, target={target_shortcode}"
-        )
+    true_total = len(collected)
+    if carousel_mode:
+        # A completed end-walk is the source of truth.  Initial dots remain only a
+        # lower-bound hint for incomplete traversals.
+        if ended_at_real_end and not stalled_with_next:
+            _LAST_CAROUSEL_EXPECTED_COUNT = true_total
+            _LAST_CAROUSEL_WALK_COMPLETE = True
+            logger.info(
+                f"IG dynamic carousel walk complete: true_total={true_total}, "
+                f"initial_hint={detected_hint or 0}, target={target_shortcode}"
+            )
+        else:
+            _LAST_CAROUSEL_EXPECTED_COUNT = max(expected_floor, true_total + 1)
+            logger.warning(
+                f"IG dynamic carousel walk incomplete: collected={true_total}, "
+                f"required_at_least={_LAST_CAROUSEL_EXPECTED_COUNT}, "
+                f"initial_hint={detected_hint or 0}, target={target_shortcode}"
+            )
+    else:
+        _LAST_CAROUSEL_EXPECTED_COUNT = true_total or 1
 
     return _dedupe_media(collected, preserve_order=True)
 
@@ -3468,7 +3902,10 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
                 )
 
         title = _get_prefetched_title(url) or _get_ig_full_caption_title(page, fallback_shortcode=shortcode or "Instagram_Post")
+        account = _get_prefetched_account(url) or _get_ig_post_account(page)
+        _cache_prefetched_account(url, account)
         _publish_ig_task_title(url, title)
+        _publish_ig_task_account(url, account)
 
         # Critical scope fix:
         # The initial page load can fetch comments, avatars, recommendation posts,
@@ -3497,6 +3934,16 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
         if not expected_count:
             expected_count = _get_carousel_total_count(page)
 
+        if not _LAST_CAROUSEL_WALK_COMPLETE:
+            logger.warning(
+                f"IG dynamic carousel traversal incomplete: expected_at_least={expected_count}, "
+                f"collected={len(filtered)}, target={shortcode}; mark RETRY instead of false SUCCESS"
+            )
+            return "RETRY", (
+                f"IG carousel traversal incomplete: collected {len(filtered)}, "
+                f"expected at least {expected_count}; Next still existed or the active slide did not finish loading"
+            )
+
         # A/B hybrid guard:
         # - v8 fresh tab is required for long carousel posts (ex: DYGxXdEiZkt, 10 slides).
         # - v7 cleaned persistent page is more stable for short carousel posts
@@ -3519,6 +3966,17 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
                 url,
                 reason=(reason or "") + " | short-carousel-v7-clean-page",
                 use_fresh_tab=False,
+            )
+
+        requested_img_index = _get_requested_img_index(url)
+        if requested_img_index > 1 and len(filtered) < 2:
+            logger.warning(
+                f"IG img_index carousel incomplete: requested_img_index={requested_img_index}, "
+                f"collected={len(filtered)}, target={shortcode}; refuse false SUCCESS"
+            )
+            return "RETRY", (
+                f"IG carousel incomplete: URL requests img_index={requested_img_index}, "
+                f"but only {len(filtered)} media item was collected"
             )
 
         if expected_count and len(filtered) < expected_count:
@@ -3564,6 +4022,16 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
                 expected_count = _LAST_CAROUSEL_EXPECTED_COUNT or 0
             if not expected_count:
                 expected_count = _get_carousel_total_count(page)
+
+            if not _LAST_CAROUSEL_WALK_COMPLETE:
+                logger.warning(
+                    f"IG dynamic carousel second-pass traversal incomplete: expected_at_least={expected_count}, "
+                    f"collected={len(filtered)}, target={shortcode}; mark RETRY"
+                )
+                return "RETRY", (
+                    f"IG carousel second-pass traversal incomplete: collected {len(filtered)}, "
+                    f"expected at least {expected_count}"
+                )
 
             if expected_count and len(filtered) < expected_count:
                 before_fill = len(filtered)
@@ -3673,11 +4141,25 @@ def _collect_ig_media_playwright(url: str):
     browser = None
     context = None
 
+    original_url = url
     url = _normalize_ig_url(url)
     shortcode = _extract_shortcode(url) or ""
 
     try:
         with sync_playwright() as p:
+            # img_index URLs are known carousel tasks. Route them directly through
+            # the logged-in persistent profile so sponsored/lazy carousel controls
+            # are available before any single-image false SUCCESS can occur.
+            if _get_requested_img_index(original_url) > 1:
+                logger.info(
+                    "IG img_index carousel pre-route: use persistent IG_Parser before headless collection "
+                    f"(img_index={_get_requested_img_index(original_url)}, target={shortcode})"
+                )
+                return _collect_ig_media_playwright_persistent(
+                    p,
+                    original_url,
+                    reason="img_index carousel requires persistent full-slide traversal",
+                )
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -3778,7 +4260,10 @@ def _collect_ig_media_playwright(url: str):
                 page,
                 fallback_shortcode=shortcode or "Instagram_Post",
             )
+            account = _get_prefetched_account(url) or _get_ig_post_account(page)
+            _cache_prefetched_account(url, account)
             _publish_ig_task_title(url, title)
+            _publish_ig_task_account(url, account)
 
             collected = []
             seen_media_keys = set()

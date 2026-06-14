@@ -145,6 +145,7 @@ class _HiddenLoginButton:
 
 
 
+# v11.54: center Post Account / Post Title headings and values
 # v11.37: show resolved Instagram Post Title beside URL
 class App:
     def __init__(self, root: tk.Tk):
@@ -171,6 +172,7 @@ class App:
         self._tree_sort_reverse = False
         self._tree_heading_base = {
             "url": "URL",
+            "account": "Post Account",
             "title": "Post Title",
             "status": "狀態",
             "retry": "Retry",
@@ -281,8 +283,7 @@ class App:
         self._status_padx = self._ui_px(6)
         self._filter_width = 8 if self._compact_ui else 9
         self._filter_downloading_width = 10 if self._compact_ui else 12
-        self._url_col_width = self._ui_px(500)
-        self._title_col_width = self._ui_px(420)
+        self._url_col_width = self._ui_px(620)
         self._status_col_width = self._ui_px(110)
         self._retry_col_width = self._ui_px(58)
 
@@ -551,11 +552,15 @@ class App:
         mid = tk.Frame(self.root, padx=self._pad_x)
         mid.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("url", "title", "status", "retry")
+        cols = ("url", "account", "title", "status", "retry")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
+        self._tree_resize_after_id = None
         self._bind_tree_sort_headings()
-        self.tree.column("url", width=max(self._ui_px(360), int(self._url_col_width * 0.58)), stretch=True, minwidth=self._ui_px(240))
-        self.tree.column("title", width=max(self._ui_px(300), int(self._url_col_width * 0.42)), stretch=True, minwidth=self._ui_px(220))
+        self.tree.heading("account", anchor="center")
+        self.tree.heading("title", anchor="center")
+        self.tree.column("url", width=self._ui_px(520), stretch=False, minwidth=self._ui_px(300), anchor="w")
+        self.tree.column("account", width=self._ui_px(220), stretch=False, minwidth=self._ui_px(165), anchor="center")
+        self.tree.column("title", width=self._ui_px(430), stretch=False, minwidth=self._ui_px(280), anchor="center")
         self.tree.column("status", width=self._status_col_width, stretch=False, anchor="center")
         self.tree.column("retry", width=self._retry_col_width, stretch=False, anchor="center")
 
@@ -568,6 +573,9 @@ class App:
         hsb.grid(row=1, column=0, sticky="ew")
         mid.grid_rowconfigure(0, weight=1)
         mid.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind("<Configure>", self._schedule_tree_column_fit, add="+")
+        self.root.after(120, self._fit_tree_columns)
 
         for status, color in _STATUS_COLORS.items():
             self.tree.tag_configure(status, foreground=color)
@@ -725,6 +733,57 @@ class App:
             fg="#333333",
             padx=self._status_padx,
         ).pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _schedule_tree_column_fit(self, _event=None):
+        """Debounce responsive Treeview column resizing."""
+        try:
+            if self._tree_resize_after_id:
+                self.root.after_cancel(self._tree_resize_after_id)
+        except Exception:
+            pass
+        try:
+            self._tree_resize_after_id = self.root.after(90, self._fit_tree_columns)
+        except Exception:
+            self._tree_resize_after_id = None
+
+    def _fit_tree_columns(self):
+        """Fit URL / account / title to the visible table width without overlap.
+
+        Status and Retry stay fixed.  At narrow widths the three text columns
+        retain readable minimum widths and the existing horizontal scrollbar is
+        used instead of visually squeezing text into adjacent columns.
+        """
+        self._tree_resize_after_id = None
+        try:
+            visible = max(1, int(self.tree.winfo_width()))
+        except Exception:
+            return
+
+        status_w = max(self._ui_px(92), int(self._status_col_width))
+        retry_w = max(self._ui_px(62), int(self._retry_col_width))
+        border_and_scroll = self._ui_px(34)
+        available = max(0, visible - status_w - retry_w - border_and_scroll)
+
+        url_min = self._ui_px(300)
+        account_min = self._ui_px(165)
+        title_min = self._ui_px(280)
+        minimum_total = url_min + account_min + title_min
+
+        if available < minimum_total:
+            # Keep columns separate and readable; horizontal scrolling handles
+            # the overflow instead of allowing account/title to appear glued.
+            url_w, account_w, title_w = url_min, account_min, title_min
+        else:
+            # Balanced proportions for normal FHD/4K windows.
+            url_w = max(url_min, int(available * 0.43))
+            account_w = max(account_min, int(available * 0.18))
+            title_w = max(title_min, available - url_w - account_w)
+
+        self.tree.column("url", width=url_w, minwidth=url_min, stretch=False, anchor="w")
+        self.tree.column("account", width=account_w, minwidth=account_min, stretch=False, anchor="center")
+        self.tree.column("title", width=title_w, minwidth=title_min, stretch=False, anchor="center")
+        self.tree.column("status", width=status_w, stretch=False, anchor="center")
+        self.tree.column("retry", width=retry_w, stretch=False, anchor="center")
 
     def _bind_tree_sort_headings(self):
         """Bind clickable Treeview column headings for display-only sorting."""
@@ -1708,11 +1767,13 @@ class App:
         for t in display:
             full_url = t.get("url", "")
             url_short = full_url[:120] + ("…" if len(full_url) > 120 else "")
+            account = re.sub(r"\s+", " ", str(t.get("account", "") or "")).strip().lstrip("@")
+            account_short = account[:30] + ("…" if len(account) > 30 else "")
             title = re.sub(r"\s+", " ", str(t.get("title", "") or "")).strip()
             title_short = title[:80] + ("…" if len(title) > 80 else "")
             status = t["status"]
             tag = status if status in _STATUS_COLORS else "PENDING"
-            iid = self.tree.insert("", tk.END, values=(url_short, title_short, status, t["retry"]), tags=(tag,))
+            iid = self.tree.insert("", tk.END, values=(url_short, account_short, title_short, status, t["retry"]), tags=(tag,))
             self._tree_url_by_iid[iid] = full_url
 
         total = runtime.get("total", 0)

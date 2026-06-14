@@ -189,25 +189,37 @@ def _worker_loop():
                             cooldown_remaining=0,
                         )
                         try:
-                            prefetched_title, title_error = instagram.prefetch_post_title(url)
+                            if hasattr(instagram, "prefetch_post_info"):
+                                prefetched_title, prefetched_account, info_error = instagram.prefetch_post_info(url)
+                            else:
+                                prefetched_title, info_error = instagram.prefetch_post_title(url)
+                                prefetched_account = ""
+                            if prefetched_account:
+                                queue_manager.update_task_account(url, prefetched_account)
                             if prefetched_title:
-                                logger.info(f"Post Title 已填入，開始下載: {prefetched_title}")
+                                logger.info(
+                                    f"Post Info 已填入，開始下載: "
+                                    f"account={prefetched_account or 'unknown'}, title={prefetched_title}"
+                                )
                                 queue_manager.update_runtime(
                                     phase="DOWNLOADING",
-                                    message=f"已取得標題，開始下載：{prefetched_title}",
+                                    message=(
+                                        f"已取得帳號/標題，開始下載："
+                                        f"{prefetched_account + '｜' if prefetched_account else ''}{prefetched_title}"
+                                    ),
                                     active_url=url,
                                     cooldown_remaining=0,
                                 )
                             else:
-                                logger.info(f"Post Title 預取略過，沿用下載階段解析: {title_error}")
+                                logger.info(f"Post Info 預取略過，沿用下載階段解析: {info_error}")
                                 queue_manager.update_runtime(
                                     phase="DOWNLOADING",
-                                    message="未預取到標題，開始下載並於下載階段補抓...",
+                                    message="未完整預取帳號/標題，開始下載並於下載階段補抓...",
                                     active_url=url,
                                     cooldown_remaining=0,
                                 )
                         except Exception as e:
-                            logger.info(f"Post Title 預取失敗，繼續正常下載: {e}")
+                            logger.info(f"Post Info 預取失敗，繼續正常下載: {e}")
                         status, error = instagram.download(url)
                 elif "facebook.com" in url or "fb.watch" in url:
                     status, error = facebook.download(url)
