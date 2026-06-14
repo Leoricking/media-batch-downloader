@@ -93,6 +93,27 @@ def _find_task(url: str) -> Optional[dict]:
     return None
 
 
+def update_task_title(url: str, title: str) -> bool:
+    """Update one task's display title without changing queue order or status."""
+    clean_url = (url or "").strip()
+    clean_title = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not clean_url or not clean_title:
+        return False
+
+    with _LOCK:
+        task = _find_task(clean_url)
+        if task is None:
+            return False
+        task["title"] = clean_title
+        task["updated_at"] = time.time()
+
+        if task.get("status") == "DOWNLOADING":
+            _RUNTIME["message"] = f"下載中：{clean_title}"
+            _RUNTIME["active_url"] = clean_url
+
+        return True
+
+
 def _recompute_runtime_counts_locked():
     total = len(_TASKS)
     done = sum(1 for t in _TASKS if t.get("status") in _TERMINAL_STATUSES)
@@ -153,7 +174,9 @@ def add_tasks(urls: list[str]) -> dict:
                     "url": url,
                     "status": "SUCCESS",
                     "retry": 0,
+                    "title": "",
                     "error": "已在 processed_links.log 中",
+                    "title": "",
                     "created_at": time.time(),
                     "updated_at": time.time(),
                 })
@@ -164,6 +187,7 @@ def add_tasks(urls: list[str]) -> dict:
                     "status": "PENDING",
                     "retry": 0,
                     "error": "",
+                    "title": "",
                     "created_at": time.time(),
                     "updated_at": time.time(),
                 })
@@ -207,6 +231,7 @@ def set_task_result(url: str, status: str, error: str = ""):
                 "status": status,
                 "retry": 0,
                 "error": error,
+                "title": "",
                 "created_at": time.time(),
                 "updated_at": time.time(),
             }

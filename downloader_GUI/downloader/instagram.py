@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs, urlencode
 
 import instaloader
 import requests
@@ -51,6 +51,8 @@ def _to_traditional(text: str) -> str:
 
 logger = get_logger("instagram")
 
+# v11.48 IG Caption Lock + Full-Frame Media Validation
+
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
 _DL_TIMEOUT = 300
 _MAX_CAROUSEL_ITEMS = 40
@@ -62,9 +64,12 @@ _is_logged_in = False
 _LAST_CAROUSEL_EXPECTED_COUNT = 0
 _LAST_CAROUSEL_TARGET = ""
 
+# v11.38 Title Prefetch Before Download + v11.37 Full-frame Carousel Capture
 # v11.34 profile-batch context: shortcode -> username map for downloads/<username>/ output.
 _PROFILE_SHORTCODE_OWNER: dict[str, str] = {}
 _DOWNLOAD_CONTEXT = threading.local()
+_PREFETCHED_TITLES: dict[str, str] = {}
+_PREFETCHED_TITLES_LOCK = threading.RLock()
 
 
 def setup():
@@ -264,6 +269,7 @@ def _extract_shortcode(url: str):
 
 
 def _normalize_ig_url(url: str) -> str:
+    """Normalize IG content URL while preserving img_index routing context."""
     shortcode = _extract_shortcode(url)
 
     if not shortcode:
@@ -272,7 +278,18 @@ def _normalize_ig_url(url: str) -> str:
     if "/reel/" in url or "/reels/" in url:
         return f"https://www.instagram.com/reel/{shortcode}/"
 
-    return f"https://www.instagram.com/p/{shortcode}/"
+    normalized = f"https://www.instagram.com/p/{shortcode}/"
+
+    try:
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query or "")
+        img_index = (query.get("img_index") or [""])[0].strip()
+        if img_index.isdigit() and int(img_index) > 0:
+            normalized += "?" + urlencode({"img_index": img_index})
+    except Exception:
+        pass
+
+    return normalized
 
 
 
@@ -1076,42 +1093,301 @@ def _download_via_ytdlp(url: str, quick: bool = False):
 
     return _classify_error(last_error)
 
-def _get_ig_title(page, fallback_shortcode: str = ""):
-    candidates = []
+def _clean_ig_caption_candidate(raw: str, fallback_shortcode: str = "") -> str:
+    """Convert IG meta/DOM text into the real post caption.
 
+    Rejects Instagram UI prompts such as "絕不錯過 <account> 的任何貼文" and
+    strips engagement/author/date prefixes from og:description.  The remaining
+    text is the actual caption, including secondary lines such as sponsorship
+    notes when they are part of the post body.
+    """
+    if not raw:
+        return ""
+
+    text = html.unescape(str(raw)).replace("\\n", "\n").replace("\r", "\n")
+    text = text.replace("\u200b", " ").strip()
+
+    # Typical Instagram metadata:
+    # 336 likes, 23 comments - jessterific on/於 May 8, 2026: "caption"
+    # 122 likes, 0 comments - account on ...: "caption"
+    prefix_patterns = [
+        r'^\s*[\d.,]+(?:[KMB萬千])?\s+likes?\s*,\s*[\d.,]+(?:[KMB萬千])?\s+comments?\s*-\s*[^:：]{1,120}\s+(?:on|於)\s+[^:：]{1,100}\s*[:：]\s*["“]?',
+        r'^\s*[\d.,]+(?:[KMB萬千])?\s*(?:個)?讚\s*[，,]\s*[\d.,]+(?:[KMB萬千])?\s*(?:則)?留言\s*-\s*[^:：]{1,120}\s*(?:於|在)\s+[^:：]{1,100}\s*[:：]\s*["“]?',
+        r'^\s*[^\n:：]{1,80}\s+(?:on|在)\s+Instagram\s*[:：]\s*["“]?',
+    ]
+    for pat in prefix_patterns:
+        text = re.sub(pat, "", text, count=1, flags=re.I)
+
+    # Remove only the wrapping metadata quote, not quotation marks inside caption.
+    text = text.strip()
+    if len(text) >= 2 and text[0] in {'"', '“'} and text[-1] in {'"', '”'}:
+        text = text[1:-1].strip()
+    else:
+        text = text.lstrip('"“').rstrip('"”').strip()
+
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        low = line.lower()
+        if re.search(r"絕不錯過\s*[^\s]{1,60}\s*的任何貼文", line, flags=re.I):
+            continue
+        if re.search(r"never miss any posts? from", low):
+            continue
+        if low in {
+            "instagram", "追蹤", "追蹤中", "follow", "following", "查看翻譯",
+            "view translation", "尚無留言", "no comments yet", "開始對話",
+        }:
+            continue
+        if re.fullmatch(r"[\d.,]+\s*(?:likes?|comments?|個讚|則留言)", low):
+            continue
+        lines.append(line)
+
+    text = " ".join(lines).strip()
+    if not text:
+        return ""
+
+    cleaned = _clean_title(text, fallback_shortcode or "Instagram_Post")
+    if cleaned in {"Instagram_Post", fallback_shortcode}:
+        return ""
+    return cleaned
+
+
+def _is_bad_ig_caption_candidate(text: str, fallback_shortcode: str = "") -> bool:
+    if not text:
+        return True
+    low = text.lower().strip()
+    if text in {"Instagram_Post", fallback_shortcode}:
+        return True
+    bad_markers = [
+        "絕不錯過", "的任何貼文", "never miss any posts", "開始對話",
+        "尚無留言", "view translation", "查看翻譯",
+    ]
+    if any(x.lower() in low for x in bad_markers):
+        return True
+    return False
+
+
+def _get_ig_title(page, fallback_shortcode: str = ""):
+    # Prefer description metadata because it contains the full caption and is not
+    # polluted by follow prompts/comments in the visible sidebar.
     for sel in [
-        'meta[property="og:title"]',
-        'meta[name="twitter:title"]',
         'meta[property="og:description"]',
         'meta[name="description"]',
+        'meta[property="og:title"]',
+        'meta[name="twitter:title"]',
     ]:
         try:
-            val = page.locator(sel).first.get_attribute("content")
-
-            if val:
-                candidates.append(val)
-
+            val = page.locator(sel).first.get_attribute("content") or ""
+            clean = _clean_ig_caption_candidate(val, fallback_shortcode)
+            if clean and not _is_bad_ig_caption_candidate(clean, fallback_shortcode):
+                return clean
         except Exception:
             pass
 
     try:
-        title = page.title() or ""
-
-        if title:
-            candidates.append(title)
-
+        clean = _clean_ig_caption_candidate(page.title() or "", fallback_shortcode)
+        if clean and not _is_bad_ig_caption_candidate(clean, fallback_shortcode):
+            return clean
     except Exception:
         pass
-
-    for candidate in candidates:
-        cleaned = _clean_title(candidate, fallback_shortcode or "Instagram_Post")
-
-        if cleaned and cleaned != "Instagram_Post":
-            return cleaned
 
     return fallback_shortcode or "Instagram_Post"
 
 
+def _cache_prefetched_title(url: str, title: str) -> str:
+    shortcode = _extract_shortcode(url) or ""
+    clean = _safe_output_name(title, "", max_len=90).strip()
+    if shortcode and clean:
+        with _PREFETCHED_TITLES_LOCK:
+            _PREFETCHED_TITLES[shortcode] = clean
+    return clean
+
+
+def _get_prefetched_title(url: str) -> str:
+    shortcode = _extract_shortcode(url) or ""
+    if not shortcode:
+        return ""
+    with _PREFETCHED_TITLES_LOCK:
+        return _PREFETCHED_TITLES.get(shortcode, "") or ""
+
+
+def prefetch_post_title(url: str) -> tuple[str, str]:
+    """Resolve and publish the actual Instagram caption before media download."""
+    shortcode = _extract_shortcode(url) or ""
+    if not shortcode:
+        return "", "無法解析 Instagram shortcode"
+
+    cached = _get_prefetched_title(url)
+    if cached:
+        _publish_ig_task_title(url, cached)
+        return cached, "cached"
+
+    normalized = _normalize_ig_url(url)
+    context = None
+    browser = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--disable-infobars"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 980},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="zh-TW",
+            )
+            cookie_path = _cookie_file if (_cookie_file and os.path.exists(_cookie_file)) else COOKIES_FILE
+            cookies = _load_netscape_cookies(cookie_path, "instagram.com")
+            if cookies:
+                try:
+                    context.add_cookies(cookies)
+                except Exception:
+                    pass
+            try:
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            except Exception:
+                pass
+
+            page = context.new_page()
+            try:
+                _goto_instagram_target_clean(page, normalized, target_shortcode=shortcode, timeout=35000)
+            except PlaywrightTimeoutError:
+                logger.info(f"IG title prefetch goto timeout, use current page: {shortcode}")
+            page.wait_for_timeout(1800)
+            if _is_missing_ig_page(page):
+                return "", "MISSING"
+            if _is_generic_ig_page(page) or _is_ig_audience_restricted_page(page):
+                return "", "需要 IG Parser Profile"
+
+            title = _get_ig_full_caption_title(page, fallback_shortcode=shortcode)
+            clean = _cache_prefetched_title(url, title)
+            if clean and not _is_bad_ig_caption_candidate(clean, shortcode):
+                _publish_ig_task_title(url, clean)
+                logger.info(f"IG title prefetch completed before download: {clean}")
+                return clean, ""
+            return "", "未取得有效標題"
+    except Exception as e:
+        logger.info(f"IG title prefetch skipped: {e}")
+        return "", str(e)
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                browser.close()
+        except Exception:
+            pass
+
+
+def _publish_ig_task_title(task_url: str, title: str) -> None:
+    """Publish the resolved post caption to queue/UI without coupling downloader to GUI."""
+    clean = _safe_output_name(title, "", max_len=90).strip()
+    if not clean or _is_bad_ig_caption_candidate(clean, _extract_shortcode(task_url) or ""):
+        return
+    try:
+        import queue_manager
+        queue_manager.update_task_title(task_url, clean)
+    except Exception as e:
+        logger.debug(f"IG task title publish skipped: {e}")
+
+
+def _expand_ig_caption_more(page) -> bool:
+    """Expand Instagram's localized More button before reading a long caption."""
+    selectors = [
+        'button:has-text("更多")',
+        'div[role="button"]:has-text("更多")',
+        'span:has-text("更多")',
+        'button:has-text("more")',
+        'div[role="button"]:has-text("more")',
+        'span:has-text("more")',
+        'button:has-text("顯示更多")',
+        'div[role="button"]:has-text("顯示更多")',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 8)
+            for i in range(count):
+                item = loc.nth(i)
+                try:
+                    if not item.is_visible(timeout=250):
+                        continue
+                    txt = (item.inner_text(timeout=500) or "").strip().lower()
+                    if txt not in {"更多", "more", "顯示更多"} and not txt.endswith("更多"):
+                        continue
+                    item.click(timeout=1200, force=True)
+                    page.wait_for_timeout(650)
+                    logger.info("IG caption 已點擊『更多 / more』展開完整內文")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return False
+
+
+def _get_ig_full_caption_title(page, fallback_shortcode: str = "") -> str:
+    """Read the true post caption, preferring metadata over UI/sidebar text."""
+    _expand_ig_caption_more(page)
+
+    # Meta description is the most stable source for the actual caption and keeps
+    # secondary lines such as 贊助 bk8 / 贊助 me88.  Clean the engagement prefix.
+    for sel in ['meta[property="og:description"]', 'meta[name="description"]']:
+        try:
+            value = page.locator(sel).first.get_attribute("content") or ""
+            clean = _clean_ig_caption_candidate(value, fallback_shortcode)
+            if clean and not _is_bad_ig_caption_candidate(clean, fallback_shortcode):
+                logger.info(f"IG post title resolved from metadata caption: {clean}")
+                return clean
+        except Exception:
+            pass
+
+    # DOM fallback: stay inside the post article/dialog and score meaningful text.
+    candidates = []
+    selectors = [
+        'article h1',
+        'div[role="dialog"] h1',
+        'article ul li span[dir="auto"]',
+        'article div[dir="auto"] span',
+        'div[role="dialog"] ul li span[dir="auto"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 20)
+            for i in range(count):
+                node = loc.nth(i)
+                if not node.is_visible(timeout=300):
+                    continue
+                value = node.inner_text(timeout=800) or ""
+                clean = _clean_ig_caption_candidate(value, fallback_shortcode)
+                if not clean or _is_bad_ig_caption_candidate(clean, fallback_shortcode):
+                    continue
+                score = len(clean)
+                if re.search(r"[，。！？!?]", clean):
+                    score += 80
+                if "贊助" in clean or "赞助" in clean:
+                    score += 30
+                candidates.append((score, clean))
+        except Exception:
+            continue
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        clean = candidates[0][1]
+        logger.info(f"IG post title resolved from scoped DOM caption: {clean}")
+        return clean
+
+    return _get_ig_title(page, fallback_shortcode=fallback_shortcode)
 
 def _is_missing_ig_page(page) -> bool:
     """
@@ -1221,139 +1497,124 @@ def _is_generic_ig_page(page) -> bool:
     return False
 
 def _get_current_slide_main_media(page):
-    js = """
-    () => {
+    """Return the visible slide's full-frame, highest-resolution media URL.
+
+    Instagram often exposes square/cropped CDN variants alongside the real 4:5
+    source.  This resolver loads candidate dimensions in-page and strongly
+    prefers the URL whose intrinsic aspect ratio matches the visible media frame.
+    """
+    js = r"""
+    async () => {
       const scopes = [];
       const dialog = document.querySelector('div[role="dialog"]');
       const article = document.querySelector('article');
-
       if (dialog) scopes.push(dialog);
       if (article) scopes.push(article);
-      if (scopes.length === 0) scopes.push(document);
-
-      const result = [];
+      if (!scopes.length) scopes.push(document);
 
       function bad(low) {
-        const blackList = [
-          'static.cdninstagram.com',
-          '/rsrc.php',
-          'instagram.com/static',
-          'profile_pic',
-          's150x150',
-          's100x100',
-          's32x32',
-          's40x40',
-          's50x50',
-          's64x64',
-          'emoji',
-          'sprite',
-          'icon',
-          'logo',
-          't51.2885-19',
-          't51.82787-19',
-          '_nc_sid=bf7eb4',
-          'favicon',
-          'apple-touch-icon'
-        ];
-
-        return blackList.some(x => low.includes(x));
+        return [
+          'static.cdninstagram.com','/rsrc.php','instagram.com/static','profile_pic',
+          's150x150','s100x100','s32x32','s40x40','s50x50','s64x64',
+          'emoji','sprite','icon','logo','t51.2885-19','t51.82787-19',
+          '_nc_sid=bf7eb4','favicon','apple-touch-icon'
+        ].some(x => low.includes(x));
       }
 
-      function pushCandidate(el, src) {
-        if (!src) return;
-
-        const low = src.toLowerCase();
-
-        if (bad(low)) return;
-
-        const looksReal =
-          low.includes('.mp4') ||
-          low.includes('.m4v') ||
-          low.includes('.mov') ||
-          low.includes('cdninstagram.com') ||
-          low.includes('fbcdn.net') ||
-          low.includes('instagram.f');
-
-        if (!looksReal) return;
-
+      function visible(el) {
         const r = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-
-        const w = r.width || 0;
-        const h = r.height || 0;
-        const left = r.left || 0;
-        const top = r.top || 0;
-
-        const visible = (
-          style.display !== 'none' &&
-          style.visibility !== 'hidden' &&
-          parseFloat(style.opacity || '1') > 0 &&
-          w >= 120 &&
-          h >= 120 &&
-          left > -600 &&
-          top > -600 &&
-          left < window.innerWidth + 600 &&
-          top < window.innerHeight + 600
-        );
-
-        if (!visible) return;
-
-        const naturalW = el.naturalWidth || el.videoWidth || 0;
-        const naturalH = el.naturalHeight || el.videoHeight || 0;
-
-        const centerX = left + w / 2;
-        const centerY = top + h / 2;
-
-        // Instagram carousel keeps adjacent slides/preload images in the DOM.
-        // Those preloaded images can have a higher natural resolution than the
-        // currently visible slide.  The old score used naturalArea heavily, so
-        // it could pick slide 03 while the active slide was actually 01.
-        // Prefer the image closest to the visible media area's center; use
-        // natural size only as a very small tie-breaker.
-        const mediaCenterX = (left < window.innerWidth * 0.55) ? (window.innerWidth * 0.33) : (window.innerWidth / 2);
-        const mediaCenterY = window.innerHeight / 2;
-        const dx = Math.abs(centerX - mediaCenterX);
-        const dy = Math.abs(centerY - mediaCenterY);
-        const viewportOverlapX = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
-        const viewportOverlapY = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
-        const viewportOverlap = viewportOverlapX * viewportOverlapY;
-
-        result.push({
-          type: el.tagName.toLowerCase() === 'video' ? 'video' : 'image',
-          src,
-          score: (viewportOverlap * 8) + (w * h) - (dx * 6000 + dy * 80) + (((naturalW || 0) * (naturalH || 0)) / 2000),
-          area: w * h,
-          naturalArea: (naturalW || 0) * (naturalH || 0),
-          centerX,
-          centerY,
-          dx,
-          dy
-        });
+        const st = getComputedStyle(el);
+        return st.display !== 'none' && st.visibility !== 'hidden' &&
+          parseFloat(st.opacity || '1') > 0 && r.width >= 120 && r.height >= 120 &&
+          r.right > -40 && r.bottom > -40 && r.left < innerWidth + 40 && r.top < innerHeight + 40;
       }
 
+      const raw = [];
       for (const scope of scopes) {
-        const nodes = Array.from(scope.querySelectorAll('img, video'));
-
+        const nodes = Array.from(scope.querySelectorAll('img, video')).filter(visible);
         for (const el of nodes) {
-          pushCandidate(el, (el.currentSrc || el.src || '').trim());
-          pushCandidate(el, (el.getAttribute('src') || '').trim());
+          const r = el.getBoundingClientRect();
+          const frameRatio = r.height ? r.width / r.height : 0;
+          const centerX = r.left + r.width / 2;
+          const centerY = r.top + r.height / 2;
+          const mediaCenterX = r.left < innerWidth * 0.55 ? innerWidth * 0.33 : innerWidth / 2;
+          const mediaCenterY = innerHeight / 2;
+          const dx = Math.abs(centerX - mediaCenterX);
+          const dy = Math.abs(centerY - mediaCenterY);
+          const overlapX = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+          const overlapY = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+          const base = overlapX * overlapY * 8 + r.width * r.height - dx * 6000 - dy * 80;
 
+          const urls = new Map();
+          const add = (u, bonus=0) => {
+            u = (u || '').trim();
+            if (!u) return;
+            const low = u.toLowerCase();
+            if (bad(low)) return;
+            if (!(low.includes('.mp4') || low.includes('.m4v') || low.includes('.mov') ||
+                  low.includes('cdninstagram.com') || low.includes('fbcdn.net') || low.includes('instagram.f'))) return;
+            urls.set(u, Math.max(urls.get(u) || 0, bonus));
+          };
+
+          add(el.currentSrc || el.src || '', 3000);
+          add(el.getAttribute('src') || '', 2000);
           const srcset = el.getAttribute('srcset') || '';
+          for (const part of srcset.split(',').map(x => x.trim()).filter(Boolean)) {
+            const bits = part.split(/\s+/);
+            const u = bits[0];
+            const d = bits[1] || '';
+            let bonus = 6000;
+            if (d.endsWith('w')) bonus += (parseInt(d, 10) || 0) * 20;
+            if (d.endsWith('x')) bonus += Math.floor((parseFloat(d) || 1) * 15000);
+            add(u, bonus);
+          }
 
-          if (srcset) {
-            const parts = srcset.split(',').map(x => x.trim()).filter(Boolean);
-
-            for (const part of parts) {
-              const u = part.split(/\\s+/)[0];
-              pushCandidate(el, u);
-            }
+          for (const [src, bonus] of urls.entries()) {
+            raw.push({
+              elType: el.tagName.toLowerCase(), src, bonus, base, frameRatio,
+              renderWidth: r.width, renderHeight: r.height
+            });
           }
         }
       }
 
-      result.sort((a, b) => b.score - a.score);
+      raw.sort((a,b) => (b.base + b.bonus) - (a.base + a.bonus));
+      const limited = raw.slice(0, 28);
 
-      return result;
+      const measured = await Promise.all(limited.map(async c => {
+        if (c.elType === 'video' || /\.(mp4|m4v|mov)(\?|$)/i.test(c.src)) {
+          return {...c, type:'video', sourceWidth:0, sourceHeight:0, score:c.base+c.bonus+1000000};
+        }
+        const dims = await new Promise(resolve => {
+          const img = new Image();
+          const timer = setTimeout(() => resolve([0,0]), 3500);
+          img.onload = () => { clearTimeout(timer); resolve([img.naturalWidth || 0, img.naturalHeight || 0]); };
+          img.onerror = () => { clearTimeout(timer); resolve([0,0]); };
+          img.src = c.src;
+        });
+        const sw = dims[0], sh = dims[1];
+        const sourceRatio = sh ? sw / sh : 0;
+        let ratioPenalty = 0;
+        if (c.frameRatio > 0 && sourceRatio > 0) {
+          ratioPenalty = Math.abs(Math.log(sourceRatio / c.frameRatio)) * 4500000;
+        }
+        let cropPenalty = 0;
+        const low = c.src.toLowerCase();
+        if (low.includes('c288.0.864.864a')) cropPenalty += 2500000;
+        const m = low.match(/p(\d{3,4})x(\d{3,4})/);
+        if (m && c.frameRatio > 0) {
+          const ur = parseInt(m[1],10) / Math.max(1, parseInt(m[2],10));
+          cropPenalty += Math.abs(Math.log(ur / c.frameRatio)) * 2500000;
+        }
+        const pixelBonus = sw * sh / 2;
+        return {
+          ...c, type:'image', sourceWidth:sw, sourceHeight:sh,
+          sourceRatio, score:c.base+c.bonus+pixelBonus-ratioPenalty-cropPenalty
+        };
+      }));
+
+      measured.sort((a,b) => b.score - a.score);
+      return measured;
     }
     """
 
@@ -1362,10 +1623,8 @@ def _get_current_slide_main_media(page):
     except Exception:
         items = []
 
-    items = _dedupe_media(items)
-
+    items = _dedupe_media(items, preserve_order=False)
     return items[:1] if items else []
-
 
 def _get_meta_ig_media(page):
     items = []
@@ -2133,7 +2392,7 @@ def _extract_profile_post_urls_from_page(page) -> list[str]:
         text = html.unescape(unquote(str(value or "")))
         if not text:
             continue
-        text = text.replace('\u002f', '/').replace('\/', '/')
+        text = text.replace(r'\u002f', '/').replace(r'\/', '/')
         for pat in patterns:
             for m in re.finditer(pat, text, flags=re.I):
                 candidates.append(m.group(0))
@@ -2594,6 +2853,29 @@ def _extract_ig_media_from_text(text: str):
     return _dedupe_media(items)
 
 
+def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, str]:
+    """Reject cropped image variants that do not match the visible post frame."""
+    if Image is None or not path or not os.path.exists(path):
+        return True, ""
+    if (item.get("type") or "image") == "video":
+        return True, ""
+    expected = float(item.get("frameRatio") or item.get("renderRatio") or 0)
+    if expected <= 0:
+        return True, ""
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+        if w <= 0 or h <= 0:
+            return False, "圖片尺寸無效"
+        actual = w / h
+        delta = abs(actual - expected) / max(expected, 0.01)
+        if delta > 0.18:
+            return False, f"下載圖片比例與貼文畫面不符：expected={expected:.3f}, actual={actual:.3f}, size={w}x{h}"
+        return True, ""
+    except Exception as e:
+        return True, f"geometry-check-skipped: {e}"
+
+
 def _download_filtered_items_from_context(context, filtered, harvested_media, title: str, shortcode: str, referer: str):
     """Write filtered IG media items and move them using existing move_files()."""
     success_count = 0
@@ -2628,6 +2910,20 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
                     dst,
                     referer=referer,
                 )
+
+            # _write_media_body may change extension based on magic bytes. Locate the
+            # actual file and reject square/cropped variants when the visible post
+            # frame is portrait/landscape. This prevents false SUCCESS.
+            actual_candidates = [x for x in _list_media_files(TEMP_DIR) if os.path.basename(x).startswith(f"ig_{i}")]
+            actual_path = actual_candidates[-1] if actual_candidates else dst
+            geometry_ok, geometry_reason = _validate_downloaded_media_geometry(actual_path, item)
+            if not geometry_ok:
+                try:
+                    if os.path.exists(actual_path):
+                        os.remove(actual_path)
+                except Exception:
+                    pass
+                raise Exception(geometry_reason)
             success_count += 1
 
         except Exception as e:
@@ -3171,7 +3467,8 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
                     "請重新貼目標貼文 URL 後重試。"
                 )
 
-        title = _get_ig_title(page, fallback_shortcode=shortcode or "Instagram_Post")
+        title = _get_prefetched_title(url) or _get_ig_full_caption_title(page, fallback_shortcode=shortcode or "Instagram_Post")
+        _publish_ig_task_title(url, title)
 
         # Critical scope fix:
         # The initial page load can fetch comments, avatars, recommendation posts,
@@ -3443,7 +3740,19 @@ def _collect_ig_media_playwright(url: str):
             _warmup_ig_page_for_media(page, is_reel=_is_ig_reel_url(url))
 
             if _is_missing_ig_page(page):
-                return "MISSING", "Instagram 顯示：很抱歉，此頁面無法使用；連結可能故障或頁面已遭移除"
+                # Headless/cookie context can falsely show the generic unavailable page
+                # for public legacy URLs such as /<username>/p/<shortcode>/.
+                # Verify once with the logged-in IG_Parser profile before declaring MISSING.
+                status_p, error_p = _collect_ig_media_playwright_persistent(
+                    p,
+                    url,
+                    reason="headless context reported missing; verify with logged-in IG_Parser profile",
+                )
+                if status_p == "SUCCESS":
+                    return status_p, error_p
+                if status_p in {"RETRY", "BLOCKED"}:
+                    return status_p, error_p
+                return "MISSING", error_p or "Instagram 顯示貼文不存在或已移除"
 
             if _is_ig_audience_restricted_page(page):
                 status_p, error_p = _collect_ig_media_playwright_persistent(
@@ -3465,10 +3774,11 @@ def _collect_ig_media_playwright(url: str):
                     return status_p, error_p
                 return "BLOCKED", error_p or "Playwright 看到的是 login / challenge / checkpoint 頁面，不是貼文主體"
 
-            title = _get_ig_title(
+            title = _get_prefetched_title(url) or _get_ig_full_caption_title(
                 page,
                 fallback_shortcode=shortcode or "Instagram_Post",
             )
+            _publish_ig_task_title(url, title)
 
             collected = []
             seen_media_keys = set()

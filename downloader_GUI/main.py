@@ -145,6 +145,7 @@ class _HiddenLoginButton:
 
 
 
+# v11.37: show resolved Instagram Post Title beside URL
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -170,6 +171,7 @@ class App:
         self._tree_sort_reverse = False
         self._tree_heading_base = {
             "url": "URL",
+            "title": "Post Title",
             "status": "狀態",
             "retry": "Retry",
         }
@@ -279,7 +281,8 @@ class App:
         self._status_padx = self._ui_px(6)
         self._filter_width = 8 if self._compact_ui else 9
         self._filter_downloading_width = 10 if self._compact_ui else 12
-        self._url_col_width = self._ui_px(620)
+        self._url_col_width = self._ui_px(500)
+        self._title_col_width = self._ui_px(420)
         self._status_col_width = self._ui_px(110)
         self._retry_col_width = self._ui_px(58)
 
@@ -548,10 +551,11 @@ class App:
         mid = tk.Frame(self.root, padx=self._pad_x)
         mid.pack(fill=tk.BOTH, expand=True)
 
-        cols = ("url", "status", "retry")
+        cols = ("url", "title", "status", "retry")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", selectmode="browse")
         self._bind_tree_sort_headings()
-        self.tree.column("url", width=self._url_col_width, stretch=True, minwidth=self._ui_px(300))
+        self.tree.column("url", width=max(self._ui_px(360), int(self._url_col_width * 0.58)), stretch=True, minwidth=self._ui_px(240))
+        self.tree.column("title", width=max(self._ui_px(300), int(self._url_col_width * 0.42)), stretch=True, minwidth=self._ui_px(220))
         self.tree.column("status", width=self._status_col_width, stretch=False, anchor="center")
         self.tree.column("retry", width=self._retry_col_width, stretch=False, anchor="center")
 
@@ -830,10 +834,10 @@ class App:
         self.tree.focus(iid)
         self._tree_context_iid = iid
 
-        vals = self.tree.item(iid, "values") or ("", "", "")
+        vals = self.tree.item(iid, "values") or ("", "", "", "")
         self._tree_context_url_snapshot = self._tree_url_by_iid.get(iid, "") or (vals[0] if len(vals) > 0 else "")
-        self._tree_context_status_snapshot = vals[1] if len(vals) > 1 else ""
-        self._tree_context_retry_snapshot = vals[2] if len(vals) > 2 else ""
+        self._tree_context_status_snapshot = vals[2] if len(vals) > 2 else ""
+        self._tree_context_retry_snapshot = vals[3] if len(vals) > 3 else ""
 
         try:
             self._tree_context_menu.tk_popup(event.x_root, event.y_root)
@@ -886,8 +890,8 @@ class App:
                 return
             vals = self.tree.item(iid, "values")
             url = self._tree_url_by_iid.get(iid, "")
-            status = vals[1] if len(vals) > 1 else ""
-            retry = vals[2] if len(vals) > 2 else ""
+            status = vals[2] if len(vals) > 2 else ""
+            retry = vals[3] if len(vals) > 3 else ""
 
         text = f"{url}\t{status}\t{retry}"
         self._copy_to_clipboard(text, "已複製選取列狀態")
@@ -1704,9 +1708,11 @@ class App:
         for t in display:
             full_url = t.get("url", "")
             url_short = full_url[:120] + ("…" if len(full_url) > 120 else "")
+            title = re.sub(r"\s+", " ", str(t.get("title", "") or "")).strip()
+            title_short = title[:80] + ("…" if len(title) > 80 else "")
             status = t["status"]
             tag = status if status in _STATUS_COLORS else "PENDING"
-            iid = self.tree.insert("", tk.END, values=(url_short, status, t["retry"]), tags=(tag,))
+            iid = self.tree.insert("", tk.END, values=(url_short, title_short, status, t["retry"]), tags=(tag,))
             self._tree_url_by_iid[iid] = full_url
 
         total = runtime.get("total", 0)

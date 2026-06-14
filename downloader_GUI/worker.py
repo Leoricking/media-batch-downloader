@@ -182,6 +182,32 @@ def _worker_loop():
                     if username:
                         status, error, profile_expanded = _handle_instagram_profile_expand(url)
                     else:
+                        queue_manager.update_runtime(
+                            phase="DOWNLOADING",
+                            message="正在讀取 Post Title...",
+                            active_url=url,
+                            cooldown_remaining=0,
+                        )
+                        try:
+                            prefetched_title, title_error = instagram.prefetch_post_title(url)
+                            if prefetched_title:
+                                logger.info(f"Post Title 已填入，開始下載: {prefetched_title}")
+                                queue_manager.update_runtime(
+                                    phase="DOWNLOADING",
+                                    message=f"已取得標題，開始下載：{prefetched_title}",
+                                    active_url=url,
+                                    cooldown_remaining=0,
+                                )
+                            else:
+                                logger.info(f"Post Title 預取略過，沿用下載階段解析: {title_error}")
+                                queue_manager.update_runtime(
+                                    phase="DOWNLOADING",
+                                    message="未預取到標題，開始下載並於下載階段補抓...",
+                                    active_url=url,
+                                    cooldown_remaining=0,
+                                )
+                        except Exception as e:
+                            logger.info(f"Post Title 預取失敗，繼續正常下載: {e}")
                         status, error = instagram.download(url)
                 elif "facebook.com" in url or "fb.watch" in url:
                     status, error = facebook.download(url)
