@@ -52,6 +52,7 @@ try:
 except Exception:
     load_netscape_cookies_to_playwright = None
 
+# v11.55 FB Share-Video Target Lock + Caption Filename
 # v11.23.2 Full Build: v11.22.1 Fast Retry Guard + Grid Tile Mode + Strict no-video fallback for incomplete galleries
 
 _cc = OpenCC("s2t") if OpenCC else None
@@ -113,6 +114,7 @@ def _is_fb_reel_url(url: str) -> bool:
     low = (url or "").lower()
     return any(x in low for x in [
         "/share/r/",
+        "/share/v/",
         "/reel/",
         "/reels/",
         "/watch/reel/",
@@ -4094,6 +4096,179 @@ def _build_photo_items_from_links(page, links, network_items: list[dict] | None 
     return viewer_items
 
 
+
+def _get_fb_video_caption_title(page, fallback: str) -> str:
+    """Resolve the target Facebook video/Reel caption without using a generic share ID.
+
+    Prefer scoped post text and description metadata.  Reject Facebook UI labels,
+    notification text, and generic Watch/Video titles.
+    """
+    candidates = []
+    selectors = [
+        'div[role="main"] div[data-ad-preview="message"]',
+        'div[role="article"] div[data-ad-preview="message"]',
+        'div[data-ad-preview="message"]',
+        'meta[property="og:description"]',
+        'meta[name="description"]',
+        'meta[property="og:title"]',
+        'meta[name="twitter:title"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = min(loc.count(), 8)
+            for i in range(count):
+                node = loc.nth(i)
+                if sel.startswith("meta"):
+                    raw = node.get_attribute("content") or ""
+                else:
+                    if not node.is_visible(timeout=300):
+                        continue
+                    raw = node.inner_text(timeout=900) or ""
+                raw = html.unescape(str(raw or ""))
+                raw = re.sub(r"\s+", " ", raw).strip()
+                if raw:
+                    candidates.append(raw)
+        except Exception:
+            continue
+
+    try:
+        raw_title = page.title() or ""
+        if raw_title:
+            candidates.append(raw_title)
+    except Exception:
+        pass
+
+    bad_exact = {
+        "facebook", "facebook watch", "facebook video", "watch", "video",
+        "log in or sign up to view", "登入或註冊即可查看",
+    }
+    for raw in candidates:
+        clean = _clean_fb_post_title_for_path(raw, fallback="")
+        low = clean.lower().strip()
+        if not clean or low in bad_exact:
+            continue
+        if clean.startswith("Facebook_Reel_") or clean == "Facebook_Post":
+            continue
+        if re.fullmatch(r"[0-9A-Za-z_-]{8,32}", clean):
+            continue
+        logger.info(f"FB target video caption resolved: {clean}")
+        return clean
+
+    return _clean_fb_post_title_for_path(fallback, fallback="Facebook_Video")
+
+
+def _strict_visible_fb_video_candidates(page) -> list[dict]:
+    """Collect only large, visible video elements from the current target page.
+
+    This deliberately excludes hidden/preloaded recommendation videos.
+    """
+    js = r"""
+    () => {
+      const roots = [];
+      const dialog = document.querySelector('div[role="dialog"]');
+      const article = document.querySelector('div[role="article"]');
+      const main = document.querySelector('div[role="main"]');
+      if (dialog) roots.push(dialog);
+      if (article) roots.push(article);
+      if (main) roots.push(main);
+      if (!roots.length) roots.push(document);
+
+      const W = window.innerWidth || 1600;
+      const H = window.innerHeight || 1000;
+      const out = [];
+      const seen = new Set();
+
+      function add(video, src, bonus) {
+        src = String(src || '').trim();
+        if (!src || seen.has(src)) return;
+        const low = src.toLowerCase();
+        if (!(low.includes('.mp4') || low.includes('.m4v') || low.includes('.mov') ||
+              low.includes('video') || low.includes('fbcdn.net'))) return;
+
+        const r = video.getBoundingClientRect();
+        const st = getComputedStyle(video);
+        const w = r.width || 0;
+        const h = r.height || 0;
+        if (st.display === 'none' || st.visibility === 'hidden' ||
+            parseFloat(st.opacity || '1') <= 0) return;
+        if (w < 240 || h < 180) return;
+        if (r.right < 0 || r.bottom < 0 || r.left > W || r.top > H) return;
+
+        const overlapX = Math.max(0, Math.min(r.right, W) - Math.max(r.left, 0));
+        const overlapY = Math.max(0, Math.min(r.bottom, H) - Math.max(r.top, 0));
+        const visibleArea = overlapX * overlapY;
+        if (visibleArea < 80000) return;
+
+        const cx = r.left + w / 2;
+        const cy = r.top + h / 2;
+        const centerPenalty = Math.abs(cx - W / 2) * 500 + Math.abs(cy - H / 2) * 120;
+        const naturalArea = (video.videoWidth || 0) * (video.videoHeight || 0);
+        const score = 9000000 + visibleArea * 6 + naturalArea + (bonus || 0) - centerPenalty;
+        seen.add(src);
+        out.push({type:'video', src, score, area:visibleArea, naturalArea});
+      }
+
+      for (const root of roots) {
+        for (const video of Array.from(root.querySelectorAll('video'))) {
+          add(video, video.currentSrc || '', 300000);
+          add(video, video.src || '', 250000);
+          add(video, video.getAttribute('src') || '', 200000);
+          for (const source of Array.from(video.querySelectorAll('source[src]'))) {
+            add(video, source.src || source.getAttribute('src') || '', 220000);
+          }
+        }
+      }
+      out.sort((a,b) => b.score - a.score);
+      return out;
+    }
+    """
+    try:
+        items = page.evaluate(js) or []
+    except Exception:
+        items = []
+    return _dedupe_ordered(items)
+
+
+def _meta_fb_video_candidates(page) -> list[dict]:
+    """Collect target-page video metadata only; exclude image metadata."""
+    out = []
+    selectors = [
+        'meta[property="og:video"]',
+        'meta[property="og:video:url"]',
+        'meta[property="og:video:secure_url"]',
+        'meta[name="twitter:player:stream"]',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 6)):
+                src = loc.nth(i).get_attribute("content") or ""
+                if src and _looks_like_real_fb_media_url(src):
+                    out.append({
+                        "type": "video",
+                        "src": src,
+                        "score": 8500000 + _media_quality_score(src),
+                    })
+        except Exception:
+            continue
+    return _dedupe_ordered(out)
+
+
+def _fresh_network_video_candidates(network_items: list[dict]) -> list[dict]:
+    """Return only freshly captured video responses after the target video was activated."""
+    out = []
+    for cand in network_items or []:
+        src = cand.get("src") or ""
+        if cand.get("type") == "video" or any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]):
+            c2 = dict(cand)
+            c2["type"] = "video"
+            c2["score"] = int(c2.get("score") or 0) + 4000000
+            out.append(c2)
+    return _dedupe_ordered(out)
+
+
+
 def _collect_fb_media_playwright(url: str):
     clear_temp()
 
@@ -4224,64 +4399,78 @@ def _collect_fb_media_playwright(url: str):
 
             title = _clean_fb_post_title_for_path(_get_fb_title(page), fallback="Facebook_Post")
 
-            # Reel / share/r/ is a single-video route. Do not send it through the
+            # Reel / share/r/ / share/v/ is a single-video route. Do not send it through the
             # photo-gallery viewer pipeline; Facebook may preload many unrelated Reel
             # videos and thumbnails, and the gallery path can incorrectly move the
             # cover image as Facebook_Post.jpg. This branch only accepts a valid
             # video candidate; if no video is captured, it returns RETRY instead of
             # finalizing a .jpg.
             if _is_fb_reel_url(url) or _is_fb_reel_url(resolved) or _is_fb_reel_url(page.url):
-                reel_title = title
-                if _is_fallback_fb_title(reel_title):
-                    reel_title = _fb_reel_fallback_title(resolved or url)
+                fallback_reel_title = _fb_reel_fallback_title(resolved or url)
+                reel_title = _get_fb_video_caption_title(page, fallback=fallback_reel_title)
 
                 try:
+                    # Discard page-load preload traffic before activating the target video.
+                    # Facebook commonly preloads many unrelated feed/Reel MP4 files.
+                    network_items.clear()
+
+                    # Activate the largest visible target video/player area.
                     try:
-                        page.mouse.click(960, 600)
+                        clicked = page.evaluate(
+                            r"""
+                            () => {
+                              const W = innerWidth || 1600, H = innerHeight || 1000;
+                              const nodes = Array.from(document.querySelectorAll('video'));
+                              const visible = nodes.map(v => {
+                                const r = v.getBoundingClientRect();
+                                const st = getComputedStyle(v);
+                                const area = Math.max(0,r.width)*Math.max(0,r.height);
+                                const on = st.display !== 'none' && st.visibility !== 'hidden' &&
+                                  parseFloat(st.opacity||'1') > 0 && r.right > 0 && r.bottom > 0 &&
+                                  r.left < W && r.top < H && area > 50000;
+                                return {v,r,area,on};
+                              }).filter(x => x.on).sort((a,b)=>b.area-a.area);
+                              if (!visible.length) return false;
+                              const x = visible[0];
+                              try { x.v.click(); } catch(e) {}
+                              try { x.v.play(); } catch(e) {}
+                              return true;
+                            }
+                            """
+                        )
+                        if not clicked:
+                            page.mouse.click(960, 600)
                     except Exception:
-                        pass
+                        try:
+                            page.mouse.click(960, 600)
+                        except Exception:
+                            pass
 
-                    page.wait_for_timeout(2500)
+                    page.wait_for_timeout(3200)
 
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=6000)
-                    except Exception:
-                        pass
+                    # Highest trust: currently visible target video and target-page og:video.
+                    visible_video = _strict_visible_fb_video_candidates(page)
+                    meta_video = _meta_fb_video_candidates(page)
+                    fresh_network_video = _fresh_network_video_candidates(network_items)
 
-                    reel_candidates = _collect_current_page_candidates(
-                        page,
-                        network_items=network_items,
-                        include_network=True,
-                        include_meta=True,
-                        include_html=True,
+                    video_candidates = _dedupe_ordered(
+                        visible_video + meta_video + fresh_network_video
                     )
-
-                    video_candidates = []
-                    for cand in reel_candidates:
-                        src = cand.get("src") or ""
-                        if cand.get("type") == "video" or _is_probably_video_url(src) or any(
-                            x in src.lower() for x in [".mp4", ".m4v", ".mov"]
-                        ):
-                            c2 = dict(cand)
-                            c2["type"] = "video"
-                            c2["score"] = int(c2.get("score") or 0) + 3000000
-                            video_candidates.append(c2)
-
-                    video_candidates = _dedupe_ordered(video_candidates)
                     logger.info(
-                        f"FB Reel video candidate count={len(video_candidates)} "
-                        f"from total={len(reel_candidates)}"
+                        f"FB target video candidates: visible={len(visible_video)}, "
+                        f"meta={len(meta_video)}, fresh_network={len(fresh_network_video)}, "
+                        f"final={len(video_candidates)}"
                     )
 
                     if not video_candidates:
                         clear_temp()
-                        return "RETRY", "Facebook Reel 未擷取到有效影片候選，避免誤存封面圖為 jpg"
+                        return "RETRY", "Facebook 目標影片未擷取到可驗證候選，避免下載推薦或預載影片"
 
                     final_dst, size = _download_best_candidate(
                         context,
                         video_candidates,
                         os.path.join(TEMP_DIR, "fb_0001"),
-                        referer=resolved,
+                        referer=page.url or resolved,
                     )
                     logger.info(
                         f"FB Reel 主影片已下載: {os.path.basename(final_dst)} "

@@ -1,4 +1,5 @@
 import html
+import hashlib
 import http.cookiejar
 import os
 import re
@@ -51,6 +52,23 @@ def _to_traditional(text: str) -> str:
 
 logger = get_logger("instagram")
 
+# v11.66.6 Small Init-Segment Capture + Fragment Assembly
+# v11.66.5 Requested-Slide Video Prime + Init Segment Capture
+# v11.66.4 Browser Fragment Assembly + Complete Video Validation
+# v11.66.3 Complete MP4 Range Rebuild + No False SUCCESS
+# v11.66.2 Reject Fragment-Only MP4 Cache
+# v11.66.1 Single-Point Requested-Slide Video Replacement
+# v11.66 Restore v11.64 Baseline + Safe Title/Media Cache Fix
+# v11.64 Target-Dialog Lock + No-Scroll Carousel Walk
+# v11.63 Main-Media Focus + Verified ArrowRight Fallback
+# v11.62 Restore Carousel Hover/Selector Helpers
+# v11.61 Persistent Carousel Failure Isolation
+# v11.60 Spatially-Locked Carousel Next Click
+# v11.59 Trusted Locator Click + Global Carousel Scope
+# v11.58 Visible Arrow Coordinate Click + Visual Frame Verification
+# v11.57 Real Mouse Next-Arrow + Slide-State Verification
+# v11.56 Age-Restricted Profile Unlock + Carousel Gesture Fallback
+# v11.55 Restricted Carousel Robust Next Click
 # v11.52 Canonical First-Slide Navigation Lock
 # v11.50 Dynamic Carousel End-Walk Lock
 # v11.49 Sponsored Carousel Full-Slide Lock
@@ -1163,6 +1181,16 @@ def _clean_ig_caption_candidate(raw: str, fallback_shortcode: str = "") -> str:
 
     # Remove only the wrapping metadata quote, not quotation marks inside caption.
     text = text.strip()
+
+    # Restricted/profile-backed posts can expose only engagement/date metadata,
+    # e.g. "2,529 likes, 20 comments - tjztimes 於 March 17, 2026".
+    # This is not the caption and must not become the output folder name.
+    engagement_only_patterns = [
+        r'^\s*[\d.,]+(?:[KMB萬千])?\s+likes?\s*,\s*[\d.,]+(?:[KMB萬千])?\s+comments?\s*-\s*[^:：]{1,120}\s+(?:on|於)\s+.+$',
+        r'^\s*[\d.,]+(?:[KMB萬千])?\s*(?:個)?讚\s*[，,]\s*[\d.,]+(?:[KMB萬千])?\s*(?:則)?留言\s*-\s*[^:：]{1,120}\s*(?:於|在)\s+.+$',
+    ]
+    if any(re.fullmatch(pat, text, flags=re.I) for pat in engagement_only_patterns):
+        return ""
     if len(text) >= 2 and text[0] in {'"', '“'} and text[-1] in {'"', '”'}:
         text = text[1:-1].strip()
     else:
@@ -1814,45 +1842,402 @@ def _get_meta_ig_media(page):
     return _dedupe_media(items)
 
 
-def _click_next_ig(page):
-    selectors = [
+
+
+def _find_main_ig_media_geometry(page) -> dict:
+    """Find the active target-post media inside the visible post container.
+
+    Restricted posts often open as a dialog over the account grid.  Searching
+    document-wide can select a background profile tile or recommendation image.
+    This resolver therefore prefers the topmost visible role=dialog, then a
+    visible article, and never ranks media outside that target-post container.
+    """
+    try:
+        return page.evaluate(
+            r"""
+            () => {
+              const vw = innerWidth || 1600;
+              const vh = innerHeight || 1000;
+
+              const visible = el => {
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                return (
+                  st.display !== 'none' &&
+                  st.visibility !== 'hidden' &&
+                  parseFloat(st.opacity || '1') > 0 &&
+                  r.width > 40 &&
+                  r.height > 40 &&
+                  r.right > 0 &&
+                  r.bottom > 0 &&
+                  r.left < vw &&
+                  r.top < vh
+                );
+              };
+
+              const dialogs = Array.from(
+                document.querySelectorAll('div[role="dialog"]')
+              ).filter(visible);
+
+              const articles = Array.from(
+                document.querySelectorAll('article')
+              ).filter(visible);
+
+              let root = null;
+              let rootKind = '';
+
+              if (dialogs.length) {
+                dialogs.sort((a, b) => {
+                  const za = parseInt(getComputedStyle(a).zIndex || '0', 10) || 0;
+                  const zb = parseInt(getComputedStyle(b).zIndex || '0', 10) || 0;
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  return (zb - za) || (rb.width * rb.height - ra.width * ra.height);
+                });
+                root = dialogs[0];
+                rootKind = 'dialog';
+              } else if (articles.length) {
+                articles.sort((a, b) => {
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  const aa = Math.max(0, Math.min(ra.right, vw) - Math.max(ra.left, 0)) *
+                             Math.max(0, Math.min(ra.bottom, vh) - Math.max(ra.top, 0));
+                  const ab = Math.max(0, Math.min(rb.right, vw) - Math.max(rb.left, 0)) *
+                             Math.max(0, Math.min(rb.bottom, vh) - Math.max(rb.top, 0));
+                  return ab - aa;
+                });
+                root = articles[0];
+                rootKind = 'article';
+              } else {
+                root = document;
+                rootKind = 'document';
+              }
+
+              const rr = root === document
+                ? {left:0, top:0, right:vw, bottom:vh, width:vw, height:vh}
+                : root.getBoundingClientRect();
+
+              const nodes = Array.from(root.querySelectorAll('img,video'))
+                .map(el => {
+                  const r = el.getBoundingClientRect();
+                  const st = getComputedStyle(el);
+                  const src = (
+                    el.currentSrc || el.src ||
+                    el.getAttribute('src') || ''
+                  ).toLowerCase();
+
+                  const overlapX = Math.max(
+                    0, Math.min(r.right, vw, rr.right) -
+                    Math.max(r.left, 0, rr.left)
+                  );
+                  const overlapY = Math.max(
+                    0, Math.min(r.bottom, vh, rr.bottom) -
+                    Math.max(r.top, 0, rr.top)
+                  );
+                  const visibleArea = overlapX * overlapY;
+                  const cx = r.left + r.width / 2;
+                  const cy = r.top + r.height / 2;
+                  const ratio = r.height > 0 ? r.width / r.height : 0;
+
+                  const bad =
+                    src.includes('profile_pic') ||
+                    src.includes('s150x150') ||
+                    src.includes('s100x100') ||
+                    src.includes('s64x64') ||
+                    src.includes('emoji') ||
+                    src.includes('sprite') ||
+                    src.includes('static.cdninstagram.com') ||
+                    r.width < 220 ||
+                    r.height < 220 ||
+                    visibleArea < 45000 ||
+                    ratio < 0.25 ||
+                    ratio > 3.2 ||
+                    st.display === 'none' ||
+                    st.visibility === 'hidden' ||
+                    parseFloat(st.opacity || '1') <= 0;
+
+                  const realMedia =
+                    el.tagName.toLowerCase() === 'video' ||
+                    src.includes('cdninstagram.com') ||
+                    src.includes('fbcdn.net');
+
+                  // Prefer media pane on the left/center of the active post root.
+                  const targetX = rr.left + rr.width * 0.38;
+                  const targetY = rr.top + rr.height * 0.50;
+                  const centerPenalty =
+                    Math.abs(cx - targetX) * 900 +
+                    Math.abs(cy - targetY) * 650;
+
+                  const score =
+                    visibleArea * 18 +
+                    (realMedia ? 2200000 : 0) -
+                    centerPenalty;
+
+                  return {
+                    left:r.left, top:r.top, right:r.right, bottom:r.bottom,
+                    width:r.width, height:r.height,
+                    x:cx, y:cy, visibleArea, score, bad, src,
+                    rootKind,
+                    rootLeft:rr.left, rootTop:rr.top,
+                    rootRight:rr.right, rootBottom:rr.bottom,
+                    rootWidth:rr.width, rootHeight:rr.height
+                  };
+                })
+                .filter(x => !x.bad)
+                .sort((a,b) => b.score - a.score);
+
+              return nodes[0] || null;
+            }
+            """
+        ) or {}
+    except Exception:
+        return {}
+
+
+
+def _hover_main_ig_media(page) -> bool:
+    """Hover the actual post media to reveal carousel controls."""
+    media = _find_main_ig_media_geometry(page)
+    if not media:
+        return False
+
+    try:
+        page.mouse.move(float(media["x"]), float(media["y"]))
+        page.wait_for_timeout(500)
+        return True
+    except Exception as e:
+        logger.debug(f"IG main-media hover skipped: {e}")
+        return False
+
+
+
+def _carousel_next_selectors() -> list[str]:
+    """Return the shared localized selectors for carousel Next controls.
+
+    Spatial validation is still performed later, so unrelated top-page
+    「下一步」 buttons cannot pass solely because their label matches.
+    """
+    return [
         'button[aria-label="Next"]',
+        'button[aria-label*="Next" i]',
         'button[aria-label="下一張"]',
-        'button[aria-label="下一則"]',
-        'button[aria-label="下一步"]',
+        'button[aria-label*="下一" i]',
+        'button[aria-label*="次へ" i]',
+        'button:has(svg[aria-label="Next"])',
+        'button:has(svg[aria-label*="Next" i])',
+        'button:has(svg[aria-label*="下一" i])',
+        'button:has(svg[aria-label*="次へ" i])',
         'div[role="button"][aria-label="Next"]',
-        'div[role="button"][aria-label="下一張"]',
-        'div[role="button"][aria-label="下一則"]',
+        'div[role="button"][aria-label*="Next" i]',
+        'div[role="button"][aria-label*="下一" i]',
+        'div[role="button"][aria-label*="次へ" i]',
+        'div[role="button"]:has(svg[aria-label="Next"])',
+        'div[role="button"]:has(svg[aria-label*="Next" i])',
+        'div[role="button"]:has(svg[aria-label*="下一" i])',
+        'div[role="button"]:has(svg[aria-label*="次へ" i])',
         'svg[aria-label="Next"]',
-        'svg[aria-label="下一張"]',
+        'svg[aria-label*="Next" i]',
+        'svg[aria-label*="下一" i]',
+        'svg[aria-label*="次へ" i]',
+        '.coreSpriteRightChevron',
     ]
 
-    for sel in selectors:
+
+
+def _get_main_ig_media_rect(page) -> dict:
+    """Return the geometry selected by the shared main-media finder."""
+    return _find_main_ig_media_geometry(page)
+
+
+
+def _is_box_near_main_media_next(box: dict, media: dict) -> bool:
+    """Reject unrelated 下一步 buttons outside the media's right-edge zone."""
+    if not box or not media:
+        return False
+
+    try:
+        cx = float(box["x"]) + float(box["width"]) / 2.0
+        cy = float(box["y"]) + float(box["height"]) / 2.0
+        media_right = float(media["right"])
+        media_left = float(media["left"])
+        media_top = float(media["top"])
+        media_height = float(media["height"])
+        media_width = float(media["width"])
+        media_mid_y = media_top + media_height / 2.0
+    except Exception:
+        return False
+
+    horizontal_ok = (
+        cx >= media_right - 125
+        and cx <= media_right + 90
+        and cx >= media_left + media_width * 0.58
+    )
+    vertical_ok = abs(cy - media_mid_y) <= max(115, media_height * 0.34)
+    size_ok = (
+        float(box.get("width") or 0) >= 12
+        and float(box.get("height") or 0) >= 12
+        and float(box.get("width") or 0) <= 130
+        and float(box.get("height") or 0) <= 130
+    )
+    return bool(horizontal_ok and vertical_ok and size_ok)
+
+
+
+def _click_next_ig(page):
+    """Advance the active target-post carousel without scrolling the page.
+
+    The post can be displayed as a dialog above an account grid.  Playwright's
+    locator.click() may scroll an off-screen match into view and expose another
+    post.  This implementation accepts only controls already visible inside the
+    active dialog/article and clicks their current viewport coordinates.
+    """
+    _hover_main_ig_media(page)
+    media = _get_main_ig_media_rect(page)
+
+    if not media:
+        logger.warning("IG target-post media rectangle not found before Next click")
+        return False
+
+    try:
+        viewport_w = float(page.evaluate("() => innerWidth"))
+        viewport_h = float(page.evaluate("() => innerHeight"))
+    except Exception:
+        viewport_w, viewport_h = 1400.0, 1600.0
+
+    candidates = []
+    seen_keys = set()
+
+    for sel in _carousel_next_selectors():
         try:
             loc = page.locator(sel)
-
-            if loc.count() > 0:
-                target = loc.first
-
+            for i in range(min(loc.count(), 20)):
+                node = loc.nth(i)
                 try:
-                    target.click(timeout=1500)
+                    if not node.is_visible(timeout=250):
+                        continue
 
-                except Exception:
-                    handle = target.element_handle()
-
-                    if handle:
-                        page.evaluate(
-                            "(el) => el.closest('button, div[role=button]')?.click()",
-                            handle,
+                    clickable = node
+                    try:
+                        ancestor = node.locator(
+                            "xpath=ancestor-or-self::*[self::button or @role='button'][1]"
                         )
+                        if ancestor.count() > 0 and ancestor.first.is_visible(timeout=200):
+                            clickable = ancestor.first
+                    except Exception:
+                        pass
 
-                page.wait_for_timeout(1400)
-                return True
+                    box = clickable.bounding_box()
+                    if not box:
+                        continue
 
+                    # Never auto-scroll an element into view.  It must already be
+                    # inside the current target-post viewport.
+                    cx = float(box["x"]) + float(box["width"]) / 2.0
+                    cy = float(box["y"]) + float(box["height"]) / 2.0
+                    if not (2 <= cx <= viewport_w - 2 and 2 <= cy <= viewport_h - 2):
+                        continue
+
+                    if not _is_box_near_main_media_next(box, media):
+                        continue
+
+                    label = ""
+                    try:
+                        label = " ".join(filter(None, [
+                            clickable.get_attribute("aria-label") or "",
+                            clickable.get_attribute("title") or "",
+                            clickable.get_attribute("class") or "",
+                        ])).lower()
+                    except Exception:
+                        label = ""
+
+                    if any(x in label for x in [
+                        "previous", "上一張", "上一則", "上一步",
+                        "往回", "返回", "back", "leftchevron",
+                    ]):
+                        continue
+
+                    disabled = False
+                    try:
+                        disabled = bool(clickable.is_disabled())
+                    except Exception:
+                        pass
+                    try:
+                        disabled = disabled or (
+                            (clickable.get_attribute("aria-disabled") or "").lower() == "true"
+                        )
+                    except Exception:
+                        pass
+                    if disabled:
+                        continue
+
+                    key = (
+                        round(float(box["x"]), 1),
+                        round(float(box["y"]), 1),
+                        round(float(box["width"]), 1),
+                        round(float(box["height"]), 1),
+                    )
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    target_x = float(media["right"]) - 28.0
+                    target_y = float(media["top"]) + float(media["height"]) / 2.0
+                    distance = abs(cx - target_x) * 5.0 + abs(cy - target_y)
+                    candidates.append((distance, sel, box))
+                except Exception:
+                    continue
         except Exception:
             continue
 
+    candidates.sort(key=lambda x: x[0])
+
+    for _distance, sel, box in candidates:
+        try:
+            x = float(box["x"]) + float(box["width"]) / 2.0
+            y = float(box["y"]) + float(box["height"]) / 2.0
+            page.mouse.move(x, y)
+            page.wait_for_timeout(120)
+            page.mouse.click(x, y, delay=90)
+            page.wait_for_timeout(850)
+            logger.info(
+                f"IG target-dialog Next mouse click: selector={sel}, "
+                f"x={int(x)}, y={int(y)}"
+            )
+            return True
+        except Exception:
+            continue
+
+    # The arrow can be visually painted without a stable DOM label.  Click the
+    # visible media's right edge only when it is inside the viewport and target root.
+    try:
+        x = min(float(media["right"]) - 24.0, viewport_w - 3.0)
+        y = float(media["top"]) + float(media["height"]) / 2.0
+        root_top = float(media.get("rootTop") or 0.0)
+        root_bottom = float(media.get("rootBottom") or viewport_h)
+
+        if (
+            x > float(media["left"]) + float(media["width"]) * 0.60
+            and 2 <= x <= viewport_w - 2
+            and max(2.0, root_top) <= y <= min(viewport_h - 2.0, root_bottom)
+        ):
+            page.mouse.move(x, y)
+            page.wait_for_timeout(150)
+            page.mouse.click(x, y, delay=100)
+            page.wait_for_timeout(850)
+            logger.info(
+                f"IG target-dialog media-edge Next click: x={int(x)}, y={int(y)}, "
+                f"root={media.get('rootKind') or 'unknown'}"
+            )
+            return True
+    except Exception:
+        pass
+
+    logger.info(
+        f"IG target-dialog Next control not currently visible; "
+        f"skip scrolling and use keyboard fallback"
+    )
     return False
+
 
 
 def _click_next_ig_locked(page, target_shortcode: str) -> bool:
@@ -1998,11 +2383,137 @@ def _convert_webp_bytes_to_jpeg(body: bytes):
         return None
 
 
+
+def _is_complete_mp4_body(body: bytes) -> bool:
+    """Return True only for a self-contained MP4 file.
+
+    Instagram video playback may be delivered as fragmented MP4 range responses.
+    A media fragment beginning with `moof`/`mdat` but lacking the initialization
+    boxes `ftyp` and `moov` cannot be opened as a standalone .mp4 file.
+    """
+    if not body or len(body) < _MIN_FILE_SIZE:
+        return False
+
+    probe_head = body[:1024 * 1024]
+    probe_tail = body[-1024 * 1024:] if len(body) > 1024 * 1024 else b""
+
+    has_ftyp = b"ftyp" in body[:128]
+    has_moov = b"moov" in probe_head or b"moov" in probe_tail
+    return bool(has_ftyp and has_moov)
+
+
+
+
+def _is_playable_mp4_body(body: bytes) -> bool:
+    """Return True only when MP4 initialization and media payload are present."""
+    if not _is_complete_mp4_body(body):
+        return False
+
+    probe = body[:2 * 1024 * 1024]
+    if len(body) > 2 * 1024 * 1024:
+        probe += body[-2 * 1024 * 1024:]
+
+    return b"mdat" in probe or b"moof" in probe
+
+
+def _build_complete_mp4_from_harvested_candidates(candidates) -> bytes:
+    """Assemble one playable MP4 from browser-captured init/media fragments."""
+    parts = []
+    seen_hashes = set()
+
+    for candidate in candidates or []:
+        candidate_parts = list(candidate.get("parts") or [])
+
+        if candidate.get("body"):
+            candidate_parts.append({
+                "body": candidate.get("body"),
+                "content_range": candidate.get("content_range", ""),
+                "captured_at": candidate.get("captured_at", 0),
+            })
+
+        for part in candidate_parts:
+            body = part.get("body") or b""
+            if not body:
+                continue
+
+            digest = hashlib.sha256(body).hexdigest()
+            if digest in seen_hashes:
+                continue
+            seen_hashes.add(digest)
+
+            content_range = part.get("content_range", "") or ""
+            range_start = None
+            match = re.search(
+                r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
+                content_range,
+                flags=re.I,
+            )
+            if match:
+                range_start = int(match.group(1))
+
+            parts.append({
+                "body": body,
+                "range_start": range_start,
+                "captured_at": float(part.get("captured_at") or 0),
+            })
+
+    for part in parts:
+        if _is_playable_mp4_body(part["body"]):
+            return part["body"]
+
+    init_parts = [
+        part for part in parts
+        if b"ftyp" in part["body"][:128]
+        and (
+            b"moov" in part["body"][:1024 * 1024]
+            or b"moov" in part["body"][-1024 * 1024:]
+        )
+    ]
+    media_parts = [
+        part for part in parts
+        if b"moof" in part["body"][:1024 * 1024]
+        or b"mdat" in part["body"][:1024 * 1024]
+    ]
+
+    if not init_parts or not media_parts:
+        return b""
+
+    media_parts.sort(
+        key=lambda part: (
+            part["range_start"] is None,
+            part["range_start"] if part["range_start"] is not None else 0,
+            part["captured_at"],
+        )
+    )
+
+    for init in sorted(init_parts, key=lambda part: part["captured_at"]):
+        rebuilt = bytearray(init["body"])
+        init_hash = hashlib.sha256(init["body"]).hexdigest()
+
+        for media in media_parts:
+            if hashlib.sha256(media["body"]).hexdigest() == init_hash:
+                continue
+            rebuilt.extend(media["body"])
+
+        body = bytes(rebuilt)
+        if _is_playable_mp4_body(body):
+            return body
+
+    return b""
+
+
+
 def _write_media_body(dst: str, body: bytes, media_url: str = "", content_type: str = "") -> int:
     if not _is_probably_valid_media_body(body, media_url=media_url, content_type=content_type):
         raise Exception(f"媒體內容無效或過小: {len(body) if body else 0} bytes")
 
     real_fmt = _detect_media_format_from_bytes(body, media_url=media_url, content_type=content_type)
+
+    if real_fmt == "mp4" and not _is_playable_mp4_body(body):
+        raise Exception(
+            "影片資料不是可獨立播放的完整 MP4（需同時包含 ftyp/moov 與 moof/mdat）"
+        )
+
     out_body = body
     out_path = dst
 
@@ -2053,43 +2564,281 @@ def _real_ext_for_file(path: str) -> str:
     return ext if ext in _MEDIA_EXTS else ".jpg"
 
 
+
+def _classify_mp4_fragment_body(body: bytes) -> str:
+    """Classify small/large MP4 response bodies.
+
+    Instagram's MP4 initialization segment can be much smaller than the normal
+    5 KiB media threshold.  Rejecting all bodies below _MIN_FILE_SIZE discards
+    the exact ftyp/moov segment required to assemble a playable fragmented MP4.
+    """
+    if not body or len(body) < 16:
+        return ""
+
+    head = body[:1024 * 1024]
+    tail = body[-1024 * 1024:] if len(body) > 1024 * 1024 else b""
+
+    has_ftyp = b"ftyp" in body[:128]
+    has_moov = b"moov" in head or b"moov" in tail
+    has_moof = b"moof" in head
+    has_mdat = b"mdat" in head or b"mdat" in tail
+
+    if has_ftyp and has_moov and (has_moof or has_mdat):
+        return "complete"
+    if has_ftyp or has_moov:
+        return "init"
+    if has_moof or has_mdat:
+        return "media"
+    return ""
+
+
+
 def _capture_playwright_response(response, harvested: dict):
-    """Harvest real browser-loaded IG media responses as a safe fallback."""
+    """Harvest IG media and preserve all video init/media fragments."""
     try:
         media_url = response.url or ""
-        if not _looks_like_real_ig_media_url(media_url):
-            return
         if response.status < 200 or response.status >= 300:
             return
 
         headers = response.headers or {}
-        content_type = headers.get("content-type", "") or headers.get("Content-Type", "") or ""
+        content_type = (
+            headers.get("content-type", "")
+            or headers.get("Content-Type", "")
+            or ""
+        )
+        content_range = (
+            headers.get("content-range", "")
+            or headers.get("Content-Range", "")
+            or ""
+        )
         low_ct = content_type.lower()
-        if low_ct and not (low_ct.startswith("image/") or low_ct.startswith("video/") or "octet-stream" in low_ct):
+        low_url = media_url.lower()
+        is_instagram_cdn = (
+            "cdninstagram.com" in low_url
+            or "fbcdn.net" in low_url
+            or "instagram.f" in low_url
+        )
+        is_video_response = (
+            low_ct.startswith("video/")
+            or "octet-stream" in low_ct
+            or any(x in low_url for x in [".mp4", ".m4v", ".mov"])
+        )
+
+        if not is_video_response and not _looks_like_real_ig_media_url(media_url):
+            return
+        if is_video_response and not is_instagram_cdn:
+            return
+
+        if low_ct and not (
+            low_ct.startswith("image/")
+            or low_ct.startswith("video/")
+            or "octet-stream" in low_ct
+        ):
             return
 
         body = response.body()
-        if not _is_probably_valid_media_body(body, media_url=media_url, content_type=content_type):
-            return
+        fragment_kind = (
+            _classify_mp4_fragment_body(body)
+            if is_video_response
+            else ""
+        )
 
-        media_type = "video" if any(x in media_url.lower() for x in [".mp4", ".m4v", ".mov"]) or low_ct.startswith("video/") else "image"
-        key = _media_key_from_url(media_url)
+        if is_video_response:
+            # MP4 init segments are commonly only a few hundred bytes to a few
+            # KiB. Keep them when they contain ftyp/moov even though they are
+            # smaller than the normal media-file threshold.
+            if not fragment_kind and not _is_probably_valid_media_body(
+                body,
+                media_url=media_url,
+                content_type=content_type,
+            ):
+                return
+        else:
+            if not _is_probably_valid_media_body(
+                body,
+                media_url=media_url,
+                content_type=content_type,
+            ):
+                return
+
+        is_video = is_video_response
         score = _media_quality_score(media_url) + len(body)
+        captured_at = time.time()
 
-        old = harvested.get(key)
-        if old and old.get("score", 0) >= score:
+        if not is_video:
+            key = _media_key_from_url(media_url)
+            old = harvested.get(key)
+            if old and old.get("score", 0) >= score:
+                return
+
+            harvested[key] = {
+                "src": html.unescape(unquote(media_url)),
+                "type": "image",
+                "body": body,
+                "content_type": content_type,
+                "content_range": content_range,
+                "captured_at": captured_at,
+                "score": score,
+                "from": "network",
+            }
             return
 
-        harvested[key] = {
-            "src": html.unescape(unquote(media_url)),
-            "type": media_type,
-            "body": body,
-            "content_type": content_type,
-            "score": score,
-            "from": "network",
-        }
+        key = "video::" + _normalized_media_identity(media_url)
+        record = harvested.get(key)
+
+        if not record:
+            record = {
+                "src": html.unescape(unquote(media_url)),
+                "type": "video",
+                "body": body,
+                "content_type": content_type,
+                "content_range": content_range,
+                "captured_at": captured_at,
+                "score": score,
+                "from": "network",
+                "parts": [],
+                "_part_hashes": set(),
+                "fragment_kinds": set(),
+            }
+            harvested[key] = record
+
+        digest = hashlib.sha256(body).hexdigest()
+        part_hashes = record.setdefault("_part_hashes", set())
+
+        if digest not in part_hashes:
+            part_hashes.add(digest)
+            record.setdefault("parts", []).append({
+                "body": body,
+                "content_type": content_type,
+                "content_range": content_range,
+                "captured_at": captured_at,
+                "src": html.unescape(unquote(media_url)),
+                "fragment_kind": fragment_kind,
+            })
+            if fragment_kind:
+                record.setdefault("fragment_kinds", set()).add(fragment_kind)
+
+        if score > int(record.get("score") or 0):
+            record["body"] = body
+            record["content_type"] = content_type
+            record["content_range"] = content_range
+            record["captured_at"] = captured_at
+            record["score"] = score
+            record["src"] = html.unescape(unquote(media_url))
+
     except Exception:
         return
+
+
+
+def _download_complete_mp4_with_ranges(context, url: str, dst: str, referer: str):
+    """Download and rebuild a complete MP4 from explicit byte ranges."""
+    headers_base = {
+        "Referer": referer or "https://www.instagram.com/",
+        "Accept": "video/mp4,video/*;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "identity",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    chunk_size = 2 * 1024 * 1024
+    assembled = bytearray()
+    total_size = None
+    offset = 0
+    max_total = 1024 * 1024 * 1024
+
+    for _ in range(1024):
+        end = offset + chunk_size - 1
+        headers = dict(headers_base)
+        headers["Range"] = f"bytes={offset}-{end}"
+
+        response = context.request.get(
+            url,
+            headers=headers,
+            timeout=90000,
+        )
+
+        if response.status not in {200, 206}:
+            raise Exception(
+                f"IG MP4 range request failed: HTTP {response.status}, "
+                f"range={offset}-{end}"
+            )
+
+        body = response.body()
+        if not body:
+            raise Exception(
+                f"IG MP4 range request returned empty body: range={offset}-{end}"
+            )
+
+        content_range = ""
+        try:
+            content_range = (
+                response.headers.get("content-range", "")
+                or response.headers.get("Content-Range", "")
+                or ""
+            )
+        except Exception:
+            content_range = ""
+
+        if content_range:
+            m = re.search(
+                r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
+                content_range,
+                flags=re.I,
+            )
+            if m:
+                start_byte = int(m.group(1))
+                end_byte = int(m.group(2))
+
+                if start_byte != offset:
+                    raise Exception(
+                        f"IG MP4 unexpected Content-Range start: "
+                        f"expected={offset}, actual={start_byte}"
+                    )
+
+                if m.group(3) != "*":
+                    total_size = int(m.group(3))
+                    if total_size <= 0 or total_size > max_total:
+                        raise Exception(
+                            f"IG MP4 invalid total size: {total_size}"
+                        )
+
+                expected_len = end_byte - start_byte + 1
+                if len(body) > expected_len:
+                    body = body[:expected_len]
+
+        if response.status == 200 and offset == 0:
+            assembled.extend(body)
+            break
+
+        assembled.extend(body)
+        offset += len(body)
+
+        if total_size is not None and offset >= total_size:
+            assembled = assembled[:total_size]
+            break
+
+        if len(body) < chunk_size and total_size is None:
+            break
+
+        if len(assembled) > max_total:
+            raise Exception("IG MP4 exceeded 1 GiB safety cap")
+
+    rebuilt = bytes(assembled)
+
+    if not _is_playable_mp4_body(rebuilt):
+        raise Exception(
+            "IG MP4 range rebuild incomplete: missing ftyp/moov initialization boxes"
+        )
+
+    return _write_media_body(
+        dst,
+        rebuilt,
+        media_url=url,
+        content_type="video/mp4",
+    )
+
 
 
 def _download_with_playwright_request(context, url: str, dst: str, referer: str):
@@ -2279,6 +3028,61 @@ def _get_persistent_manual_wait_seconds(default: int = 45) -> int:
     return max(5, min(180, value))
 
 
+
+def _try_confirm_ig_restricted_content(page) -> bool:
+    """Click only explicit Instagram age/audience confirmation controls.
+
+    Login alone is not always enough: Instagram can keep a per-post consent/
+    age-confirmation overlay in the dedicated persistent profile.  This helper
+    never clicks generic page buttons; it only accepts explicit localized text.
+    """
+    selectors = [
+        'button:has-text("查看貼文")',
+        'button:has-text("查看內容")',
+        'button:has-text("仍要查看")',
+        'button:has-text("繼續查看")',
+        'button:has-text("確認觀看")',
+        'button:has-text("我已年滿 18 歲")',
+        'button:has-text("我已年滿18歲")',
+        'button:has-text("Continue")',
+        'button:has-text("View Post")',
+        'button:has-text("View Content")',
+        'button:has-text("See Post")',
+        'button:has-text("I am 18 or older")',
+        'div[role="button"]:has-text("查看貼文")',
+        'div[role="button"]:has-text("查看內容")',
+        'div[role="button"]:has-text("仍要查看")',
+        'div[role="button"]:has-text("繼續查看")',
+        'div[role="button"]:has-text("確認觀看")',
+        'div[role="button"]:has-text("Continue")',
+        'div[role="button"]:has-text("View Post")',
+        'div[role="button"]:has-text("View Content")',
+    ]
+
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 8)):
+                node = loc.nth(i)
+                try:
+                    if not node.is_visible(timeout=250):
+                        continue
+                    text = re.sub(r"\s+", " ", node.inner_text(timeout=500) or "").strip()
+                    if not text:
+                        continue
+                    node.click(timeout=1800, force=True)
+                    page.wait_for_timeout(1400)
+                    logger.info(f"IG restricted-content confirmation clicked: {text}")
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return False
+
+
+
 def _manual_wait_persistent_profile(page, reason: str = ""):
     """Bring the visible Chrome fallback window forward and wait for user action."""
     wait_sec = _get_persistent_manual_wait_seconds()
@@ -2287,6 +3091,11 @@ def _manual_wait_persistent_profile(page, reason: str = ""):
         page.bring_to_front()
     except Exception:
         pass
+
+    auto_confirmed = _try_confirm_ig_restricted_content(page)
+    if auto_confirmed:
+        _warmup_ig_page_for_media(page, is_reel=_is_ig_reel_url(page.url or ""))
+        return
 
     logger.info(
         "IG persistent fallback 視窗已開啟；若看到『未滿18歲 / 特定對象 / 確認觀看 / 登入驗證』提示，"
@@ -2303,6 +3112,7 @@ def _manual_wait_persistent_profile(page, reason: str = ""):
     except Exception:
         pass
 
+    _try_confirm_ig_restricted_content(page)
     _warmup_ig_page_for_media(page, is_reel=_is_ig_reel_url(page.url or ""))
 
 
@@ -2888,7 +3698,7 @@ def _warmup_ig_page_for_media(page, is_reel: bool = False):
 
     for js in [
         "() => window.scrollBy(0, 260)",
-        "() => document.querySelector('article, main, div[role=\"dialog\"]')?.scrollIntoView({block:'center'})",
+        "() => { const r=document.querySelector('div[role=\"dialog\"]')||document.querySelector('article'); if(r){ try{r.setAttribute('tabindex','-1');r.focus({preventScroll:true});}catch(e){} } }",
         "() => { const v=document.querySelector('video'); if (v) { try { v.muted=true; v.play().catch(()=>{}); } catch(e){} } }",
     ]:
         try:
@@ -3034,6 +3844,187 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
         return True, f"geometry-check-skipped: {e}"
 
 
+
+def _normalized_media_identity(url: str) -> str:
+    """Return strict IG media identity using host + path, ignoring query tokens."""
+    try:
+        cleaned = html.unescape(unquote(str(url or "").strip()))
+        parsed = urlparse(cleaned)
+        host = (parsed.netloc or "").lower()
+        path = re.sub(r"/+", "/", parsed.path or "")
+        return f"{host}{path}".lower()
+    except Exception:
+        return str(url or "").strip().lower()
+
+
+def _find_exact_harvested_media(harvested_media: dict, item: dict):
+    """Return only the cached response belonging to this exact slide media."""
+    media_url = item.get("src", "") or ""
+    media_type = (item.get("type") or "image").lower()
+    wanted_identity = _normalized_media_identity(media_url)
+
+    best = None
+    best_score = -1
+
+    for candidate in (harvested_media or {}).values():
+        candidate_url = candidate.get("src", "") or ""
+        candidate_type = (candidate.get("type") or "image").lower()
+        content_type = (candidate.get("content_type") or "").lower()
+
+        if media_type == "video":
+            if candidate_type != "video" and not content_type.startswith("video/"):
+                continue
+        else:
+            if candidate_type == "video" or content_type.startswith("video/"):
+                continue
+
+        if _normalized_media_identity(candidate_url) != wanted_identity:
+            continue
+
+        score = int(candidate.get("score") or 0)
+        if candidate.get("body") and score > best_score:
+            best = candidate
+            best_score = score
+
+    return best
+
+
+
+
+def _replace_requested_slide_with_harvested_video(
+    filtered,
+    harvested_media,
+    original_url: str,
+    target_shortcode: str,
+):
+    """Replace only the requested image slot when a complete video can be built."""
+    requested_index = _get_requested_img_index(original_url)
+    if requested_index <= 1:
+        return filtered
+
+    slot = requested_index - 1
+    if slot < 0 or slot >= len(filtered):
+        return filtered
+
+    current_item = filtered[slot] or {}
+    current_type = (current_item.get("type") or "image").lower()
+    current_url = (current_item.get("src") or "").lower()
+
+    if current_type == "video" or any(
+        ext in current_url for ext in [".mp4", ".m4v", ".mov"]
+    ):
+        return filtered
+
+    video_candidates = []
+    for candidate in (harvested_media or {}).values():
+        if not isinstance(candidate, dict):
+            continue
+
+        candidate_url = candidate.get("src", "") or ""
+        candidate_type = (candidate.get("type") or "").lower()
+        content_type = (candidate.get("content_type") or "").lower()
+        body = candidate.get("body") or b""
+
+        is_video = (
+            candidate_type == "video"
+            or content_type.startswith("video/")
+            or any(
+                ext in candidate_url.lower()
+                for ext in [".mp4", ".m4v", ".mov"]
+            )
+            or _detect_media_format_from_bytes(
+                body[:64],
+                media_url=candidate_url,
+                content_type=content_type,
+            ) == "mp4"
+        )
+        if is_video:
+            video_candidates.append(candidate)
+
+    if not video_candidates:
+        logger.info(
+            f"IG requested-slide video replacement skipped: "
+            f"img_index={requested_index}, harvested_video=0, "
+            f"target={target_shortcode}"
+        )
+        return filtered
+
+    init_parts = 0
+    media_parts = 0
+    complete_parts = 0
+    for candidate in video_candidates:
+        for part in list(candidate.get("parts") or []):
+            kind = part.get("fragment_kind") or _classify_mp4_fragment_body(
+                part.get("body") or b""
+            )
+            if kind == "init":
+                init_parts += 1
+            elif kind == "media":
+                media_parts += 1
+            elif kind == "complete":
+                complete_parts += 1
+
+    logger.info(
+        f"IG requested-slide video fragment inventory: "
+        f"img_index={requested_index}, init={init_parts}, "
+        f"media={media_parts}, complete={complete_parts}, "
+        f"candidates={len(video_candidates)}, target={target_shortcode}"
+    )
+
+    complete_body = _build_complete_mp4_from_harvested_candidates(
+        video_candidates
+    )
+
+    video_candidates.sort(
+        key=lambda item: (
+            int(item.get("score") or 0),
+            len(item.get("body") or b""),
+        ),
+        reverse=True,
+    )
+    chosen = video_candidates[0]
+    chosen_url = chosen.get("src", "") or ""
+
+    if not chosen_url:
+        return filtered
+
+    replacement = {
+        **current_item,
+        "src": chosen_url,
+        "type": "video",
+        "score": max(
+            int(current_item.get("score") or 0),
+            int(chosen.get("score") or 0),
+        ),
+        "requested_slide_video_replacement": True,
+    }
+
+    if complete_body:
+        replacement["_complete_video_body"] = complete_body
+        logger.info(
+            f"IG requested-slide complete video assembled: "
+            f"img_index={requested_index}, bytes={len(complete_body)}, "
+            f"candidates={len(video_candidates)}, target={target_shortcode}"
+        )
+    else:
+        logger.info(
+            f"IG requested-slide video fragments captured but not complete: "
+            f"img_index={requested_index}, candidates={len(video_candidates)}, "
+            f"target={target_shortcode}; use range fallback"
+        )
+
+    replaced = list(filtered)
+    replaced[slot] = replacement
+
+    logger.info(
+        f"IG requested-slide video replacement applied: "
+        f"img_index={requested_index}, candidates={len(video_candidates)}, "
+        f"target={target_shortcode}"
+    )
+    return replaced
+
+
+
 def _download_filtered_items_from_context(context, filtered, harvested_media, title: str, shortcode: str, referer: str):
     """Write filtered IG media items and move them using existing move_files()."""
     success_count = 0
@@ -3052,22 +4043,76 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
         media_key = _media_key_from_url(media_url)
 
         try:
-            harvested = harvested_media.get(media_key)
-            if harvested and harvested.get("body"):
+            embedded_video_body = item.get("_complete_video_body") or b""
+            harvested = _find_exact_harvested_media(harvested_media, item)
+            harvested_body = harvested.get("body") if harvested else b""
+            harvested_type = (
+                (harvested.get("type") or "").lower() if harvested else ""
+            )
+            harvested_content_type = (
+                harvested.get("content_type", "") if harvested else ""
+            )
+            is_video_item = (
+                media_type == "video"
+                or harvested_type == "video"
+                or harvested_content_type.lower().startswith("video/")
+                or any(x in media_url.lower() for x in [".mp4", ".m4v", ".mov"])
+            )
+
+            use_cached_body = bool(harvested_body)
+            fragment_video = bool(
+                use_cached_body
+                and is_video_item
+                and not _is_playable_mp4_body(harvested_body)
+            )
+
+            if embedded_video_body:
                 _write_media_body(
                     dst,
-                    harvested.get("body"),
+                    embedded_video_body,
                     media_url=media_url,
-                    content_type=harvested.get("content_type", ""),
+                    content_type="video/mp4",
                 )
-                logger.info(f"IG 使用 browser network cache 寫入第 {i} 個媒體")
-            else:
-                _download_with_playwright_request(
+                logger.info(
+                    f"IG 第 {i} 個影片使用 browser init/media fragments "
+                    "組成完整 MP4"
+                )
+            elif fragment_video:
+                logger.info(
+                    f"IG 第 {i} 個影片 cache 為 fragmented MP4 segment；"
+                    "從 byte 0 重新分段下載並重建完整 MP4"
+                )
+                _download_complete_mp4_with_ranges(
                     context,
                     media_url,
                     dst,
                     referer=referer,
                 )
+                logger.info(f"IG 第 {i} 個影片完整 MP4 重建完成")
+            elif use_cached_body:
+                _write_media_body(
+                    dst,
+                    harvested_body,
+                    media_url=media_url,
+                    content_type=harvested_content_type,
+                )
+                logger.info(f"IG 使用 browser network cache 寫入第 {i} 個媒體")
+            else:
+                if is_video_item:
+                    _download_complete_mp4_with_ranges(
+                        context,
+                        media_url,
+                        dst,
+                        referer=referer,
+                    )
+                    logger.info(f"IG 第 {i} 個影片完整 MP4 下載完成")
+                else:
+                    _download_with_playwright_request(
+                        context,
+                        media_url,
+                        dst,
+                        referer=referer,
+                    )
 
             # _write_media_body may change extension based on magic bytes. Locate the
             # actual file and reject square/cropped variants when the visible post
@@ -3085,12 +4130,23 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
             success_count += 1
 
         except Exception as e:
+            if item.get("requested_slide_video_replacement"):
+                raise Exception(
+                    f"IG requested slide video download failed at index {i}: {e}"
+                ) from e
             logger.warning(f"IG 略過無效媒體: {media_url[:180]} | {e}")
 
     if success_count <= 0:
         return "RETRY", "Playwright 有抓到媒體 URL，但本輪全部下載失敗或過小；可能是 IG CDN 暫時空回應，建議稍後重試"
 
     temp_files_after_capture = _list_media_files(TEMP_DIR)
+
+    if success_count != len(filtered) or len(temp_files_after_capture) != len(filtered):
+        return "RETRY", (
+            f"IG 媒體完整性檢查失敗：expected={len(filtered)}, "
+            f"written={success_count}, temp_files={len(temp_files_after_capture)}"
+        )
+
     logger.info(
         f"IG Playwright 已成功寫入 {success_count} 個媒體；"
         f"TEMP 有效檔案={len(temp_files_after_capture)}，準備搬移"
@@ -3498,13 +4554,571 @@ def _wait_for_current_media_key_change(page, before_key: str, target_shortcode: 
     return ""
 
 
-def _click_next_ig_locked_keycheck(page, target_shortcode: str) -> bool:
-    """Advance one real slide and verify the active media changed.
 
-    This is used only by confirmed carousel posts.  It does not run for normal
-    single-image posts or Reels.
+
+def _get_carousel_state_signature(page) -> str:
+    """Return a slide signature that survives IG reusing the same img element."""
+    try:
+        data = page.evaluate(
+            r"""
+            () => {
+              const root = document.querySelector('div[role="dialog"]') || document.querySelector('article');
+              if (!root) return {key:'', dot:-1, transform:''};
+              const media = Array.from(root.querySelectorAll('img,video'))
+                .map(el => { const r=el.getBoundingClientRect(), st=getComputedStyle(el); return {el,r,area:r.width*r.height,ok:st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>0&&r.width>120&&r.height>120&&r.right>0&&r.bottom>0&&r.left<innerWidth&&r.top<innerHeight}; })
+                .filter(x=>x.ok).sort((a,b)=>b.area-a.area)[0];
+              let key='', transform='';
+              if (media) {
+                const el=media.el;
+                key=el.currentSrc||el.src||el.getAttribute('src')||'';
+                let p=el;
+                for(let i=0;i<5&&p;i++,p=p.parentElement){const tr=getComputedStyle(p).transform||'';if(tr&&tr!=='none'){transform=tr;break;}}
+              }
+              let dot=-1;
+              const dots=Array.from(root.querySelectorAll('[aria-current],button,div,span'))
+                .map(el=>{const r=el.getBoundingClientRect(),st=getComputedStyle(el),aria=(el.getAttribute('aria-current')||'').toLowerCase(),cls=(el.getAttribute('class')||'').toLowerCase();return {r,active:aria==='true'||aria==='page'||cls.includes('active')||cls.includes('selected'),op:parseFloat(st.opacity||'1')};})
+                .filter(x=>x.op>0&&x.r.width>=3&&x.r.height>=3&&x.r.width<=24&&x.r.height<=24&&x.r.top>innerHeight*0.45)
+                .sort((a,b)=>a.r.left-b.r.left);
+              const compact=[];
+              for(const x of dots){const cx=x.r.left+x.r.width/2;if(!compact.length||Math.abs((compact[compact.length-1].r.left+compact[compact.length-1].r.width/2)-cx)>7)compact.push(x);}
+              dot=compact.findIndex(x=>x.active);
+              return {key,dot,transform};
+            }
+            """
+        ) or {}
+    except Exception:
+        data={}
+    raw_key=str(data.get('key') or '')
+    key=_media_key_from_url(raw_key) if raw_key else ''
+    return f"{key}|dot={data.get('dot',-1)}|tr={data.get('transform','')}"
+
+
+def _wait_for_carousel_state_change(page, before_signature: str, target_shortcode: str, timeout_ms: int = 6500) -> bool:
+    deadline=time.time()+max(0.8,timeout_ms/1000.0)
+    while time.time()<deadline:
+        if target_shortcode and not _is_target_shortcode_context(page,target_shortcode):
+            return False
+        now=_get_carousel_state_signature(page)
+        if now and before_signature and now!=before_signature:
+            return True
+        try: page.wait_for_timeout(220)
+        except Exception: time.sleep(0.22)
+    return False
+
+
+
+def _get_main_media_visual_fingerprint(page) -> str:
+    """Hash the visible main-media pixels for restricted Carousel verification."""
+    try:
+        box = page.evaluate(
+            r"""
+            () => {
+              const root = document.querySelector('div[role="dialog"]') ||
+                           document.querySelector('article');
+              if (!root) return null;
+              const nodes = Array.from(root.querySelectorAll('img,video'))
+                .map(el => {
+                  const r = el.getBoundingClientRect();
+                  const st = getComputedStyle(el);
+                  const overlapX = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+                  const overlapY = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+                  return {
+                    r,
+                    visibleArea: overlapX * overlapY,
+                    ok: st.display !== 'none' && st.visibility !== 'hidden' &&
+                        parseFloat(st.opacity || '1') > 0 &&
+                        r.width > 220 && r.height > 180 &&
+                        overlapX > 180 && overlapY > 160
+                  };
+                })
+                .filter(x => x.ok)
+                .sort((a,b) => b.visibleArea - a.visibleArea);
+              if (!nodes.length) return null;
+              const r = nodes[0].r;
+              return {
+                x: Math.max(0, r.left + 4),
+                y: Math.max(0, r.top + 4),
+                width: Math.max(20, Math.min(innerWidth - Math.max(0, r.left + 4), r.width - 8)),
+                height: Math.max(20, Math.min(innerHeight - Math.max(0, r.top + 4), r.height - 8))
+              };
+            }
+            """
+        )
+        if not box:
+            return ""
+        shot = page.screenshot(
+            clip={
+                "x": float(box["x"]),
+                "y": float(box["y"]),
+                "width": float(box["width"]),
+                "height": float(box["height"]),
+            },
+            animations="disabled",
+            timeout=5000,
+        )
+        return hashlib.sha1(shot).hexdigest()
+    except Exception:
+        return ""
+
+
+def _wait_for_visual_frame_change(page, before_hash: str, target_shortcode: str, timeout_ms: int = 6000) -> bool:
+    if not before_hash:
+        return False
+    deadline = time.time() + max(1.0, timeout_ms / 1000.0)
+    while time.time() < deadline:
+        if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
+            return False
+        now_hash = _get_main_media_visual_fingerprint(page)
+        if now_hash and now_hash != before_hash:
+            return True
+        try:
+            page.wait_for_timeout(280)
+        except Exception:
+            time.sleep(0.28)
+    return False
+
+
+def _find_visible_next_arrow_point(page) -> dict:
+    """Locate a visible Next control strictly beside the main media."""
+    _hover_main_ig_media(page)
+    try:
+        return page.evaluate(
+            r"""
+            () => {
+              const medias = Array.from(document.querySelectorAll('img,video'))
+                .map(el => {
+                  const r = el.getBoundingClientRect();
+                  const st = getComputedStyle(el);
+                  const overlapX = Math.max(
+                    0, Math.min(r.right, innerWidth) - Math.max(r.left, 0)
+                  );
+                  const overlapY = Math.max(
+                    0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)
+                  );
+                  const visibleArea = overlapX * overlapY;
+                  return {
+                    r, visibleArea,
+                    ok:
+                      st.display !== 'none' &&
+                      st.visibility !== 'hidden' &&
+                      parseFloat(st.opacity || '1') > 0 &&
+                      r.width > 220 &&
+                      r.height > 180 &&
+                      visibleArea > 50000
+                  };
+                })
+                .filter(x => x.ok)
+                .sort((a,b) => b.visibleArea - a.visibleArea);
+
+              if (!medias.length) return null;
+
+              const mr = medias[0].r;
+              const my = mr.top + mr.height / 2;
+              const nodes = Array.from(document.querySelectorAll(
+                'button,[role="button"],svg,[aria-label],[title],.coreSpriteRightChevron'
+              ));
+              const candidates = [];
+              const seen = new Set();
+
+              for (const el of nodes) {
+                const clicker = el.closest('button,[role="button"]') || el;
+                if (seen.has(clicker)) continue;
+                seen.add(clicker);
+
+                const r = clicker.getBoundingClientRect();
+                const st = getComputedStyle(clicker);
+                if (
+                  st.display === 'none' ||
+                  st.visibility === 'hidden' ||
+                  parseFloat(st.opacity || '1') <= 0
+                ) continue;
+                if (
+                  r.width < 12 || r.height < 12 ||
+                  r.width > 130 || r.height > 130
+                ) continue;
+                if (
+                  r.right <= 0 || r.bottom <= 0 ||
+                  r.left >= innerWidth || r.top >= innerHeight
+                ) continue;
+
+                const cx = r.left + r.width / 2;
+                const cy = r.top + r.height / 2;
+                const label = (
+                  (clicker.getAttribute('aria-label') || '') + ' ' +
+                  (el.getAttribute('aria-label') || '') + ' ' +
+                  (clicker.getAttribute('title') || '') + ' ' +
+                  (el.getAttribute('title') || '') + ' ' +
+                  (clicker.getAttribute('class') || '') + ' ' +
+                  (el.getAttribute('class') || '')
+                ).trim().toLowerCase();
+
+                const previous =
+                  label.includes('previous') ||
+                  label.includes('上一張') ||
+                  label.includes('上一則') ||
+                  label.includes('上一步') ||
+                  label.includes('往回') ||
+                  label.includes('返回') ||
+                  label.includes('back') ||
+                  label.includes('corespriteleftchevron');
+                if (previous) continue;
+
+                const spatiallyValid =
+                  cx >= mr.right - 125 &&
+                  cx <= mr.right + 90 &&
+                  cx >= mr.left + mr.width * 0.58 &&
+                  Math.abs(cy - my) <= Math.max(115, mr.height * 0.34);
+
+                // Critical: even an explicit "下一步" label is rejected when it
+                // is at the top-right header instead of beside the media.
+                if (!spatiallyValid) continue;
+
+                const explicitNext =
+                  label.includes('next') ||
+                  label.includes('下一張') ||
+                  label.includes('下一則') ||
+                  label.includes('下一步') ||
+                  label.includes('次へ') ||
+                  label.includes('corespriterightchevron');
+
+                const score =
+                  (explicitNext ? 100000 : 0) -
+                  Math.abs(cx - (mr.right - 28)) * 50 -
+                  Math.abs(cy - my) * 12 +
+                  r.width * r.height;
+
+                candidates.push({
+                  x: Math.max(2, Math.min(innerWidth - 2, cx)),
+                  y: Math.max(2, Math.min(innerHeight - 2, cy)),
+                  label,
+                  score,
+                  rect: {
+                    left:r.left, top:r.top,
+                    width:r.width, height:r.height
+                  },
+                  media: {
+                    left:mr.left, top:mr.top, right:mr.right,
+                    width:mr.width, height:mr.height
+                  }
+                });
+              }
+
+              candidates.sort((a,b) => b.score - a.score);
+              return candidates[0] || null;
+            }
+            """
+        ) or {}
+    except Exception:
+        return {}
+
+
+
+def _click_visible_next_arrow_with_mouse(
+    page,
+    before_signature: str,
+    before_visual_hash: str,
+    target_shortcode: str,
+) -> bool:
+    point = _find_visible_next_arrow_point(page)
+    if not point:
+        logger.warning(f"IG visible next-arrow point not found: target={target_shortcode}")
+        return False
+
+    try:
+        x = float(point.get("x"))
+        y = float(point.get("y"))
+        label = str(point.get("label") or "")
+        logger.info(
+            f"IG visible next-arrow mouse target: x={int(x)}, y={int(y)}, "
+            f"label={label or '-'}, target={target_shortcode}"
+        )
+        page.mouse.move(x, y)
+        page.wait_for_timeout(180)
+        page.mouse.down()
+        page.wait_for_timeout(90)
+        page.mouse.up()
+    except Exception as exc:
+        logger.warning(f"IG visible next-arrow mouse click failed: {exc}")
+        return False
+
+    if _wait_for_carousel_state_change(
+        page, before_signature, target_shortcode, timeout_ms=3000
+    ):
+        logger.info(f"IG visible next-arrow state advanced: target={target_shortcode}")
+        return True
+
+    if _wait_for_visual_frame_change(
+        page, before_visual_hash, target_shortcode, timeout_ms=4500
+    ):
+        logger.info(f"IG visible next-arrow visual frame advanced: target={target_shortcode}")
+        return True
+
+    return False
+
+
+
+def _click_next_by_real_mouse(page, before_signature: str, target_shortcode: str) -> bool:
+    """Use a genuine pointer click on the visible carousel chevron/media edge."""
+    try:
+        info=page.evaluate(r"""
+        () => {
+          const root=document.querySelector('div[role="dialog"]')||document.querySelector('article');
+          if(!root)return null;
+          const media=Array.from(root.querySelectorAll('img,video'))
+            .map(el=>{const r=el.getBoundingClientRect(),st=getComputedStyle(el);return {r,area:r.width*r.height,ok:st.display!=='none'&&st.visibility!=='hidden'&&parseFloat(st.opacity||'1')>0&&r.width>220&&r.height>180&&r.right>0&&r.bottom>0&&r.left<innerWidth&&r.top<innerHeight};})
+            .filter(x=>x.ok).sort((a,b)=>b.area-a.area)[0];
+          if(!media)return null;
+          const r=media.r; return {left:r.left,top:r.top,right:r.right,width:r.width,height:r.height};
+        }
+        """)
+        if not info:return False
+        y_values=[0.50,0.46,0.54]
+        x_values=[info['right']-30,info['right']-18,info['right']+8]
+        for yr in y_values:
+            y=info['top']+info['height']*yr
+            for x in x_values:
+                try:
+                    page.mouse.move(x,y); page.wait_for_timeout(120); page.mouse.click(x,y,delay=90)
+                except Exception:
+                    continue
+                if _wait_for_carousel_state_change(page,before_signature,target_shortcode,timeout_ms=3600):
+                    logger.info(f"IG real-mouse next-arrow advanced: x={int(x)}, y={int(y)}, target={target_shortcode}")
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+
+def _click_next_carousel_dot(page, before_key: str, target_shortcode: str) -> bool:
+    """Click the first pagination dot to the right of the active dot.
+
+    Used only after the normal Next button and ArrowRight both failed.  The dot
+    search is spatially limited to the main media frame, so normal posts are
+    unaffected.
     """
+    try:
+        clicked = page.evaluate(
+            r"""
+            () => {
+              const root = document.querySelector('div[role="dialog"]') ||
+                           document.querySelector('article');
+              if (!root) return false;
+
+              const medias = Array.from(root.querySelectorAll('img,video'))
+                .map(el => {
+                  const r = el.getBoundingClientRect();
+                  const st = getComputedStyle(el);
+                  return {el,r,area:r.width*r.height,ok:
+                    st.display !== 'none' && st.visibility !== 'hidden' &&
+                    parseFloat(st.opacity||'1') > 0 && r.width > 120 && r.height > 120};
+                })
+                .filter(x => x.ok)
+                .sort((a,b)=>b.area-a.area);
+              if (!medias.length) return false;
+              const mr = medias[0].r;
+
+              const raw = Array.from(root.querySelectorAll('button,div,span,svg,circle'))
+                .map(el => {
+                  const r = el.getBoundingClientRect();
+                  const st = getComputedStyle(el);
+                  const bg = st.backgroundColor || '';
+                  const op = parseFloat(st.opacity || '1');
+                  const cls = (el.getAttribute('class') || '').toLowerCase();
+                  const aria = (el.getAttribute('aria-current') || '').toLowerCase();
+                  const active = aria === 'true' || aria === 'page' ||
+                    cls.includes('active') || cls.includes('selected') ||
+                    (!bg.includes('rgba(0, 0, 0, 0)') && !bg.includes('transparent'));
+                  return {el,r,op,active};
+                })
+                .filter(x =>
+                  x.op > 0 &&
+                  x.r.width >= 3 && x.r.height >= 3 &&
+                  x.r.width <= 22 && x.r.height <= 22 &&
+                  x.r.left + x.r.width/2 >= mr.left + mr.width*0.20 &&
+                  x.r.left + x.r.width/2 <= mr.right - mr.width*0.20 &&
+                  x.r.top + x.r.height/2 >= mr.bottom - 100 &&
+                  x.r.top + x.r.height/2 <= mr.bottom + 40
+                )
+                .sort((a,b)=>a.r.left-b.r.left);
+
+              const dots = [];
+              for (const x of raw) {
+                const cx = x.r.left + x.r.width/2;
+                if (!dots.length || Math.abs((dots[dots.length-1].r.left +
+                    dots[dots.length-1].r.width/2) - cx) > 7) dots.push(x);
+              }
+              if (dots.length < 2) return false;
+
+              let activeIndex = dots.findIndex(x => x.active);
+              if (activeIndex < 0) {
+                // Active dot is usually slightly larger/darker.
+                let best = -1, bestArea = -1;
+                dots.forEach((x,i)=>{
+                  const a=x.r.width*x.r.height;
+                  if (a>bestArea){bestArea=a;best=i;}
+                });
+                activeIndex = best;
+              }
+
+              const nextIndex = Math.min(dots.length - 1, activeIndex + 1);
+              if (nextIndex <= activeIndex) return false;
+              const target = dots[nextIndex].el.closest('button,[role="button"]') || dots[nextIndex].el;
+              try { target.click(); return true; } catch(e) { return false; }
+            }
+            """
+        )
+    except Exception:
+        clicked = False
+
+    if not clicked:
+        return False
+
+    after_key = _wait_for_current_media_key_change(
+        page, before_key, target_shortcode, timeout_ms=5000
+    )
+    if after_key:
+        logger.info(f"IG carousel dot fallback advanced: target={target_shortcode}")
+        return True
+    return False
+
+
+def _swipe_ig_carousel_left(page, before_key: str, target_shortcode: str) -> bool:
+    """Perform a real pointer swipe across the visible main media frame."""
+    try:
+        box = page.evaluate(
+            r"""
+            () => {
+              const root = document.querySelector('div[role="dialog"]') ||
+                           document.querySelector('article');
+              if (!root) return null;
+              const nodes = Array.from(root.querySelectorAll('img,video'))
+                .map(el => {
+                  const r=el.getBoundingClientRect(), st=getComputedStyle(el);
+                  return {r,area:r.width*r.height,ok:
+                    st.display!=='none' && st.visibility!=='hidden' &&
+                    parseFloat(st.opacity||'1')>0 && r.width>220 && r.height>180 &&
+                    r.right>0 && r.bottom>0 && r.left<innerWidth && r.top<innerHeight};
+                })
+                .filter(x=>x.ok).sort((a,b)=>b.area-a.area);
+              if (!nodes.length) return null;
+              const r=nodes[0].r;
+              return {left:r.left,top:r.top,width:r.width,height:r.height};
+            }
+            """
+        )
+        if not box:
+            return False
+
+        y = box["top"] + box["height"] * 0.52
+        x1 = box["left"] + box["width"] * 0.78
+        x2 = box["left"] + box["width"] * 0.24
+        page.mouse.move(x1, y)
+        page.mouse.down()
+        steps = 12
+        for i in range(1, steps + 1):
+            x = x1 + (x2 - x1) * i / steps
+            page.mouse.move(x, y)
+            page.wait_for_timeout(25)
+        page.mouse.up()
+
+        after_key = _wait_for_current_media_key_change(
+            page, before_key, target_shortcode, timeout_ms=5500
+        )
+        if after_key:
+            logger.info(f"IG carousel swipe fallback advanced: target={target_shortcode}")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+
+
+def _advance_ig_carousel_with_arrow_key(
+    page,
+    before_key: str,
+    before_signature: str,
+    before_visual_hash: str,
+    target_shortcode: str,
+) -> bool:
+    """Focus the active target-post container and press ArrowRight without scroll."""
+    media = _find_main_ig_media_geometry(page)
+    if not media:
+        return False
+
+    try:
+        focused = page.evaluate(
+            r"""
+            () => {
+              const visible = el => {
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                return st.display !== 'none' &&
+                       st.visibility !== 'hidden' &&
+                       parseFloat(st.opacity || '1') > 0 &&
+                       r.width > 100 && r.height > 100 &&
+                       r.right > 0 && r.bottom > 0 &&
+                       r.left < innerWidth && r.top < innerHeight;
+              };
+
+              const dialogs = Array.from(
+                document.querySelectorAll('div[role="dialog"]')
+              ).filter(visible);
+
+              let root = dialogs[0] ||
+                         Array.from(document.querySelectorAll('article')).find(visible) ||
+                         document.body;
+
+              try {
+                root.setAttribute('tabindex', '-1');
+                root.focus({preventScroll:true});
+                return document.activeElement === root;
+              } catch (e) {
+                return false;
+              }
+            }
+            """
+        )
+
+        page.keyboard.press("ArrowRight")
+        page.wait_for_timeout(550)
+        logger.info(
+            f"IG target-dialog ArrowRight fallback: focused={bool(focused)}, "
+            f"root={media.get('rootKind') or 'unknown'}, target={target_shortcode}"
+        )
+    except Exception as exc:
+        logger.debug(f"IG target-dialog ArrowRight dispatch failed: {exc}")
+        return False
+
+    after_key = _wait_for_current_media_key_change(
+        page, before_key, target_shortcode, timeout_ms=3200
+    )
+    if after_key:
+        logger.info(f"IG target-dialog ArrowRight media-key advanced: target={target_shortcode}")
+        return True
+
+    if _wait_for_carousel_state_change(
+        page, before_signature, target_shortcode, timeout_ms=1800
+    ):
+        logger.info(f"IG target-dialog ArrowRight state advanced: target={target_shortcode}")
+        return True
+
+    if _wait_for_visual_frame_change(
+        page, before_visual_hash, target_shortcode, timeout_ms=2200
+    ):
+        logger.info(f"IG target-dialog ArrowRight visual advanced: target={target_shortcode}")
+        return True
+
+    return False
+
+
+
+def _click_next_ig_locked_keycheck(page, target_shortcode: str) -> bool:
+    """Advance one slide and accept only a verified media/state/visual change."""
     before_key = _get_current_media_key(page)
+    before_signature = _get_carousel_state_signature(page)
+    before_visual_hash = _get_main_media_visual_fingerprint(page)
     before_url = ""
     try:
         before_url = page.url or ""
@@ -3514,43 +5128,71 @@ def _click_next_ig_locked_keycheck(page, target_shortcode: str) -> bool:
     if not _is_actionable_carousel_next(page):
         return False
 
+    # First use the spatially locked real carousel control.
     moved = _click_next_ig(page)
-    if not moved:
-        return False
+    if moved:
+        if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
+            logger.warning(
+                f"IG carousel scope guard: next click left target={target_shortcode}; "
+                f"before={before_url}; after={getattr(page, 'url', '')}; "
+                f"stop collecting to avoid wrong post"
+            )
+            return False
 
-    if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
-        logger.warning(
-            f"IG carousel scope guard: next click left target={target_shortcode}; "
-            f"before={before_url}; after={getattr(page, 'url', '')}; stop collecting to avoid wrong post"
+        after_key = _wait_for_current_media_key_change(
+            page, before_key, target_shortcode, timeout_ms=2600
         )
-        return False
+        if after_key:
+            return True
 
-    after_key = _wait_for_current_media_key_change(
+        if _wait_for_carousel_state_change(
+            page, before_signature, target_shortcode, timeout_ms=1400
+        ):
+            logger.info(
+                f"IG carousel state changed without media-key change: "
+                f"target={target_shortcode}"
+            )
+            return True
+
+        if _wait_for_visual_frame_change(
+            page, before_visual_hash, target_shortcode, timeout_ms=1800
+        ):
+            logger.info(
+                f"IG carousel visual frame changed without media-key change: "
+                f"target={target_shortcode}"
+            )
+            return True
+
+    # Preferred fallback for restricted layouts: focus the actual media and use
+    # Instagram's own keyboard carousel handler.
+    if _advance_ig_carousel_with_arrow_key(
         page,
         before_key,
+        before_signature,
+        before_visual_hash,
         target_shortcode,
-        timeout_ms=6500,
-    )
-    if after_key:
+    ):
         return True
 
-    # One conservative keyboard retry helps layouts whose visible chevron receives
-    # the click but React does not advance on the first event.
-    if _is_actionable_carousel_next(page):
-        try:
-            page.keyboard.press("ArrowRight")
-            after_key = _wait_for_current_media_key_change(
-                page,
-                before_key,
-                target_shortcode,
-                timeout_ms=4500,
-            )
-            if after_key:
-                return True
-        except Exception:
-            pass
+    # Coordinate fallbacks remain, but they now use the corrected main-media
+    # geometry and reject 返回/back controls.
+    if _click_visible_next_arrow_with_mouse(
+        page, before_signature, before_visual_hash, target_shortcode
+    ):
+        return True
+
+    if _click_next_by_real_mouse(page, before_signature, target_shortcode):
+        return True
+
+    if _click_next_carousel_dot(page, before_key, target_shortcode):
+        return True
+
+    if _swipe_ig_carousel_left(page, before_key, target_shortcode):
+        return True
 
     return False
+
+
 
 def _fill_filtered_from_network_cache(filtered, harvested_media, expected_count: int):
     """Fill only from the *fresh* carousel-walk network cache.
@@ -3604,6 +5246,141 @@ def _fill_filtered_from_network_cache(filtered, harvested_media, expected_count:
         )
 
     return _dedupe_media(out, preserve_order=True)[:expected_count]
+
+
+
+def _prime_requested_video_slide(page, target_shortcode: str, slide_number: int) -> bool:
+    """Trigger playback only on the explicitly requested carousel slide.
+
+    The normal v11.66 carousel path is unchanged.  This helper runs only when the
+    current collected position equals the original shared URL's img_index.  It
+    stays inside the active target-post dialog/article and waits so Chrome can
+    request both MP4 initialization and media fragments.
+    """
+    try:
+        primed = page.evaluate(
+            r"""
+            () => {
+              const vw = innerWidth || 1400;
+              const vh = innerHeight || 1600;
+
+              const visible = el => {
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                const ox = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+                const oy = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+                return (
+                  st.display !== 'none' &&
+                  st.visibility !== 'hidden' &&
+                  parseFloat(st.opacity || '1') > 0 &&
+                  r.width >= 220 &&
+                  r.height >= 180 &&
+                  ox * oy >= 45000
+                );
+              };
+
+              const dialogs = Array.from(
+                document.querySelectorAll('div[role="dialog"]')
+              ).filter(visible);
+
+              let root = null;
+              if (dialogs.length) {
+                dialogs.sort((a, b) => {
+                  const za = parseInt(getComputedStyle(a).zIndex || '0', 10) || 0;
+                  const zb = parseInt(getComputedStyle(b).zIndex || '0', 10) || 0;
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  return (zb - za) || (rb.width * rb.height - ra.width * ra.height);
+                });
+                root = dialogs[0];
+              } else {
+                const articles = Array.from(
+                  document.querySelectorAll('article')
+                ).filter(visible);
+
+                articles.sort((a, b) => {
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  return rb.width * rb.height - ra.width * ra.height;
+                });
+                root = articles[0] || null;
+              }
+
+              if (!root) return false;
+
+              const videos = Array.from(root.querySelectorAll('video'))
+                .filter(visible)
+                .sort((a, b) => {
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  return rb.width * rb.height - ra.width * ra.height;
+                });
+
+              if (videos.length) {
+                const video = videos[0];
+                try {
+                  video.muted = true;
+                  video.playsInline = true;
+                  video.preload = 'auto';
+                  video.load();
+                } catch (e) {}
+
+                try {
+                  const pending = video.play();
+                  if (pending && pending.catch) pending.catch(() => {});
+                } catch (e) {}
+                return true;
+              }
+
+              // Some IG builds expose the current video as a poster until the
+              // media area is clicked once.  Click only the largest media inside
+              // the active post root; never click document-wide content.
+              const media = Array.from(root.querySelectorAll('img'))
+                .filter(visible)
+                .sort((a, b) => {
+                  const ra = a.getBoundingClientRect();
+                  const rb = b.getBoundingClientRect();
+                  return rb.width * rb.height - ra.width * ra.height;
+                })[0];
+
+              if (!media) return false;
+
+              const r = media.getBoundingClientRect();
+              const x = r.left + r.width / 2;
+              const y = r.top + r.height / 2;
+              const target = document.elementFromPoint(x, y);
+              if (!target) return false;
+
+              try {
+                target.dispatchEvent(new MouseEvent('click', {
+                  bubbles: true,
+                  cancelable: true,
+                  clientX: x,
+                  clientY: y,
+                  view: window
+                }));
+                return true;
+              } catch (e) {
+                return false;
+              }
+            }
+            """
+        )
+    except Exception:
+        primed = False
+
+    if primed:
+        logger.info(
+            f"IG requested video slide primed for init/media capture: "
+            f"slide={slide_number}, target={target_shortcode}"
+        )
+        try:
+            page.wait_for_timeout(4200)
+        except Exception:
+            time.sleep(4.2)
+
+    return bool(primed)
+
 
 
 def _collect_visible_target_media(page, target_shortcode: str, include_meta: bool = True):
@@ -3694,6 +5471,18 @@ def _collect_visible_target_media(page, target_shortcode: str, include_meta: boo
                 pass
             _LAST_CAROUSEL_WALK_COMPLETE = False
             break
+
+        requested_slide = int(
+            getattr(_DOWNLOAD_CONTEXT, "requested_img_index", 1) or 1
+        )
+        current_slide_number = len(collected) + 1
+
+        if requested_slide > 1 and current_slide_number == requested_slide:
+            _prime_requested_video_slide(
+                page,
+                target_shortcode,
+                current_slide_number,
+            )
 
         current = _get_current_slide_main_media(page)
         if not current and include_meta and not collected:
@@ -3809,6 +5598,14 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
     This version is strictly shortcode-scoped.  It never scans or finalizes media
     after IG redirects the visible page to a profile/account grid.
     """
+    # Record that this task entered the authenticated browser-profile path.
+    # A later Playwright/carousel exception must not fall through to anonymous
+    # yt-dlp, which cannot see this profile's age/audience trust state.
+    try:
+        _DOWNLOAD_CONTEXT.persistent_profile_attempted = True
+    except Exception:
+        pass
+
     enabled = _try_get_config_value("IG_PERSISTENT_PROFILE_ENABLED", True)
     if str(enabled).lower() in {"0", "false", "no", "off"}:
         return "RETRY", "IG persistent Chrome profile fallback disabled"
@@ -3816,6 +5613,11 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
     user_data_dir = _resolve_chrome_user_data_dir()
     profile_dir = _resolve_chrome_profile_directory()
     shortcode = _extract_shortcode(url) or ""
+
+    try:
+        _DOWNLOAD_CONTEXT.requested_img_index = _get_requested_img_index(url)
+    except Exception:
+        _DOWNLOAD_CONTEXT.requested_img_index = 1
 
     if not shortcode:
         return "FAILED", "無法解析 Instagram shortcode；為避免誤抓整個帳號，已停止"
@@ -3834,7 +5636,7 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
             user_data_dir=user_data_dir,
             channel="chrome",
             headless=False,
-            no_viewport=True,
+            viewport={"width": 1400, "height": 1600},
             locale="zh-TW",
             args=[
                 f"--profile-directory={profile_dir}",
@@ -3842,7 +5644,8 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
                 "--disable-infobars",
                 "--no-first-run",
                 "--no-default-browser-check",
-                "--start-maximized",
+                "--window-size=1400,1600",
+                "--window-position=20,20",
             ],
         )
 
@@ -3901,8 +5704,19 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
                     "請重新貼目標貼文 URL 後重試。"
                 )
 
+        # Some logged-in profiles no longer show the restriction text after the
+        # first render but still keep a consent overlay intercepting carousel clicks.
+        _try_confirm_ig_restricted_content(page)
+
         title = _get_prefetched_title(url) or _get_ig_full_caption_title(page, fallback_shortcode=shortcode or "Instagram_Post")
         account = _get_prefetched_account(url) or _get_ig_post_account(page)
+
+        cleaned_title = _clean_ig_caption_candidate(title, shortcode)
+        if cleaned_title and not _is_bad_ig_caption_candidate(cleaned_title, shortcode):
+            title = cleaned_title
+        else:
+            title = account or shortcode or "Instagram_Post"
+            logger.info(f"IG caption unavailable; use safe folder fallback: {title}")
         _cache_prefetched_account(url, account)
         _publish_ig_task_title(url, title)
         _publish_ig_task_account(url, account)
@@ -3922,7 +5736,18 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
             )
             harvested_media.clear()
 
-        visible_media = _collect_visible_target_media(page, shortcode)
+        try:
+            visible_media = _collect_visible_target_media(page, shortcode)
+        except Exception as carousel_exc:
+            logger.exception(
+                f"IG persistent carousel walk exception: "
+                f"target={shortcode}, error={carousel_exc}"
+            )
+            return "RETRY", (
+                f"IG persistent carousel walk exception: {carousel_exc}. "
+                "Authenticated browser state was preserved; anonymous yt-dlp fallback was skipped."
+            )
+
         filtered = _dedupe_media(visible_media, preserve_order=True)
 
         # Use the count detected before/while flipping.  Re-detecting after
@@ -4060,6 +5885,18 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
         if not filtered:
             return "RETRY", "已登入 IG_Parser Profile 但仍未抓到目標貼文媒體；請確認專用 Profile 已完成年齡/帳號驗證後重試"
 
+        # Single-point mixed-carousel repair:
+        # Instagram can expose a video slide only as its poster <img>.  When the
+        # original shared URL explicitly identifies that slide with img_index,
+        # replace only that exact slot with the video response harvested during
+        # the already-completed target-post walk.
+        filtered = _replace_requested_slide_with_harvested_video(
+            filtered,
+            harvested_media,
+            url,
+            shortcode,
+        )
+
         # Final post lock before writing files.  The collected media were gathered
         # only while the page was scoped to the target shortcode; if a later Next
         # click left the post, do not continue scanning or append anything else.
@@ -4077,12 +5914,27 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
 
     except Exception as e:
         msg = str(e)
+        logger.exception(
+            f"IG persistent profile unexpected exception: "
+            f"target={shortcode}, error={msg}"
+        )
         if "user data directory is already in use" in msg.lower() or "process singleton" in msg.lower():
             return "RETRY", (
                 "IG_Parser Chrome Profile 目前被同一個專用 Chrome 視窗佔用。"
                 "請關閉 IG_Parser 視窗後重試；日常 Chrome 不需要關閉。"
             )
-        return _classify_error(msg)
+
+        classified_status, classified_error = _classify_error(msg)
+        if classified_status == "MISSING":
+            return classified_status, classified_error
+
+        # Once the authenticated persistent profile was required, unexpected
+        # browser/carousel failures remain retryable.  Do not downgrade them to
+        # FAILED and then invoke anonymous yt-dlp.
+        return "RETRY", (
+            f"IG authenticated persistent-profile flow failed: "
+            f"{classified_error or msg}"
+        )
 
     finally:
         try:
@@ -4424,6 +6276,10 @@ def download(url: str):
         setup()
 
     _set_current_profile_output_owner(_get_profile_owner_for_url(url))
+    try:
+        _DOWNLOAD_CONTEXT.persistent_profile_attempted = False
+    except Exception:
+        pass
 
     # 每筆 IG 任務開始前清理上一筆失敗 / 中斷殘留的 post/ 暫存檔。
     # 注意：SUCCESS 的清理由 move_files() 負責，避免誤刪正在搬移中的媒體。
@@ -4459,7 +6315,33 @@ def download(url: str):
                 result_box[0] = (status3, error3)
                 return
 
-            # Playwright 也失敗時，才讓 yt-dlp 做一次快速備援。
+            # If the logged-in persistent Chrome profile was already required,
+            # do not fall through to yt-dlp.  yt-dlp runs in a separate context
+            # and does not inherit the profile's age/audience confirmation state.
+            persistent_attempted = False
+            try:
+                persistent_attempted = bool(
+                    getattr(_DOWNLOAD_CONTEXT, "persistent_profile_attempted", False)
+                )
+            except Exception:
+                persistent_attempted = False
+
+            if persistent_attempted:
+                logger.info(
+                    "IG skip yt-dlp fallback: authenticated persistent profile "
+                    "was already used for this restricted/carousel post"
+                )
+                result_box[0] = (
+                    "RETRY",
+                    error3 or (
+                        "IG authenticated persistent-profile collection did not complete; "
+                        "anonymous yt-dlp fallback was intentionally skipped"
+                    ),
+                )
+                return
+
+            # For ordinary public posts that never needed the persistent profile,
+            # preserve the existing one-shot yt-dlp emergency fallback.
             status2, error2 = _download_via_ytdlp(normalized_url, quick=True)
 
             if status2 == "SUCCESS":
