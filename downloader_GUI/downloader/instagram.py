@@ -1,4 +1,5 @@
 import html
+import json
 import hashlib
 import http.cookiejar
 import os
@@ -52,6 +53,9 @@ def _to_traditional(text: str) -> str:
 
 logger = get_logger("instagram")
 
+# v11.78.2 Git-OK Naming Rule Restore
+# v11.78.1 Structured Caption/Account Fix
+# v11.78 Authenticated Structured Extraction (No Carousel Flipping)
 # v11.66.6 Small Init-Segment Capture + Fragment Assembly
 # v11.66.5 Requested-Slide Video Prime + Init Segment Capture
 # v11.66.4 Browser Fragment Assembly + Complete Video Validation
@@ -1234,6 +1238,17 @@ def _is_bad_ig_caption_candidate(text: str, fallback_shortcode: str = "") -> boo
     bad_markers = [
         "絕不錯過", "的任何貼文", "never miss any posts", "開始對話",
         "尚無留言", "view translation", "查看翻譯",
+        "建立帳號或登入 instagram",
+        "建立帳號或登入 instagram -",
+        "與瞭解你的人分享你感興趣的內容",
+        "create an account or log in to instagram",
+        "share what you're into with the people who get you",
+        "connect with friends, share what you're up to",
+        "connect with friends",
+        "see what's new from others all over the world",
+        "see what’s new from others all over the world",
+        "log in • instagram",
+        "instagram photos and videos",
     ]
     if any(x.lower() in low for x in bad_markers):
         return True
@@ -1270,9 +1285,17 @@ def _get_ig_title(page, fallback_shortcode: str = ""):
 def _cache_prefetched_title(url: str, title: str) -> str:
     shortcode = _extract_shortcode(url) or ""
     clean = _safe_output_name(title, "", max_len=90).strip()
-    if shortcode and clean:
+
+    if _is_bad_ig_caption_candidate(clean, shortcode):
+        clean = ""
+
+    if shortcode:
         with _PREFETCHED_TITLES_LOCK:
-            _PREFETCHED_TITLES[shortcode] = clean
+            if clean:
+                _PREFETCHED_TITLES[shortcode] = clean
+            else:
+                _PREFETCHED_TITLES.pop(shortcode, None)
+
     return clean
 
 
@@ -1282,6 +1305,20 @@ def _get_prefetched_title(url: str) -> str:
         return ""
     with _PREFETCHED_TITLES_LOCK:
         return _PREFETCHED_TITLES.get(shortcode, "") or ""
+
+
+
+def _extract_post_account_hint_from_url(url: str) -> str:
+    """Return username from /<username>/p/<shortcode>/ style shared URLs."""
+    try:
+        parsed = urlparse(str(url or ""))
+        parts = [part for part in (parsed.path or "").split("/") if part]
+        if len(parts) >= 3 and parts[1].lower() in {"p", "reel", "reels"}:
+            return _clean_ig_account(parts[0])
+    except Exception:
+        pass
+    return ""
+
 
 
 def _clean_ig_account(raw: str) -> str:
@@ -1433,8 +1470,13 @@ def prefetch_post_info(url: str) -> tuple[str, str, str]:
 
             title = cached_title or _get_ig_full_caption_title(page, fallback_shortcode=shortcode)
             account = cached_account or _get_ig_post_account(page)
+            if _is_bad_ig_caption_candidate(title, shortcode):
+                title = ""
             clean_title = _cache_prefetched_title(url, title)
-            clean_account = _cache_prefetched_account(url, account)
+            clean_account = _cache_prefetched_account(
+                url,
+                account or _extract_post_account_hint_from_url(url),
+            )
 
             if clean_title and not _is_bad_ig_caption_candidate(clean_title, shortcode):
                 _publish_ig_task_title(url, clean_title)
@@ -5592,6 +5634,580 @@ def _collect_limited_target_fallback_media(page, harvested_media, target_shortco
     return _dedupe_media(items)[:3]
 
 
+
+_IG_SHORTCODE_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789-_"
+)
+
+
+def _shortcode_to_media_id(shortcode: str) -> str:
+    """Decode an Instagram shortcode into its numeric media id."""
+    value = 0
+    try:
+        for char in str(shortcode or "").strip():
+            index = _IG_SHORTCODE_ALPHABET.find(char)
+            if index < 0:
+                return ""
+            value = value * 64 + index
+        return str(value) if value > 0 else ""
+    except Exception:
+        return ""
+
+
+def _capture_ig_structured_response(response, payloads: list) -> None:
+    """Capture authenticated IG JSON without depending on visual carousel state."""
+    try:
+        if response.status < 200 or response.status >= 300:
+            return
+
+        url = response.url or ""
+        low_url = url.lower()
+        headers = response.headers or {}
+        content_type = (
+            headers.get("content-type", "")
+            or headers.get("Content-Type", "")
+            or ""
+        ).lower()
+
+        interesting = (
+            "application/json" in content_type
+            or "/graphql/" in low_url
+            or "/api/v1/media/" in low_url
+            or "polaris" in low_url
+        )
+        if not interesting:
+            return
+
+        body = response.body()
+        if not body or len(body) > 30 * 1024 * 1024:
+            return
+
+        text = body.decode("utf-8", errors="ignore").strip()
+        if not text or text[0] not in "[{":
+            return
+
+        payload = json.loads(text)
+        payloads.append({
+            "url": url,
+            "payload": payload,
+            "captured_at": time.time(),
+        })
+    except Exception:
+        return
+
+
+def _best_ig_image_candidate(node: dict) -> str:
+    candidates = []
+
+    def add(url, width=0, height=0, bonus=0):
+        url = html.unescape(unquote(str(url or "").strip()))
+        if not _looks_like_real_ig_media_url(url):
+            return
+        if any(ext in url.lower() for ext in [".mp4", ".m4v", ".mov"]):
+            return
+        try:
+            score = int(width or 0) * int(height or 0) + int(bonus or 0)
+        except Exception:
+            score = int(bonus or 0)
+        candidates.append((score, url))
+
+    for item in ((node.get("image_versions2") or {}).get("candidates") or []):
+        if isinstance(item, dict):
+            add(item.get("url"), item.get("width"), item.get("height"), 4000000)
+
+    for item in (node.get("display_resources") or []):
+        if isinstance(item, dict):
+            add(
+                item.get("src") or item.get("url"),
+                item.get("config_width") or item.get("width"),
+                item.get("config_height") or item.get("height"),
+                3000000,
+            )
+
+    for item in (node.get("thumbnail_resources") or []):
+        if isinstance(item, dict):
+            add(
+                item.get("src") or item.get("url"),
+                item.get("config_width") or item.get("width"),
+                item.get("config_height") or item.get("height"),
+                1000000,
+            )
+
+    for key in [
+        "display_url", "image_url", "thumbnail_url",
+        "src", "url",
+    ]:
+        add(node.get(key), node.get("width"), node.get("height"))
+
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    return candidates[0][1] if candidates else ""
+
+
+def _best_ig_video_candidate(node: dict) -> str:
+    candidates = []
+
+    def add(url, width=0, height=0, bitrate=0, bonus=0):
+        url = html.unescape(unquote(str(url or "").strip()))
+        if not url:
+            return
+        low = url.lower()
+        if not (
+            ".mp4" in low or ".m4v" in low or ".mov" in low
+            or "cdninstagram.com" in low or "fbcdn.net" in low
+        ):
+            return
+        try:
+            score = (
+                int(width or 0) * int(height or 0)
+                + int(bitrate or 0)
+                + int(bonus or 0)
+            )
+        except Exception:
+            score = int(bonus or 0)
+        candidates.append((score, url))
+
+    for item in (node.get("video_versions") or []):
+        if isinstance(item, dict):
+            add(
+                item.get("url"),
+                item.get("width"),
+                item.get("height"),
+                item.get("bitrate"),
+                5000000,
+            )
+
+    for item in (node.get("video_resources") or []):
+        if isinstance(item, dict):
+            add(
+                item.get("src") or item.get("url"),
+                item.get("config_width") or item.get("width"),
+                item.get("config_height") or item.get("height"),
+                item.get("bitrate"),
+                4000000,
+            )
+
+    for key in [
+        "video_url", "video_src", "playback_url",
+        "dash_manifest", "src", "url",
+    ]:
+        value = node.get(key)
+        if isinstance(value, str) and not value.lstrip().startswith("<"):
+            add(value, node.get("width"), node.get("height"))
+
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    return candidates[0][1] if candidates else ""
+
+
+def _ig_node_shortcode(node: dict) -> str:
+    for key in ["shortcode", "code"]:
+        value = node.get(key)
+        if isinstance(value, str) and value:
+            return value
+    media = node.get("media")
+    if isinstance(media, dict):
+        return _ig_node_shortcode(media)
+    return ""
+
+
+def _ig_node_children(node: dict):
+    edge = node.get("edge_sidecar_to_children")
+    if isinstance(edge, dict):
+        edges = edge.get("edges") or []
+        children = [
+            item.get("node")
+            for item in edges
+            if isinstance(item, dict) and isinstance(item.get("node"), dict)
+        ]
+        if children:
+            return children
+
+    for key in ["carousel_media", "children", "carousel_children"]:
+        value = node.get(key)
+        if isinstance(value, list):
+            children = []
+            for item in value:
+                if isinstance(item, dict):
+                    child = item.get("node") if isinstance(item.get("node"), dict) else item
+                    children.append(child)
+            if children:
+                return children
+
+    return []
+
+
+def _ig_structured_node_to_media(node: dict, slide_index: int):
+    if not isinstance(node, dict):
+        return None
+
+    media_type_value = node.get("media_type")
+    product_type = str(node.get("product_type") or "").lower()
+    typename = str(node.get("__typename") or "").lower()
+
+    is_video = bool(
+        node.get("is_video") is True
+        or media_type_value in {2, "2", "video"}
+        or "video" in typename
+        or product_type in {"clips", "video"}
+        or node.get("video_versions")
+        or node.get("video_resources")
+        or node.get("video_url")
+    )
+
+    if is_video:
+        url = _best_ig_video_candidate(node)
+        if not url:
+            return None
+        return {
+            "src": url,
+            "type": "video",
+            "score": 100000000 + _media_quality_score(url),
+            "_carousel_slide_index": slide_index,
+            "from": "authenticated-structured-json",
+        }
+
+    url = _best_ig_image_candidate(node)
+    if not url:
+        return None
+
+    width = node.get("original_width") or node.get("width") or 0
+    height = node.get("original_height") or node.get("height") or 0
+    try:
+        frame_ratio = float(width) / float(height) if float(height) > 0 else 0
+    except Exception:
+        frame_ratio = 0
+
+    return {
+        "src": url,
+        "type": "image",
+        "score": 50000000 + _media_quality_score(url),
+        "_carousel_slide_index": slide_index,
+        "frameRatio": frame_ratio,
+        "from": "authenticated-structured-json",
+    }
+
+
+def _extract_structured_media_from_candidate(node: dict, shortcode: str):
+    if not isinstance(node, dict):
+        return []
+
+    node_shortcode = _ig_node_shortcode(node)
+    if node_shortcode and shortcode and node_shortcode != shortcode:
+        return []
+
+    children = _ig_node_children(node)
+    source_nodes = children or [node]
+
+    items = []
+    for index, child in enumerate(source_nodes, 1):
+        media = _ig_structured_node_to_media(child, index)
+        if not media:
+            return []
+        items.append(media)
+
+    return _dedupe_media(items, preserve_order=True)
+
+
+def _find_structured_media_in_payload(payload, shortcode: str):
+    """Find the exact shortcode node and return its ordered children."""
+    best = []
+    stack = [payload]
+    visited = 0
+
+    while stack and visited < 250000:
+        current = stack.pop()
+        visited += 1
+
+        if isinstance(current, dict):
+            direct = _extract_structured_media_from_candidate(current, shortcode)
+            if direct:
+                current_shortcode = _ig_node_shortcode(current)
+                children = _ig_node_children(current)
+                exact = bool(current_shortcode == shortcode)
+                score = (
+                    (1000000 if exact else 0)
+                    + (10000 if children else 0)
+                    + len(direct)
+                )
+                previous_score = getattr(
+                    _DOWNLOAD_CONTEXT,
+                    "_structured_best_score",
+                    -1,
+                )
+                if score > previous_score:
+                    _DOWNLOAD_CONTEXT._structured_best_score = score
+                    best = direct
+
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+
+        elif isinstance(current, list):
+            for value in current:
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+
+    return best
+
+
+def _extract_json_scripts_from_page(page):
+    payloads = []
+    try:
+        texts = page.evaluate(
+            r"""
+            () => Array.from(document.querySelectorAll(
+              'script[type="application/json"],script[data-sjs]'
+            )).map(s => s.textContent || '').filter(Boolean)
+            """
+        ) or []
+    except Exception:
+        texts = []
+
+    for text in texts:
+        try:
+            text = str(text or "").strip()
+            if text and text[0] in "[{" and len(text) <= 30 * 1024 * 1024:
+                payloads.append(json.loads(text))
+        except Exception:
+            continue
+    return payloads
+
+
+def _fetch_authenticated_media_info(page, shortcode: str):
+    """Use the logged-in page session to query the post info endpoint."""
+    media_id = _shortcode_to_media_id(shortcode)
+    if not media_id:
+        return None
+
+    try:
+        result = page.evaluate(
+            r"""
+            async ({mediaId}) => {
+              const urls = [
+                `/api/v1/media/${mediaId}/info/`,
+                `/api/v1/media/${mediaId}/info/?can_support_threading=true`
+              ];
+
+              for (const url of urls) {
+                try {
+                  const response = await fetch(url, {
+                    method: 'GET',
+                    credentials: 'include',
+                    headers: {
+                      'Accept': 'application/json',
+                      'X-IG-App-ID': '936619743392459',
+                      'X-Requested-With': 'XMLHttpRequest'
+                    }
+                  });
+                  if (!response.ok) continue;
+                  const data = await response.json();
+                  if (data) return data;
+                } catch (e) {}
+              }
+              return null;
+            }
+            """,
+            {"mediaId": media_id},
+        )
+        return result if isinstance(result, (dict, list)) else None
+    except Exception:
+        return None
+
+
+
+def _structured_caption_text(node: dict) -> str:
+    """Extract the real post caption from common IG API/GraphQL shapes."""
+    if not isinstance(node, dict):
+        return ""
+
+    caption = node.get("caption")
+    if isinstance(caption, dict):
+        for key in ["text", "caption_text"]:
+            value = caption.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    elif isinstance(caption, str) and caption.strip():
+        return caption.strip()
+
+    edge = node.get("edge_media_to_caption")
+    if isinstance(edge, dict):
+        for entry in edge.get("edges") or []:
+            if not isinstance(entry, dict):
+                continue
+            child = entry.get("node")
+            if isinstance(child, dict):
+                value = child.get("text")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+
+    for key in [
+        "caption_text",
+        "description",
+        "text",
+    ]:
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return ""
+
+
+def _structured_account_name(node: dict) -> str:
+    """Extract the post owner username from common IG response shapes."""
+    if not isinstance(node, dict):
+        return ""
+
+    for key in ["user", "owner"]:
+        value = node.get(key)
+        if isinstance(value, dict):
+            for name_key in ["username", "user_name"]:
+                account = _clean_ig_account(value.get(name_key))
+                if account:
+                    return account
+
+    for key in ["username", "owner_username"]:
+        account = _clean_ig_account(node.get(key))
+        if account:
+            return account
+
+    return ""
+
+
+def _find_structured_metadata_in_payload(payload, shortcode: str) -> tuple[str, str]:
+    """Find caption/account only from the exact target-shortcode node.
+
+    This intentionally mirrors instagram_git_ok.py naming behavior:
+    real post caption first; if the post has no caption, caller falls back to
+    account and then shortcode. Generic Instagram page-shell text is ignored.
+    """
+    exact_title = ""
+    exact_account = ""
+    stack = [payload]
+    visited = 0
+
+    while stack and visited < 250000:
+        current = stack.pop()
+        visited += 1
+
+        if isinstance(current, dict):
+            current_shortcode = _ig_node_shortcode(current)
+
+            if current_shortcode == shortcode:
+                title_raw = _structured_caption_text(current)
+                clean_title = _clean_ig_caption_candidate(
+                    title_raw,
+                    shortcode,
+                )
+                if (
+                    clean_title
+                    and not _is_bad_ig_caption_candidate(
+                        clean_title,
+                        shortcode,
+                    )
+                ):
+                    exact_title = clean_title
+
+                account = _structured_account_name(current)
+                if account:
+                    exact_account = account
+
+                # The exact post node is authoritative. Do not continue looking
+                # for unrelated app-shell text elsewhere in the payload.
+                if exact_title or exact_account:
+                    return exact_title, exact_account
+
+            for value in current.values():
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+
+        elif isinstance(current, list):
+            for value in current:
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+
+    return "", ""
+
+
+
+def _collect_authenticated_structured_media(
+    page,
+    captured_payloads: list,
+    shortcode: str,
+):
+    """Return the complete ordered post media without clicking carousel arrows."""
+    try:
+        _DOWNLOAD_CONTEXT._structured_best_score = -1
+        _DOWNLOAD_CONTEXT.structured_title = ""
+        _DOWNLOAD_CONTEXT.structured_account = ""
+    except Exception:
+        pass
+
+    sources = []
+
+    for record in captured_payloads or []:
+        if isinstance(record, dict) and "payload" in record:
+            sources.append(record.get("payload"))
+
+    sources.extend(_extract_json_scripts_from_page(page))
+
+    api_payload = _fetch_authenticated_media_info(page, shortcode)
+    if api_payload is not None:
+        sources.insert(0, api_payload)
+
+    best = []
+    structured_title = ""
+    structured_account = ""
+
+    for payload in sources:
+        items = _find_structured_media_in_payload(payload, shortcode)
+        if len(items) > len(best):
+            best = items
+
+        title_candidate, account_candidate = (
+            _find_structured_metadata_in_payload(payload, shortcode)
+        )
+        if title_candidate and not structured_title:
+            structured_title = title_candidate
+        if account_candidate and not structured_account:
+            structured_account = account_candidate
+
+    try:
+        _DOWNLOAD_CONTEXT.structured_title = structured_title
+        _DOWNLOAD_CONTEXT.structured_account = structured_account
+    except Exception:
+        pass
+
+    if structured_title:
+        logger.info(
+            f"IG structured caption resolved: {structured_title}"
+        )
+    if structured_account:
+        logger.info(
+            f"IG structured account resolved: {structured_account}"
+        )
+
+    if not best:
+        return []
+
+    keys = [_media_key_from_url(item.get("src", "")) for item in best]
+    if not all(keys) or len(set(keys)) != len(keys):
+        logger.warning(
+            f"IG authenticated structured extraction rejected duplicate/empty media: "
+            f"count={len(best)}, target={shortcode}"
+        )
+        return []
+
+    logger.info(
+        f"IG authenticated structured extraction complete: "
+        f"count={len(best)}, "
+        f"types={[item.get('type') for item in best]}, "
+        f"target={shortcode}; carousel flipping skipped"
+    )
+    return best
+
+
+
 def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", use_fresh_tab: bool = True):
     """Fallback using the project-local logged-in Chrome profile.
 
@@ -5655,6 +6271,7 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
             pass
 
         harvested_media = {}
+        structured_payloads = []
         if use_fresh_tab:
             # v8 strategy: fresh tab prevents long-carousel stale DOM/profile pollution.
             page = _get_fresh_persistent_target_page(context)
@@ -5663,7 +6280,11 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
             # carousel posts whose first slide can be polluted by Chrome restored
             # tabs when opening a brand-new page too early.
             page = _get_persistent_context_page(context)
-        page.on("response", lambda response: _capture_playwright_response(response, harvested_media))
+        def _on_ig_response(response):
+            _capture_playwright_response(response, harvested_media)
+            _capture_ig_structured_response(response, structured_payloads)
+
+        page.on("response", _on_ig_response)
 
         try:
             page.bring_to_front()
@@ -5708,201 +6329,87 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
         # first render but still keep a consent overlay intercepting carousel clicks.
         _try_confirm_ig_restricted_content(page)
 
-        title = _get_prefetched_title(url) or _get_ig_full_caption_title(page, fallback_shortcode=shortcode or "Instagram_Post")
-        account = _get_prefetched_account(url) or _get_ig_post_account(page)
+        # Primary authenticated path:
+        # Extract the complete ordered post structure and its caption/account from
+        # the logged-in browser session. No visual carousel clicking is used.
+        filtered = _collect_authenticated_structured_media(
+            page,
+            structured_payloads,
+            shortcode,
+        )
 
+        if not filtered:
+            logger.warning(
+                f"IG authenticated structured extraction returned 0: "
+                f"target={shortcode}; visual carousel flipping is disabled"
+            )
+            return "RETRY", (
+                "IG authenticated browser opened the post, but the complete "
+                "structured media list was not available. Carousel flipping is "
+                "disabled to prevent wrong-post or wrong-slide downloads."
+            )
+
+        structured_title = getattr(
+            _DOWNLOAD_CONTEXT,
+            "structured_title",
+            "",
+        ) or ""
+        structured_account = getattr(
+            _DOWNLOAD_CONTEXT,
+            "structured_account",
+            "",
+        ) or ""
+
+        prefetched_title = _get_prefetched_title(url)
+        if _is_bad_ig_caption_candidate(prefetched_title, shortcode):
+            prefetched_title = ""
+            _cache_prefetched_title(url, "")
+
+        dom_title = _get_ig_full_caption_title(
+            page,
+            fallback_shortcode=shortcode or "Instagram_Post",
+        )
+        if _is_bad_ig_caption_candidate(dom_title, shortcode):
+            dom_title = ""
+
+        account = (
+            structured_account
+            or _get_prefetched_account(url)
+            or _extract_post_account_hint_from_url(url)
+            or _get_ig_post_account(page)
+        )
+
+        title = structured_title or prefetched_title or dom_title
         cleaned_title = _clean_ig_caption_candidate(title, shortcode)
-        if cleaned_title and not _is_bad_ig_caption_candidate(cleaned_title, shortcode):
+
+        if (
+            cleaned_title
+            and not _is_bad_ig_caption_candidate(
+                cleaned_title,
+                shortcode,
+            )
+        ):
             title = cleaned_title
         else:
             title = account or shortcode or "Instagram_Post"
-            logger.info(f"IG caption unavailable; use safe folder fallback: {title}")
+            logger.info(
+                f"IG caption unavailable; use safe folder fallback: {title}"
+            )
+
+        if structured_title or prefetched_title or dom_title:
+            _cache_prefetched_title(url, title)
+        else:
+            _cache_prefetched_title(url, "")
         _cache_prefetched_account(url, account)
         _publish_ig_task_title(url, title)
         _publish_ig_task_account(url, account)
 
-        # Critical scope fix:
-        # The initial page load can fetch comments, avatars, recommendation posts,
-        # restored tabs, or previous-profile resources in the persistent Chrome
-        # profile.  Those responses are not guaranteed to belong to this shortcode.
-        # Clear the harvested cache immediately before the controlled carousel walk;
-        # after this point, network-fill can only use media triggered by this
-        # target-post collection pass instead of stale/broad page-load noise.
-        preload_harvest_count = len(harvested_media)
-        if preload_harvest_count:
-            logger.info(
-                f"IG 清除 persistent profile 預載 network cache：preload={preload_harvest_count}, "
-                f"target={shortcode}，避免用推薦貼文/舊快取補圖"
-            )
-            harvested_media.clear()
-
-        try:
-            visible_media = _collect_visible_target_media(page, shortcode)
-        except Exception as carousel_exc:
-            logger.exception(
-                f"IG persistent carousel walk exception: "
-                f"target={shortcode}, error={carousel_exc}"
-            )
-            return "RETRY", (
-                f"IG persistent carousel walk exception: {carousel_exc}. "
-                "Authenticated browser state was preserved; anonymous yt-dlp fallback was skipped."
-            )
-
-        filtered = _dedupe_media(visible_media, preserve_order=True)
-
-        # Use the count detected before/while flipping.  Re-detecting after
-        # carousel navigation can return 0 on IG desktop, which caused 10-slide
-        # posts to be marked SUCCESS after only the 4 visible slides.
-        expected_count = 0
-        if _LAST_CAROUSEL_TARGET == shortcode:
-            expected_count = _LAST_CAROUSEL_EXPECTED_COUNT or 0
-        if not expected_count:
-            expected_count = _get_carousel_total_count(page)
-
-        if not _LAST_CAROUSEL_WALK_COMPLETE:
-            logger.warning(
-                f"IG dynamic carousel traversal incomplete: expected_at_least={expected_count}, "
-                f"collected={len(filtered)}, target={shortcode}; mark RETRY instead of false SUCCESS"
-            )
-            return "RETRY", (
-                f"IG carousel traversal incomplete: collected {len(filtered)}, "
-                f"expected at least {expected_count}; Next still existed or the active slide did not finish loading"
-            )
-
-        # A/B hybrid guard:
-        # - v8 fresh tab is required for long carousel posts (ex: DYGxXdEiZkt, 10 slides).
-        # - v7 cleaned persistent page is more stable for short carousel posts
-        #   (ex: DZNGYtXDQHk, 3 slides) because IG/Chrome can briefly expose
-        #   restored/recommended media in a new tab before the real first slide settles.
-        # Do the strategy switch before writing/downloading anything, so no wrong
-        # files are moved and all existing WEBP/magic-bytes/move_files logic stays unchanged.
-        if use_fresh_tab and expected_count and expected_count <= 3:
-            logger.info(
-                f"IG carousel short-post strategy switch: expected={expected_count}, "
-                f"target={shortcode}; retry collect with v7 clean persistent page before writing files"
-            )
-            try:
-                if context:
-                    context.close()
-            except Exception:
-                pass
-            return _collect_ig_media_playwright_persistent_impl(
-                p,
-                url,
-                reason=(reason or "") + " | short-carousel-v7-clean-page",
-                use_fresh_tab=False,
-            )
-
-        requested_img_index = _get_requested_img_index(url)
-        if requested_img_index > 1 and len(filtered) < 2:
-            logger.warning(
-                f"IG img_index carousel incomplete: requested_img_index={requested_img_index}, "
-                f"collected={len(filtered)}, target={shortcode}; refuse false SUCCESS"
-            )
-            return "RETRY", (
-                f"IG carousel incomplete: URL requests img_index={requested_img_index}, "
-                f"but only {len(filtered)} media item was collected"
-            )
-
-        if expected_count and len(filtered) < expected_count:
-            before_fill = len(filtered)
-            filtered = _fill_filtered_from_network_cache(filtered, harvested_media, expected_count)
-            logger.info(
-                f"IG carousel network fill: expected={expected_count}, before={before_fill}, after={len(filtered)}, target={shortcode}"
-            )
-
-        # Only when visible DOM has no media do we use a very limited fallback.
-        # Never append broad performance/html/network data after visible media,
-        # otherwise IG profile grids and "more posts" thumbnails may be downloaded.
-        if not filtered:
-            filtered = _collect_limited_target_fallback_media(
-                page,
-                harvested_media,
-                shortcode,
-                allow_broad_fallback=True,
-            )
-
+        expected_count = len(filtered)
         logger.info(
-            f"IG persistent profile scoped media count={len(filtered)}; "
-            f"visible={len(visible_media)}, network harvest={len(harvested_media)}, target={shortcode}"
+            f"IG persistent profile structured media count={expected_count}; "
+            f"network harvest={len(harvested_media)}, target={shortcode}"
         )
 
-        if expected_count and filtered and len(filtered) < expected_count:
-            logger.warning(
-                f"IG carousel incomplete after scoped collection/network fill: expected={expected_count}, got={len(filtered)}, target={shortcode}; mark RETRY instead of false SUCCESS"
-            )
-            return "RETRY", f"IG carousel incomplete: expected {expected_count}, got {len(filtered)}"
-
-        if not filtered:
-            _manual_wait_persistent_profile(page, reason="persistent scoped media count=0")
-            if not _is_target_shortcode_context(page, shortcode):
-                return "RETRY", (
-                    f"二次掃描時頁面已離開目標貼文 {shortcode}；為避免誤抓整個帳號，已停止。"
-                )
-            visible_media = _collect_visible_target_media(page, shortcode)
-            filtered = _dedupe_media(visible_media, preserve_order=True)
-
-            expected_count = 0
-            if _LAST_CAROUSEL_TARGET == shortcode:
-                expected_count = _LAST_CAROUSEL_EXPECTED_COUNT or 0
-            if not expected_count:
-                expected_count = _get_carousel_total_count(page)
-
-            if not _LAST_CAROUSEL_WALK_COMPLETE:
-                logger.warning(
-                    f"IG dynamic carousel second-pass traversal incomplete: expected_at_least={expected_count}, "
-                    f"collected={len(filtered)}, target={shortcode}; mark RETRY"
-                )
-                return "RETRY", (
-                    f"IG carousel second-pass traversal incomplete: collected {len(filtered)}, "
-                    f"expected at least {expected_count}"
-                )
-
-            if expected_count and len(filtered) < expected_count:
-                before_fill = len(filtered)
-                filtered = _fill_filtered_from_network_cache(filtered, harvested_media, expected_count)
-                logger.info(
-                    f"IG carousel second-pass network fill: expected={expected_count}, before={before_fill}, after={len(filtered)}, target={shortcode}"
-                )
-            if not filtered:
-                filtered = _collect_limited_target_fallback_media(
-                    page,
-                    harvested_media,
-                    shortcode,
-                    allow_broad_fallback=True,
-                )
-            logger.info(
-                f"IG persistent profile second-pass scoped media count={len(filtered)}; "
-                f"visible={len(visible_media)}, network harvest={len(harvested_media)}, target={shortcode}"
-            )
-
-        if expected_count and filtered and len(filtered) < expected_count:
-            logger.warning(
-                f"IG carousel incomplete after second pass: expected={expected_count}, got={len(filtered)}, target={shortcode}; mark RETRY instead of false SUCCESS"
-            )
-            return "RETRY", f"IG carousel incomplete: expected {expected_count}, got {len(filtered)}"
-
-        if not filtered:
-            return "RETRY", "已登入 IG_Parser Profile 但仍未抓到目標貼文媒體；請確認專用 Profile 已完成年齡/帳號驗證後重試"
-
-        # Single-point mixed-carousel repair:
-        # Instagram can expose a video slide only as its poster <img>.  When the
-        # original shared URL explicitly identifies that slide with img_index,
-        # replace only that exact slot with the video response harvested during
-        # the already-completed target-post walk.
-        filtered = _replace_requested_slide_with_harvested_video(
-            filtered,
-            harvested_media,
-            url,
-            shortcode,
-        )
-
-        # Final post lock before writing files.  The collected media were gathered
-        # only while the page was scoped to the target shortcode; if a later Next
-        # click left the post, do not continue scanning or append anything else.
-        # We still allow writing already collected scoped media instead of falling
-        # back to yt-dlp, because yt-dlp cannot use the project-local IG_Parser
-        # trust state.
         return _download_filtered_items_from_context(
             context,
             filtered,
@@ -6010,7 +6517,7 @@ def _collect_ig_media_playwright(url: str):
                 return _collect_ig_media_playwright_persistent(
                     p,
                     original_url,
-                    reason="img_index carousel requires persistent full-slide traversal",
+                    reason="img_index carousel requires authenticated structured extraction",
                 )
             browser = p.chromium.launch(
                 headless=True,
