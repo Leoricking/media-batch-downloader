@@ -1,6 +1,6 @@
 # 🚀 Media Batch Downloader
 
-> Current documentation: v11.54 Post Account + Dynamic Carousel Completeness
+> Current documentation: v11.78.2 Authenticated Structured Extraction + Git-OK Naming Rule
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。它支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、失敗清單整理，以及 Instagram / Facebook 的多引擎下載 fallback。
 
@@ -18,11 +18,12 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 保留 cookies.txt 作為 legacy / emergency fallback
 - 支援 IG Parser 專用 Chrome Profile，處理年齡 / 特定對象限制貼文
 - 支援 FB Parser 專用 Chrome Profile，處理 Facebook 登入、2FA、相簿與 Reel fallback
-- 支援 Instagram 受限 Carousel 的 post 鎖定、完整數量檢查、順序保留與防推薦貼文污染
+- Instagram 年齡／特定受眾限制貼文改用已登入 IG Parser Profile 的結構化 JSON，一次取得完整圖片／影片清單，不再依賴畫面翻頁
+- 支援受限 Carousel 的 shortcode 鎖定、完整數量檢查、原始順序保留與防推薦貼文污染
 - 支援下載前預取 Instagram Post Account 與 Post Title，先顯示於 GUI 再開始下載
 - GUI 任務表格顯示 URL / Post Account / Post Title / 狀態 / Retry，欄寬會依視窗大小自動調整
-- 支援 `img_index=` 分享網址的 canonical first-slide navigation，避免從第 2 張開始而漏掉第一張
-- Carousel 不再只相信分頁點數量，會動態走到真正最後一張後才判定 SUCCESS
+- `img_index=` 分享網址在受限貼文流程中只作為任務路由資訊；媒體清單改由結構化資料一次解析，不再逐張導航
+- 結構化媒體清單中的 child 數量、實際寫入數與輸出檔案數必須一致，才會判定 SUCCESS
 - 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
 - 支援自動簡體轉繁體
 - 支援安全檔名與資料夾命名
@@ -52,7 +53,7 @@ media-batch-downloader/
 │  │  ├─ instagram.py
 │  │  └─ facebook.py
 │  ├─ data/
-│  │  ├─ chrome_ig_parser/      # IG Parser 專用 Chrome Profile，用於登入、受限貼文與 Carousel fallback
+│  │  ├─ chrome_ig_parser/      # IG Parser 專用 Chrome Profile，用於登入、年齡／受眾限制與結構化媒體擷取
 │  │  ├─ playwright_fb_profile/ # FB Parser 專用 Chrome Profile，用於登入、相簿與 Reel fallback
 │  │  ├─ processed_links.log
 │  │  ├─ failed_links.log
@@ -193,25 +194,38 @@ downloader_GUI/data/playwright_fb_profile
 
 ## Instagram 下載機制
 
-Instagram 目前採多引擎策略：
+Instagram 目前採多引擎與分流策略：
 
 ```text
-Instaloader
-→ Playwright DOM / Network Cache
-→ yt-dlp fallback
+一般 Post / Reel
+→ Instaloader / yt-dlp / 一般 Playwright
+→ 成功則直接下載
+
+一般流程遇到 GraphQL 403、empty media、年齡或特定受眾限制
+→ 開啟已登入 IG Parser Profile
+→ 擷取 GraphQL / API / 頁面 JSON
+→ 依 shortcode 找到目標 Post
+→ 一次取得完整 carousel_media / children
+→ 依原始順序下載全部圖片與影片
+→ 不翻頁
 ```
 
 ### 圖文 / Carousel 貼文
 
-對 `/p/` 圖文貼文，若 Instaloader 因 GraphQL 403 失敗，系統會優先使用 Playwright。Playwright 會：
+對 `/p/` 圖文貼文，系統先嘗試既有快速路徑。若 Instaloader 因 GraphQL 403、一般 Playwright 回傳 0 媒體，或貼文需要登入／年齡／特定受眾驗證，會切換到已登入 IG Parser Profile。
 
-- 開啟真實 Instagram 頁面
-- 讀取主圖 / 影片 DOM
-- 逐張點擊 Carousel 下一張
-- 同時攔截瀏覽器已載入成功的 Network response
-- 若 CDN 二次請求失敗，直接使用 Browser Network Cache 寫檔
+受限貼文的主要流程不再依賴畫面上的 Carousel 箭頭，而是：
 
-這可避免「瀏覽器看得到，但程式二次抓 CDN 被拒絕」造成的 FAILED。
+- 使用專案內已登入的 Chrome Persistent Profile 開啟目標 shortcode
+- 攔截已登入瀏覽器的 GraphQL、`/api/v1/media/<media_id>/info/` 與頁面 JSON
+- 從 `carousel_media`、`edge_sidecar_to_children` 或相容 children 結構一次取得全部元素
+- 每個 child 分別選擇最高品質圖片或影片 URL
+- 依 API / JSON 原始順序輸出，不以畫面位置或品質分數重新排序
+- 使用同一個 Playwright Browser Context 下載，沿用登入 cookies 與 trust state
+- 影片保留完整 MP4、Range rebuild 與 fragment 組合驗證
+- 預期數、實際寫入數與暫存檔案數不一致時回 `RETRY`，不會假成功
+
+這可避免「翻頁按錯、漏頁、重複上一張影片、推薦貼文污染」等 UI 自動化問題。
 
 ### Reel / 影片
 
@@ -228,54 +242,86 @@ downloader_GUI/data/chrome_ig_parser
 設計原則：
 
 - 不使用日常 Chrome `Default` Profile，避免與平常瀏覽器搶鎖或造成空白視窗
-- 保留登入狀態、年齡確認與裝置信任狀態
-- 每筆任務仍會鎖定原始 shortcode，避免跳到推薦貼文、帳號頁或其他 post
-- Carousel 會偵測 `total_count`，缺圖不會假成功，會回 `RETRY`
-- 若網址包含 `img_index=`，會優先走已驗證穩定的 clean persistent page 路徑
-- 其他受限長 Carousel 會走 fresh tab 路徑，避免舊 DOM / 舊 dialog 污染
-- 掃描前會清除 persistent profile 的預載 network cache，避免推薦貼文或上一筆任務圖片混入
-- 下載時會保留 Carousel 翻頁順序，避免依圖片品質分數重新排序
+- 保留登入狀態、年齡確認、2FA、裝置信任與受眾確認狀態
+- 每筆任務鎖定原始 shortcode，只接受目標 Post 的結構化節點
+- 受限 Post / Carousel 以 authenticated structured extraction 為主要流程
+- 優先查詢 `/api/v1/media/<media_id>/info/`，並同時讀取 GraphQL / Polaris / hydration JSON
+- 一次取得完整 `carousel_media` / `children`，不點 Next、不按 ArrowRight、不 Swipe、不使用 pagination dot
+- `img_index=` 不再作為逐張定位 API，只保留為原始任務資訊
+- 圖片與影片依 children 原始順序輸出
+- 若結構化資料缺少 child、URL 重複或媒體數不完整，直接回 `RETRY`
+- 不會退回視覺翻頁，以避免錯 post、錯 slide 或漏下載
 
 若第一次使用 IG Parser，請先在 GUI 點「🌐 IG Parser」，登入 Instagram 並完成必要的年齡或帳號確認。完成後即可回到下載器批次執行，不需要手動匯出 cookies.txt。
 
-### Instagram Carousel 動態完整遍歷
+### Instagram Authenticated Structured Extraction（不翻頁）
 
-新版 Carousel 不再把初始分頁點（dots）數量直接當成真實總張數。部分贊助貼文、廣告型 Carousel 或 `img_index=` 分享網址，初始 DOM 可能只顯示兩個導覽節點，但實際貼文有更多頁。
+這是目前處理年齡驗證、特定受眾限制、GraphQL 403 與一般 headless 回傳 0 媒體時的正式解法。
 
-目前流程：
+流程：
 
 ```text
 鎖定目標 shortcode
-→ 必要時使用 IG Parser Persistent Profile
-→ 將瀏覽器導航網址中的 img_index 移除
-→ 從第一張開始
-→ 逐張點擊 Next
-→ 每次確認主媒體 key 確實改變
-→ Next 真正消失或停用後才確認到達最後一張
-→ 實際走過的張數作為 true_total
-→ true_total 全部成功寫入才回 SUCCESS
+→ 開啟已登入 IG Parser Persistent Profile
+→ 完成年齡 / 受眾 / 登入確認
+→ 攔截 GraphQL / API / 頁面 JSON
+→ 將 shortcode 轉換為 media ID
+→ 查詢 /api/v1/media/<media_id>/info/
+→ 找出目標 Post 的 carousel_media / children
+→ 一次取得完整圖片與影片 URL
+→ 依原始 child 順序下載
+→ written == expected == temp_files 才回 SUCCESS
 ```
 
-保護規則：
+媒體解析規則：
 
-- 原始任務 URL 與 `img_index=` 仍會保留，用於路由與 GUI 顯示
-- 只有瀏覽器實際導航時暫時移除 `img_index=`，確保從第一張開始
-- 若回到第一張後仍存在可操作的 Previous，會拒絕 false SUCCESS
-- 若 Next 還存在但下一張沒有完成載入，會回 `RETRY`
-- 不會因初始 dots 顯示 `2` 就只下載兩張
-- 不會因 URL 從 `img_index=2` 開啟而漏掉第一張
-- 每次翻頁都會檢查目標 shortcode，避免跳到推薦貼文
-- 正常單張 Post 與 Reel 不會啟動 Carousel 翻頁流程
+- 圖片會從 `image_versions2.candidates`、`display_resources` 等欄位選擇最高解析度版本
+- 影片會從 `video_versions`、`video_resources` 等欄位選擇最高解析度／bitrate 版本
+- 單張 Post 也使用同一套結構化節點解析
+- 混合 Carousel 可正確保留 `image / video / video / ...` 的原始排列
+- 不使用 Network Cache 的其他推薦貼文補數量
+- 不使用 `img_index=N` 逐張載入
+- 不進行畫面翻頁或滑鼠座標猜測
+- 若無法取得完整結構化清單，回 `RETRY`，不以不可靠的視覺翻頁補救
+
+命名規則：
+
+```text
+目標 Post 的真正 caption
+→ Post Account
+→ shortcode
+→ Instagram_Post
+```
+
+並排除 Instagram 通用頁面文字，例如：
+
+```text
+建立帳號或登入 Instagram
+Connect with friends, share what you're up to...
+Share what you're into with the people who get you...
+Instagram photos and videos
+```
 
 常用 Log：
 
 ```text
-IG canonical first-slide navigation lock
-IG carousel first-slide lock
-IG dynamic carousel walk start
-IG dynamic carousel walk: slide=
-IG dynamic carousel walk complete: true_total=
-IG dynamic carousel traversal incomplete
+IG authenticated structured extraction complete:
+IG structured caption resolved:
+IG structured account resolved:
+IG persistent profile structured media count=
+carousel flipping skipped
+IG Playwright 已成功寫入
+TEMP 有效檔案=
+```
+
+受限貼文流程中不應再出現：
+
+```text
+IG dynamic carousel walk
+Next click
+ArrowRight fallback
+media-edge Next click
+img_index recovery
 ```
 
 ### IG 媒體格式與 WEBP 處理
@@ -373,7 +419,7 @@ URL | Post Account | Post Title | 狀態 | Retry
 
 - `URL`：保留原始任務網址，靠左顯示
 - `Post Account`：下載前先預取發文帳號，例如 `successful101_official`
-- `Post Title`：下載前先預取完整 caption / 標題
+- `Post Title`：下載前先預取 caption；若一般 headless 只能取得 Instagram 通用頁面文字，會在已登入結構化擷取後更新為真正 caption、帳號或 shortcode
 - `Post Account`、`Post Title`、`狀態`、`Retry` 皆置中顯示
 - 視窗放大時，URL / Account / Title 會自動加寬
 - 視窗縮小時會保留最小欄寬，超出部分交由水平捲軸，不會黏在一起
@@ -531,15 +577,13 @@ network harvest=
 IG 使用 browser network cache 寫入
 IG Playwright 已成功寫入
 IG 清理暫存 post/
-IG strategy pre-route: img_index URL detected
-IG 清除 persistent profile 預載 network cache
-IG canonical first-slide navigation lock
-IG carousel first-slide lock
-IG dynamic carousel walk start
-IG dynamic carousel walk: slide=
-IG dynamic carousel walk complete: true_total=
-IG dynamic carousel traversal incomplete
-IG carousel network fill:
+IG authenticated structured extraction complete:
+IG structured caption resolved:
+IG structured account resolved:
+IG persistent profile structured media count=
+carousel flipping skipped
+IG Playwright 已成功寫入
+TEMP 有效檔案=
 ```
 
 若看到：
@@ -624,6 +668,20 @@ python main.py
 ---
 
 ## 版本紀錄
+
+### v11.78.2 Authenticated Structured Extraction + Git-OK Naming Rule
+
+- 年齡／特定受眾限制 Post 改用已登入 IG Parser Profile 的結構化資料擷取
+- 新增 GraphQL、Polaris、hydration JSON 與 `/api/v1/media/<media_id>/info/` 解析
+- 一次取得完整 `carousel_media` / `children`，不再依賴 Carousel 畫面翻頁
+- 圖片與影片依原始 child 順序下載，支援混合 Carousel
+- 保留完整 MP4、Range rebuild、fragment assembly 與媒體完整性檢查
+- expected / written / temp_files 必須一致才判定 `SUCCESS`
+- 結構化清單無法取得時回 `RETRY`，不退回容易誤點的視覺翻頁
+- Post Title 只接受目標 shortcode 節點的真正 caption
+- 命名規則恢復為：caption → Post Account → shortcode → `Instagram_Post`
+- 排除 Instagram 通用頁面標題，例如登入提示與 `Connect with friends...`
+- 保留普通 Post、Reels、帳號批次、Facebook 與既有 GUI 功能
 
 ### v11.54 Post Account + Dynamic Carousel Completeness
 
