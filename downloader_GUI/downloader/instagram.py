@@ -53,6 +53,13 @@ def _to_traditional(text: str) -> str:
 
 logger = get_logger("instagram")
 
+# v11.90 Structured Shortcode Ownership Fix
+# v11.93 Persistent Profile After Quality-Reject Fix
+# v11.88 Final Hard-Gated Exact Media Pipeline
+# v11.87 Verified Carousel Walk Final
+# v11.86 Carousel Probe-Until-End Lock
+# v11.85 Complete Carousel Direct-Index Collection
+# v11.84 Final Restored Stable Flow
 # v11.78.2 Git-OK Naming Rule Restore
 # v11.78.1 Structured Caption/Account Fix
 # v11.78 Authenticated Structured Extraction (No Carousel Flipping)
@@ -711,16 +718,9 @@ def _looks_like_real_ig_media_url(src: str) -> bool:
     if not ("cdninstagram.com" in low or "fbcdn.net" in low or "instagram.f" in low):
         return False
 
-    return any(x in low for x in [
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".webp",
-        "format=jpg",
-        "format=jpeg",
-        "format=png",
-        "format=webp",
-    ])
+    # Signed Instagram CDN URLs can omit .jpg/.mp4 in the visible path.
+    # Static/profile/icon resources were already rejected above.
+    return True
 
 
 def _media_quality_score(url: str) -> int:
@@ -1040,6 +1040,25 @@ def _collect_from_instaloader_shortcode(url: str):
 
     _L.download_post(post, target=TEMP_DIR)
 
+    downloaded = _list_media_files(TEMP_DIR)
+
+    if _is_ig_reel_url(url):
+        videos = [
+            path for path in downloaded
+            if _real_ext_for_file(path) == ".mp4"
+        ]
+        if not videos:
+            clear_temp()
+            raise Exception(
+                "instaloader Reel 只取得封面縮圖，未取得真正 MP4"
+            )
+        for path in downloaded:
+            if path not in videos:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
     if move_files(title):
         return "SUCCESS", ""
 
@@ -1138,6 +1157,24 @@ def _download_via_ytdlp(url: str, quick: bool = False):
                         or _extract_shortcode(url)
                         or "Instagram_Post"
                     )
+
+                downloaded = _list_media_files(TEMP_DIR)
+
+                if is_reel:
+                    videos = [
+                        path for path in downloaded
+                        if _real_ext_for_file(path) == ".mp4"
+                    ]
+                    if not videos:
+                        clear_temp()
+                        last_error = "yt-dlp Reel 只取得封面縮圖，未取得真正 MP4"
+                        continue
+                    for path in downloaded:
+                        if path not in videos:
+                            try:
+                                os.remove(path)
+                            except Exception:
+                                pass
 
                 if move_files(title):
                     return "SUCCESS", ""
@@ -3860,31 +3897,70 @@ def _extract_ig_media_from_text(text: str):
 
 
 def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, str]:
-    """Reject cropped image variants that do not match the visible post frame."""
-    if Image is None or not path or not os.path.exists(path):
+    """Hard-gate downloaded still images against thumbnails/cropped variants."""
+    if not path or not os.path.exists(path):
+        return False, "媒體檔案不存在"
+
+    media_type = (item.get("type") or "image").lower()
+    if media_type == "video":
         return True, ""
-    if (item.get("type") or "image") == "video":
-        return True, ""
+
+    if Image is None:
+        return False, "缺少 Pillow，無法驗證圖片解析度"
+
     expected = float(item.get("frameRatio") or item.get("renderRatio") or 0)
-    if expected <= 0:
-        return True, ""
+    source_w = int(item.get("sourceWidth") or 0)
+    source_h = int(item.get("sourceHeight") or 0)
+
     try:
         with Image.open(path) as im:
             w, h = im.size
+
         if w <= 0 or h <= 0:
             return False, "圖片尺寸無效"
-        if w < 320 or h < 320:
-            return False, f"下載圖片尺寸過小：size={w}x{h}"
-        actual = w / h
-        if actual > 2.25 or actual < 0.44:
-            return False, f"下載圖片比例異常，疑似裁切殘片：actual={actual:.3f}, size={w}x{h}"
-        delta = abs(actual - expected) / max(expected, 0.01)
-        if delta > 0.14:
-            return False, f"下載圖片比例與貼文畫面不符：expected={expected:.3f}, actual={actual:.3f}, size={w}x{h}"
-        return True, ""
-    except Exception as e:
-        return True, f"geometry-check-skipped: {e}"
 
+        # Instagram normal Post images are expected to have at least a 720px
+        # long edge. Reject 320/480/640 preview variants outright.
+        if max(w, h) < 720:
+            return False, (
+                f"下載結果是低解析度縮圖：actual={w}x{h}"
+            )
+
+        if min(w, h) < 360:
+            return False, (
+                f"下載圖片短邊過小，疑似裁切縮圖：actual={w}x{h}"
+            )
+
+        if source_w > 0 and source_h > 0:
+            declared_long = max(source_w, source_h)
+            actual_long = max(w, h)
+            if declared_long >= 720 and actual_long < int(declared_long * 0.80):
+                return False, (
+                    f"下載圖片解析度低於來源宣告："
+                    f"declared={source_w}x{source_h}, actual={w}x{h}"
+                )
+
+        actual = w / h
+
+        if actual > 2.25 or actual < 0.44:
+            return False, (
+                f"下載圖片比例異常，疑似裁切殘片："
+                f"actual={actual:.3f}, size={w}x{h}"
+            )
+
+        if expected > 0:
+            delta = abs(actual - expected) / max(expected, 0.01)
+            if delta > 0.14:
+                return False, (
+                    f"下載圖片比例與貼文畫面不符："
+                    f"expected={expected:.3f}, actual={actual:.3f}, "
+                    f"size={w}x{h}"
+                )
+
+        return True, ""
+
+    except Exception as e:
+        return False, f"圖片解析度驗證失敗：{e}"
 
 
 def _normalized_media_identity(url: str) -> str:
@@ -4067,8 +4143,58 @@ def _replace_requested_slide_with_harvested_video(
 
 
 
+
+def _validate_downloaded_media_type(path: str, item: dict) -> tuple[bool, str]:
+    """Ensure a Reel/video is a real playable MP4 and images are not videos."""
+    if not path or not os.path.exists(path):
+        return False, "下載檔案不存在"
+
+    expected_type = (item.get("type") or "image").lower()
+    real_ext = _real_ext_for_file(path)
+
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+
+    if expected_type == "video":
+        if real_ext != ".mp4":
+            return False, (
+                f"影片下載結果不是 MP4，而是 {real_ext or 'unknown'}"
+            )
+        if size < 100 * 1024:
+            return False, (
+                f"影片檔案過小，疑似封面或殘片：{size} bytes"
+            )
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+            if not _is_playable_mp4_body(body):
+                return False, "影片不是完整可播放 MP4"
+        except Exception as e:
+            return False, f"影片完整性驗證失敗：{e}"
+        return True, ""
+
+    if real_ext == ".mp4":
+        return False, "圖片項目實際下載成影片，媒體類型不符"
+
+    return True, ""
+
+
+
 def _download_filtered_items_from_context(context, filtered, harvested_media, title: str, shortcode: str, referer: str):
-    """Write filtered IG media items and move them using existing move_files()."""
+    """Write only media explicitly owned by the current shortcode."""
+    if not filtered:
+        return "FAILED", "IG 沒有可下載的目標媒體"
+
+    for item in filtered:
+        owner = item.get("_target_shortcode")
+        if owner != shortcode:
+            return "FAILED", (
+                f"IG 媒體 shortcode 不符："
+                f"expected={shortcode}, actual={owner or 'missing'}"
+            )
+
     success_count = 0
 
     for i, item in enumerate(filtered, 1):
@@ -4161,7 +4287,22 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
             # frame is portrait/landscape. This prevents false SUCCESS.
             actual_candidates = [x for x in _list_media_files(TEMP_DIR) if os.path.basename(x).startswith(f"ig_{i}")]
             actual_path = actual_candidates[-1] if actual_candidates else dst
-            geometry_ok, geometry_reason = _validate_downloaded_media_geometry(actual_path, item)
+            type_ok, type_reason = _validate_downloaded_media_type(
+                actual_path,
+                item,
+            )
+            if not type_ok:
+                try:
+                    if os.path.exists(actual_path):
+                        os.remove(actual_path)
+                except Exception:
+                    pass
+                raise Exception(type_reason)
+
+            geometry_ok, geometry_reason = _validate_downloaded_media_geometry(
+                actual_path,
+                item,
+            )
             if not geometry_ok:
                 try:
                     if os.path.exists(actual_path):
@@ -4179,12 +4320,14 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
             logger.warning(f"IG 略過無效媒體: {media_url[:180]} | {e}")
 
     if success_count <= 0:
-        return "RETRY", "Playwright 有抓到媒體 URL，但本輪全部下載失敗或過小；可能是 IG CDN 暫時空回應，建議稍後重試"
+        return "FAILED", (
+            "IG 媒體全部未通過影片/圖片完整性與解析度驗證"
+        )
 
     temp_files_after_capture = _list_media_files(TEMP_DIR)
 
     if success_count != len(filtered) or len(temp_files_after_capture) != len(filtered):
-        return "RETRY", (
+        return "FAILED", (
             f"IG 媒體完整性檢查失敗：expected={len(filtered)}, "
             f"written={success_count}, temp_files={len(temp_files_after_capture)}"
         )
@@ -5167,11 +5310,12 @@ def _click_next_ig_locked_keycheck(page, target_shortcode: str) -> bool:
     except Exception:
         pass
 
-    if not _is_actionable_carousel_next(page):
-        return False
+    actionable_next = _is_actionable_carousel_next(page)
 
-    # First use the spatially locked real carousel control.
-    moved = _click_next_ig(page)
+    # First use the spatially locked real carousel control when available.
+    # Instagram frequently hides the visible Next control in headless mode,
+    # so keyboard/dot/swipe fallbacks must still run when this is False.
+    moved = _click_next_ig(page) if actionable_next else False
     if moved:
         if target_shortcode and not _is_target_shortcode_context(page, target_shortcode):
             logger.warning(
@@ -6190,6 +6334,16 @@ def _collect_authenticated_structured_media(
     if not best:
         return []
 
+    # v11.90: structured JSON extraction is already selected from the exact
+    # target-shortcode node, but the converted child media did not carry the
+    # ownership marker required by the final hard gate.  Stamp it only here,
+    # after exact structured selection and duplicate validation preparation, so
+    # downstream download validation can prove every item belongs to this task.
+    # This does not relax cross-post protection; it restores the ownership
+    # metadata lost while converting carousel child nodes.
+    for item in best:
+        item["_target_shortcode"] = shortcode
+
     keys = [_media_key_from_url(item.get("src", "")) for item in best]
     if not all(keys) or len(set(keys)) != len(keys):
         logger.warning(
@@ -6208,7 +6362,13 @@ def _collect_authenticated_structured_media(
 
 
 
-def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", use_fresh_tab: bool = True):
+def _collect_ig_media_playwright_persistent_impl(
+    p,
+    url: str,
+    reason: str = "",
+    use_fresh_tab: bool = True,
+    headless_mode: bool = False,
+):
     """Fallback using the project-local logged-in Chrome profile.
 
     This version is strictly shortcode-scoped.  It never scans or finalizes media
@@ -6251,7 +6411,7 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
         context = p.chromium.launch_persistent_context(
             user_data_dir=user_data_dir,
             channel="chrome",
-            headless=False,
+            headless=headless_mode,
             viewport={"width": 1400, "height": 1600},
             locale="zh-TW",
             args=[
@@ -6315,14 +6475,19 @@ def _collect_ig_media_playwright_persistent_impl(p, url: str, reason: str = "", 
             )
 
         if _is_generic_ig_page(page) or _is_ig_audience_restricted_page(page):
-            _manual_wait_persistent_profile(page, reason="age/audience/login page before harvest")
+            if headless_mode:
+                return "BLOCKED", "IG_VISIBLE_PROFILE_REQUIRED"
+
+            _manual_wait_persistent_profile(
+                page,
+                reason="age/audience/login page before harvest",
+            )
 
             if _is_missing_ig_page(page):
                 return "MISSING", "Instagram 顯示：很抱歉，此頁面無法使用；連結可能故障或頁面已遭移除"
             if not _is_target_shortcode_context(page, shortcode):
-                return "RETRY", (
-                    f"手動確認後頁面離開目標貼文 {shortcode}；為避免誤抓整個帳號，已停止。"
-                    "請重新貼目標貼文 URL 後重試。"
+                return "FAILED", (
+                    f"確認後頁面離開目標貼文 {shortcode}；已停止下載。"
                 )
 
         # Some logged-in profiles no longer show the restriction text after the
@@ -6470,28 +6635,349 @@ def _should_use_v7_clean_persistent_page_for_url(url: str) -> bool:
     return "img_index=" in low
 
 
-def _collect_ig_media_playwright_persistent(p, url: str, reason: str = ""):
-    """Hybrid persistent IG fallback.
+def _collect_ig_media_playwright_persistent(
+    p,
+    url: str,
+    reason: str = "",
+    headless_mode: bool = False,
+):
+    use_v7_clean = (
+        _should_use_v7_clean_persistent_page_for_url(url)
+        and not headless_mode
+    )
 
-    Keep the two known-good paths from the user's A/B test:
-    - img_index carousel URLs use v7 clean persistent page from the start.
-    - other posts use v8 fresh tab.
-
-    Do not start with v8 and switch later for img_index posts; that can already
-    introduce first-slide pollution before the v7 retry begins.
-    """
-    use_v7_clean = _should_use_v7_clean_persistent_page_for_url(url)
-    if use_v7_clean:
-        logger.info(
-            "IG strategy pre-route: img_index URL detected; "
-            "use v7 clean persistent page from start to avoid first-slide pollution"
-        )
     return _collect_ig_media_playwright_persistent_impl(
         p,
         url,
         reason=reason,
-        use_fresh_tab=not use_v7_clean,
+        use_fresh_tab=True if headless_mode else not use_v7_clean,
+        headless_mode=headless_mode,
     )
+
+
+
+def _detect_target_carousel_count(page) -> int:
+    """Detect the number of slides in the active target Post.
+
+    Instagram commonly exposes either "1 / 4" text, localized aria-labels, or
+    one small indicator dot per slide.  Search only inside the active article/
+    dialog so comments and recommended posts cannot affect the result.
+    """
+    try:
+        count = page.evaluate(
+            r"""
+            () => {
+              const root =
+                document.querySelector('div[role="dialog"] article') ||
+                document.querySelector('div[role="dialog"]') ||
+                document.querySelector('article');
+
+              if (!root) return 1;
+
+              let best = 1;
+              const nodes = Array.from(
+                root.querySelectorAll('[aria-label],[title],span,div,button')
+              );
+
+              for (const el of nodes) {
+                const text = [
+                  el.getAttribute && el.getAttribute('aria-label'),
+                  el.getAttribute && el.getAttribute('title'),
+                  el.textContent
+                ].filter(Boolean).join(' ').trim();
+
+                const patterns = [
+                  /(?:image|photo|video|slide)\s*(\d+)\s*(?:of|\/)\s*(\d+)/i,
+                  /(?:第\s*)?(\d+)\s*(?:張|則|個)?\s*[\/／]\s*(\d+)/,
+                  /\b(\d+)\s*[\/／]\s*(\d+)\b/
+                ];
+
+                for (const pattern of patterns) {
+                  const match = text.match(pattern);
+                  if (!match) continue;
+                  const total = parseInt(match[2], 10) || 0;
+                  if (total > best && total <= 40) best = total;
+                }
+              }
+
+              // Carousel indicator dots are generally tiny, horizontally aligned,
+              // and located near the lower half of the media pane.
+              const rr = root.getBoundingClientRect();
+              const candidates = Array.from(root.querySelectorAll(
+                'div,span,button,[role="button"]'
+              )).filter(el => {
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                if (
+                  st.display === 'none' ||
+                  st.visibility === 'hidden' ||
+                  parseFloat(st.opacity || '1') <= 0
+                ) return false;
+
+                return (
+                  r.width >= 3 && r.width <= 16 &&
+                  r.height >= 3 && r.height <= 16 &&
+                  r.left >= rr.left &&
+                  r.right <= rr.right &&
+                  r.top >= rr.top + rr.height * 0.55 &&
+                  r.bottom <= rr.bottom
+                );
+              });
+
+              const rows = new Map();
+              for (const el of candidates) {
+                const r = el.getBoundingClientRect();
+                const cy = Math.round((r.top + r.height / 2) / 4) * 4;
+                const cx = Math.round((r.left + r.width / 2) / 4) * 4;
+                if (!rows.has(cy)) rows.set(cy, []);
+                rows.get(cy).push(cx);
+              }
+
+              for (const xs of rows.values()) {
+                const unique = [];
+                for (const x of xs.sort((a,b) => a-b)) {
+                  if (!unique.some(v => Math.abs(v - x) <= 5)) unique.push(x);
+                }
+                if (unique.length >= 2 && unique.length <= 40) {
+                  best = Math.max(best, unique.length);
+                }
+              }
+
+              return best;
+            }
+            """
+        )
+        return max(1, min(_MAX_CAROUSEL_ITEMS, int(count or 1)))
+    except Exception:
+        return 1
+
+
+def _load_exact_post_slide(
+    context,
+    shortcode: str,
+    slide_index: int,
+    harvested_media: dict,
+):
+    """Load exactly one carousel index in a fresh hidden page."""
+    page = context.new_page()
+    page.on(
+        "response",
+        lambda response: _capture_playwright_response(
+            response,
+            harvested_media,
+        ),
+    )
+
+    target_url = f"https://www.instagram.com/p/{shortcode}/"
+    if slide_index > 1:
+        target_url += f"?img_index={slide_index}"
+
+    try:
+        page.goto(
+            target_url,
+            wait_until="domcontentloaded",
+            timeout=45000,
+        )
+    except PlaywrightTimeoutError:
+        logger.warning(
+            f"IG direct-index goto timeout: "
+            f"target={shortcode}, index={slide_index}"
+        )
+
+    page.wait_for_timeout(2800)
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=6000)
+    except Exception:
+        pass
+
+    _warmup_ig_page_for_media(page, is_reel=False)
+
+    if not _is_target_shortcode_context(page, shortcode):
+        try:
+            page.close()
+        except Exception:
+            pass
+        return None
+
+    current = _get_current_slide_main_media(page)
+    if not current:
+        current = _get_meta_ig_media(page)[:1]
+
+    item = dict(current[0]) if current else None
+    if item:
+        item["_carousel_slide_index"] = slide_index
+        item["_target_shortcode"] = shortcode
+        item["from"] = item.get("from") or "direct-img-index"
+
+    try:
+        page.close()
+    except Exception:
+        pass
+
+    return item
+
+
+def _collect_complete_post_carousel(
+    context,
+    page,
+    shortcode: str,
+    harvested_media: dict,
+    original_url: str = "",
+):
+    """Collect every slide and fail closed on any completeness uncertainty."""
+    detected = _detect_target_carousel_count(page)
+    requested_index = _get_requested_img_index(original_url or "")
+    minimum_expected = max(1, detected, requested_index)
+
+    if not _is_target_shortcode_context(page, shortcode):
+        logger.warning(
+            f"IG carousel start context mismatch: "
+            f"target={shortcode}, current={page.url}"
+        )
+        return []
+
+    # Always begin from the first slide, regardless of a shared img_index URL.
+    _rewind_carousel_to_first(
+        page,
+        shortcode,
+        max_steps=_MAX_CAROUSEL_ITEMS,
+    )
+
+    collected = []
+    seen = set()
+
+    first = _get_current_slide_main_media(page)
+    if not first:
+        first = _get_meta_ig_media(page)[:1]
+
+    if not first:
+        logger.warning(
+            f"IG carousel first media unavailable: target={shortcode}"
+        )
+        return []
+
+    first_item = dict(first[0])
+    first_item["_carousel_slide_index"] = 1
+    first_item["_target_shortcode"] = shortcode
+    first_item["from"] = first_item.get("from") or "verified-carousel-walk"
+
+    first_key = _media_key_from_url(first_item.get("src", ""))
+    if not first_key:
+        return []
+
+    seen.add(first_key)
+    collected.append(first_item)
+
+    # Do not trust only the visible arrow. Probe advancement through all verified
+    # methods; the keycheck function now runs keyboard/dot/swipe even when IG
+    # hides the Next button.
+    first_probe_attempted = False
+    first_probe_moved = False
+
+    for slide_index in range(2, _MAX_CAROUSEL_ITEMS + 1):
+        first_probe_attempted = True
+        moved = _click_next_ig_locked_keycheck(page, shortcode)
+
+        if slide_index == 2:
+            first_probe_moved = bool(moved)
+
+        if not moved:
+            break
+
+        if not _is_target_shortcode_context(page, shortcode):
+            logger.warning(
+                f"IG carousel walk left target post: "
+                f"target={shortcode}, current={page.url}"
+            )
+            return []
+
+        current = _get_current_slide_main_media(page)
+        if not current:
+            logger.warning(
+                f"IG carousel advanced but media unresolved: "
+                f"index={slide_index}, target={shortcode}"
+            )
+            return []
+
+        item = dict(current[0])
+        item["_carousel_slide_index"] = slide_index
+        item["_target_shortcode"] = shortcode
+        item["from"] = item.get("from") or "verified-carousel-walk"
+
+        key = _media_key_from_url(item.get("src", ""))
+        if not key:
+            return []
+
+        if key in seen:
+            logger.info(
+                f"IG carousel end reached by duplicate: "
+                f"index={slide_index}, target={shortcode}"
+            )
+            break
+
+        seen.add(key)
+        collected.append(item)
+
+        if detected > 1 and len(collected) >= detected:
+            # Still perform no extra click. The detected count is accepted only
+            # after exactly that many unique media items were captured.
+            break
+
+    initial_next_available = (
+        _is_actionable_carousel_next(page)
+        or _has_visible_carousel_next(page)
+    )
+
+    logger.info(
+        f"IG hard-gated carousel result: "
+        f"collected={len(collected)}, detected={detected}, "
+        f"requested_index={requested_index}, minimum={minimum_expected}, "
+        f"first_probe_attempted={first_probe_attempted}, "
+        f"first_probe_moved={first_probe_moved}, "
+        f"next_visible_after_walk={initial_next_available}, "
+        f"target={shortcode}"
+    )
+
+    # Shared URLs with img_index=N prove at least N slides exist.
+    if len(collected) < minimum_expected:
+        logger.warning(
+            f"IG incomplete carousel rejected: "
+            f"collected={len(collected)}, minimum={minimum_expected}, "
+            f"target={shortcode}"
+        )
+        return []
+
+    # If navigation still reports another slide after collection stopped, the
+    # result is incomplete and must never be SUCCESS.
+    if initial_next_available and (
+        detected <= 1 or len(collected) < detected
+    ):
+        logger.warning(
+            f"IG remaining next control proves incomplete carousel: "
+            f"collected={len(collected)}, detected={detected}, "
+            f"target={shortcode}"
+        )
+        return []
+
+    # A Carousel probe that moved confirms multi-slide content. Never permit it
+    # to collapse back to one output item.
+    if first_probe_moved and len(collected) <= 1:
+        logger.warning(
+            f"IG one-slide false SUCCESS rejected after verified movement: "
+            f"target={shortcode}"
+        )
+        return []
+
+    for item in collected:
+        if item.get("_target_shortcode") != shortcode:
+            logger.warning(
+                f"IG cross-post media rejected before download: "
+                f"target={shortcode}"
+            )
+            return []
+
+    return _dedupe_media(collected, preserve_order=True)
 
 
 def _collect_ig_media_playwright(url: str):
@@ -6506,19 +6992,6 @@ def _collect_ig_media_playwright(url: str):
 
     try:
         with sync_playwright() as p:
-            # img_index URLs are known carousel tasks. Route them directly through
-            # the logged-in persistent profile so sponsored/lazy carousel controls
-            # are available before any single-image false SUCCESS can occur.
-            if _get_requested_img_index(original_url) > 1:
-                logger.info(
-                    "IG img_index carousel pre-route: use persistent IG_Parser before headless collection "
-                    f"(img_index={_get_requested_img_index(original_url)}, target={shortcode})"
-                )
-                return _collect_ig_media_playwright_persistent(
-                    p,
-                    original_url,
-                    reason="img_index carousel requires authenticated structured extraction",
-                )
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -6624,32 +7097,28 @@ def _collect_ig_media_playwright(url: str):
             _publish_ig_task_title(url, title)
             _publish_ig_task_account(url, account)
 
-            collected = []
-            seen_media_keys = set()
-
-            for _ in range(_MAX_CAROUSEL_ITEMS):
+            if _is_ig_post_url(url):
+                filtered = _collect_complete_post_carousel(
+                    context,
+                    page,
+                    shortcode,
+                    harvested_media,
+                    original_url=original_url,
+                )
+            else:
+                collected = []
                 current = _get_current_slide_main_media(page)
+                if current:
+                    collected.extend(current[:1])
 
-                if not current and not collected:
-                    current = _get_meta_ig_media(page)[:1]
-
-                if not current:
-                    break
-
-                item = current[0]
-                src = item.get("src", "")
-                key = _media_key_from_url(src)
-
-                if key not in seen_media_keys:
-                    seen_media_keys.add(key)
-                    collected.append(item)
-
-                moved = _click_next_ig_locked(page, shortcode)
-
-                if not moved:
-                    break
-
-            filtered = _dedupe_media(collected)
+                filtered = [
+                    item for item in _dedupe_media(collected)
+                    if (item.get("type") or "").lower() == "video"
+                    or any(
+                        ext in (item.get("src") or "").lower()
+                        for ext in [".mp4", ".m4v", ".mov"]
+                    )
+                ][:1]
 
             # Shortcode scope guard:
             # If the target post/reel DOM is visible, do not append broad
@@ -6662,13 +7131,15 @@ def _collect_ig_media_playwright(url: str):
             fallback_html = []
             if not filtered:
                 fallback_video = _get_video_current_sources(page)
-                if _is_target_shortcode_context(page, shortcode):
-                    fallback_perf = _get_performance_ig_media(page)[:3]
-                    try:
-                        fallback_html = _extract_ig_media_from_text(page.content())[:3]
-                    except Exception:
-                        fallback_html = []
-                filtered = _dedupe_media(fallback_video + fallback_perf + fallback_html)[:3]
+
+                if _is_ig_reel_url(url):
+                    filtered = _dedupe_media(fallback_video)[:1]
+                else:
+                    # Broad page resources may belong to recommendations or
+                    # another post. Never use them for normal Post downloads.
+                    fallback_perf = []
+                    fallback_html = []
+                    filtered = []
 
             logger.info(
                 f"IG filtered media count={len(filtered)}; network harvest={len(harvested_media)}; "
@@ -6680,11 +7151,22 @@ def _collect_ig_media_playwright(url: str):
                 status_p, error_p = _collect_ig_media_playwright_persistent(
                     p,
                     url,
-                    reason="normal Playwright network harvest=0",
+                    reason="normal headless collection returned 0",
+                    headless_mode=True,
                 )
+
                 if status_p == "SUCCESS":
                     return status_p, error_p
-                return "RETRY", error_p or "Playwright 頁面已開啟，但本輪未抓到有效貼文主媒體；可能是 IG lazy-load / 暫時空回應，建議稍後重試"
+
+                if status_p == "BLOCKED" and error_p == "IG_VISIBLE_PROFILE_REQUIRED":
+                    return _collect_ig_media_playwright_persistent(
+                        p,
+                        url,
+                        reason="explicit login/age/audience confirmation required",
+                        headless_mode=False,
+                    )
+
+                return status_p, error_p
 
             status_write, error_write = _download_filtered_items_from_context(
                 context,
@@ -6694,6 +7176,60 @@ def _collect_ig_media_playwright(url: str):
                 shortcode,
                 referer=url,
             )
+
+            # v11.93:
+            # A cookies.txt/headless page may expose only a cropped 640x640 preview
+            # for an age/audience-restricted post. The media list is non-empty, so
+            # older builds skipped the authenticated IG Parser Profile and later
+            # let anonymous yt-dlp turn the task into a false BLOCKED result.
+            #
+            # Keep every existing quality/integrity gate unchanged. When all
+            # headless candidates are rejected, retry the exact shortcode through
+            # the logged-in persistent profile before deciding the final status.
+            if status_write != "SUCCESS":
+                quality_or_integrity_rejected = any(
+                    marker in str(error_write or "")
+                    for marker in [
+                        "媒體全部未通過",
+                        "媒體完整性檢查失敗",
+                        "低解析度縮圖",
+                        "解析度",
+                        "圖片幾何",
+                        "影片/圖片完整性",
+                    ]
+                )
+
+                if quality_or_integrity_rejected:
+                    logger.info(
+                        "IG headless 媒體未通過品質/完整性 gate；"
+                        "改用已登入 IG Parser Profile 重新抓取，避免匿名 yt-dlp 假 BLOCKED"
+                    )
+                    status_p, error_p = _collect_ig_media_playwright_persistent(
+                        p,
+                        url,
+                        reason=(
+                            "headless media existed but all candidates were rejected "
+                            "by quality/integrity validation"
+                        ),
+                        headless_mode=True,
+                    )
+
+                    if status_p == "SUCCESS":
+                        return status_p, error_p
+
+                    if status_p == "BLOCKED" and error_p == "IG_VISIBLE_PROFILE_REQUIRED":
+                        return _collect_ig_media_playwright_persistent(
+                            p,
+                            url,
+                            reason=(
+                                "visible login/age/audience confirmation required "
+                                "after headless quality rejection"
+                            ),
+                            headless_mode=False,
+                        )
+
+                    return status_p, error_p
+
             return status_write, error_write
 
             success_count = 0
@@ -6774,6 +7310,50 @@ def _collect_ig_media_playwright(url: str):
         try:
             if browser:
                 browser.close()
+        except Exception:
+            pass
+
+
+def get_login_status() -> tuple[bool, str]:
+    """Check the dedicated IG Parser Profile without opening a visible browser."""
+    user_data_dir = _resolve_chrome_user_data_dir()
+    profile_dir = _resolve_chrome_profile_directory()
+
+    if not user_data_dir or not os.path.exists(user_data_dir):
+        return False, "未建立 Profile"
+
+    context = None
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel="chrome",
+                headless=True,
+                args=[
+                    f"--profile-directory={profile_dir}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--window-position=-32000,-32000",
+                ],
+            )
+            cookies = context.cookies()
+            names = {
+                str(cookie.get("name") or "")
+                for cookie in cookies
+                if "instagram.com" in str(cookie.get("domain") or "").lower()
+            }
+            if {"sessionid", "ds_user_id"}.issubset(names):
+                return True, "已登入"
+            return False, "未登入"
+    except Exception as e:
+        text = _clean_error_text(str(e))
+        if "user data directory is already in use" in text.lower():
+            return False, "Profile 使用中"
+        return False, "狀態無法確認"
+    finally:
+        try:
+            if context:
+                context.close()
         except Exception:
             pass
 

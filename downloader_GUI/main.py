@@ -145,6 +145,7 @@ class _HiddenLoginButton:
 
 
 
+# v11.89: restore Post Account + centered Account/Title + login status
 # v11.54: center Post Account / Post Title headings and values
 # v11.37: show resolved Instagram Post Title beside URL
 class App:
@@ -158,6 +159,8 @@ class App:
         self._blocked_warned = False
         self._login_in_progress = False
         self._failed_window = None
+        self.ig_login_status_var = tk.StringVar(value="IG：檢查中…")
+        self.fb_login_status_var = tk.StringVar(value="FB：檢查中…")
 
         # Treeview row id -> full task url.
         # The visible URL column is shortened for readability, but right-click copy
@@ -184,6 +187,7 @@ class App:
 
         self._build_ui()
         queue_manager.load_checkpoint()
+        self.root.after(300, self._refresh_login_status_async)
         worker.start()
 
         self.root.after(300, self._init_session)
@@ -544,6 +548,36 @@ class App:
             pady=self._button_pady,
             font=("Microsoft JhengHei UI", self._small_font_size),
             relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT)
+
+        login_status_row = tk.Frame(btn_area)
+        login_status_row.pack(anchor="w", fill=tk.X, pady=(self._ui_px(3), 0))
+
+        self.ig_login_status_label = tk.Label(
+            login_status_row,
+            textvariable=self.ig_login_status_var,
+            fg="#757575",
+            font=("Microsoft JhengHei UI", self._small_font_size, "bold"),
+        )
+        self.ig_login_status_label.pack(side=tk.LEFT, padx=(0, self._ui_px(12)))
+
+        self.fb_login_status_label = tk.Label(
+            login_status_row,
+            textvariable=self.fb_login_status_var,
+            fg="#757575",
+            font=("Microsoft JhengHei UI", self._small_font_size, "bold"),
+        )
+        self.fb_login_status_label.pack(side=tk.LEFT, padx=(0, self._ui_px(12)))
+
+        tk.Button(
+            login_status_row,
+            text="🔄 更新登入狀態",
+            command=self._refresh_login_status_async,
+            padx=self._ui_px(5),
+            pady=max(1, self._button_pady - 1),
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.GROOVE,
             cursor="hand2",
         ).pack(side=tk.LEFT)
 
@@ -1026,6 +1060,59 @@ class App:
                 "建議先點「🌐 IG Parser」與「🌐 FB Parser」完成登入；不需手動匯出 cookies.txt。"
             )
 
+    def _apply_login_status(self, platform: str, logged_in: bool, message: str):
+        if platform == "ig":
+            var = self.ig_login_status_var
+            label = self.ig_login_status_label
+            prefix = "IG"
+        else:
+            var = self.fb_login_status_var
+            label = self.fb_login_status_label
+            prefix = "FB"
+
+        var.set(f"{prefix}：{message}")
+
+        if logged_in:
+            label.configure(fg="#2E7D32")
+        elif message in {"檢查中…", "Profile 使用中"}:
+            label.configure(fg="#EF6C00")
+        else:
+            label.configure(fg="#C62828")
+
+    def _refresh_login_status_async(self):
+        self._apply_login_status("ig", False, "檢查中…")
+        self._apply_login_status("fb", False, "檢查中…")
+
+        def check():
+            try:
+                ig_ok, ig_message = instagram.get_login_status()
+            except Exception:
+                ig_ok, ig_message = False, "狀態無法確認"
+
+            try:
+                fb_ok, fb_message = facebook.get_login_status()
+            except Exception:
+                fb_ok, fb_message = False, "狀態無法確認"
+
+            self.root.after(
+                0,
+                lambda: self._apply_login_status(
+                    "ig",
+                    bool(ig_ok),
+                    str(ig_message),
+                ),
+            )
+            self.root.after(
+                0,
+                lambda: self._apply_login_status(
+                    "fb",
+                    bool(fb_ok),
+                    str(fb_message),
+                ),
+            )
+
+        threading.Thread(target=check, daemon=True).start()
+
     def _open_ig_parser_profile(self):
         """Open project-local IG_Parser Chrome profile for one-time login / trust setup."""
         try:
@@ -1044,6 +1131,7 @@ class App:
                 parent=self.root,
             )
             self.status_var.set(f"已開啟 IG_Parser 專用 Profile：{profile_root}")
+            self.root.after(1500, self._refresh_login_status_async)
         except Exception as e:
             messagebox.showerror(
                 "無法開啟 IG_Parser Profile",
@@ -1070,6 +1158,7 @@ class App:
                 parent=self.root,
             )
             self.status_var.set(f"已開啟 FB_Parser 專用 Profile：{profile_root}")
+            self.root.after(1500, self._refresh_login_status_async)
         except Exception as e:
             messagebox.showerror(
                 "無法開啟 FB_Parser Profile",
