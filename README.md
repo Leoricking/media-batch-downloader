@@ -1,6 +1,6 @@
 # 🚀 Media Batch Downloader
 
-> Current documentation: v11.78.2 Authenticated Structured Extraction + Git-OK Naming Rule
+> Current documentation: v11.93 Persistent Profile After Quality-Reject Fix
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。它支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、失敗清單整理，以及 Instagram / Facebook 的多引擎下載 fallback。
 
@@ -22,6 +22,12 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 支援受限 Carousel 的 shortcode 鎖定、完整數量檢查、原始順序保留與防推薦貼文污染
 - 支援下載前預取 Instagram Post Account 與 Post Title，先顯示於 GUI 再開始下載
 - GUI 任務表格顯示 URL / Post Account / Post Title / 狀態 / Retry，欄寬會依視窗大小自動調整
+- GUI 顯示 IG / FB Parser 登入狀態，可手動更新；Post Account 與 Post Title 標題及內容皆置中
+- Instagram structured media 會寫入並驗證目標 shortcode ownership，避免跨貼文媒體污染
+- Instagram 圖片會硬性拒絕 320 / 480 / 640 等低解析度縮圖、錯誤裁切與比例不符版本
+- Instagram Reel / 影片必須通過真實 MP4、檔案大小與可播放完整性驗證，封面圖不得假裝影片成功
+- 一般 headless 流程若只取得縮圖或品質檢查失敗，會改用已登入 IG Parser Profile 重抓；Profile 也無法確認時才回 BLOCKED
+- Facebook Reel 保留既有可下載的 browser network / metadata 流程，輸出檔名優先使用 Reel caption / title
 - `img_index=` 分享網址在受限貼文流程中只作為任務路由資訊；媒體清單改由結構化資料一次解析，不再逐張導航
 - 結構化媒體清單中的 child 數量、實際寫入數與輸出檔案數必須一致，才會判定 SUCCESS
 - 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
@@ -198,16 +204,19 @@ Instagram 目前採多引擎與分流策略：
 
 ```text
 一般 Post / Reel
-→ Instaloader / yt-dlp / 一般 Playwright
-→ 成功則直接下載
+→ Instaloader / yt-dlp / headless Playwright
+→ 媒體類型、解析度、比例、完整 MP4 與 shortcode ownership 驗證
+→ 全部驗證通過才輸出 SUCCESS
 
-一般流程遇到 GraphQL 403、empty media、年齡或特定受眾限制
-→ 開啟已登入 IG Parser Profile
+一般流程遇到 GraphQL 403、empty media、年齡／特定受眾限制，
+或 headless 只取得低解析度縮圖、裁切圖、無效影片
+→ 先改用已登入 IG Parser Profile 的 headless persistent context
+→ 若需要手動登入／年齡／受眾確認，才開啟可見 Profile
 → 擷取 GraphQL / API / 頁面 JSON
 → 依 shortcode 找到目標 Post
 → 一次取得完整 carousel_media / children
 → 依原始順序下載全部圖片與影片
-→ 不翻頁
+→ 無法確認完整性時 FAILED / RETRY，不假 SUCCESS
 ```
 
 ### 圖文 / Carousel 貼文
@@ -223,13 +232,18 @@ Instagram 目前採多引擎與分流策略：
 - 依 API / JSON 原始順序輸出，不以畫面位置或品質分數重新排序
 - 使用同一個 Playwright Browser Context 下載，沿用登入 cookies 與 trust state
 - 影片保留完整 MP4、Range rebuild 與 fragment 組合驗證
-- 預期數、實際寫入數與暫存檔案數不一致時回 `RETRY`，不會假成功
+- 預期數、實際寫入數與暫存檔案數不一致時拒絕成功並回 `FAILED` / `RETRY`，不會假成功
 
 這可避免「翻頁按錯、漏頁、重複上一張影片、推薦貼文污染」等 UI 自動化問題。
 
 ### Reel / 影片
 
-對 `/reel/` 或 `/reels/`，仍優先使用 yt-dlp，失敗後再由 Playwright fallback。
+對 `/reel/` 或 `/reels/`：
+
+- 可使用 Instaloader、yt-dlp 與 Playwright fallback，但最終輸出必須是真正可播放的完整 MP4
+- 若只取得封面圖、縮圖、破碎 fragment 或過小檔案，直接拒絕，不得判定 `SUCCESS`
+- Playwright 可利用 browser network cache、Range rebuild 與 fragment assembly 重建完整影片
+- Reel 任務只允許輸出影片；圖片封面不會被搬成正式結果
 
 ### IG Parser 專用 Chrome Profile 與受限貼文
 
@@ -312,6 +326,9 @@ IG persistent profile structured media count=
 carousel flipping skipped
 IG Playwright 已成功寫入
 TEMP 有效檔案=
+IG headless 媒體未通過品質/完整性 gate
+IG structured shortcode ownership
+IG 第 N 個影片完整 MP4 重建完成
 ```
 
 受限貼文流程中不應再出現：
@@ -342,6 +359,19 @@ Instagram 可能回傳 WEBP bytes，但 URL 或暫存檔名看起來像 `.jpg`�
 - 不再把 WEBP bytes 假裝命名成 `.jpg`
 - `move_files()` 搬移前會再次檢查真實檔案格式
 - 多檔搬移會使用自然排序，避免 `ig_10` 排在 `ig_2` 前面
+
+### Instagram 媒體硬驗證與受限貼文 fallback
+
+正式輸出前會執行下列 hard gate：
+
+- 每個 structured media item 的 `_target_shortcode` 必須與任務 shortcode 完全一致
+- 圖片長邊低於 720px、短邊過小、比例異常、與可視畫面比例明顯不符時拒絕
+- 來源宣告為高解析度、但實際下載尺寸明顯縮水時拒絕
+- 影片必須是真實 MP4，檔案需包含可播放所需的初始化與媒體資料
+- Carousel 的 expected / written / temp_files 必須一致
+- 任一元素失敗時不會用其他貼文、推薦內容或低品質候選補數量
+
+若一般 headless 頁面能看見貼文，卻只提供 640px 裁切縮圖，下載器不會直接採用匿名 yt-dlp 的「特定受眾」訊息判定 `BLOCKED`。它會先切換到已登入 IG Parser Profile 重新取得目標 shortcode 的完整結構化媒體；只有 Profile 本身也需要登入、年齡或受眾確認且無法完成時，才回 `BLOCKED`。
 
 ### Instagram 狀態分類
 
@@ -394,6 +424,30 @@ downloader_GUI/data/playwright_fb_profile
 
 `cookies.txt` 只保留為 legacy / emergency fallback，不再是主要推薦流程。
 
+### Facebook Reel / 分享影片
+
+支援：
+
+- `facebook.com/reel/...`
+- `facebook.com/share/r/...`
+- `facebook.com/share/v/...`
+- `facebook.com/watch/...`
+- `facebook.com/.../videos/...`
+- `fb.watch/...`
+
+Facebook Reel 頁面可能使用 `blob:` 作為可見 `<video>` 的播放來源，因此下載器會保留已驗證可用的 browser network / metadata / HTML 候選流程，不會因可見 `<video>` 沒有直接 MP4 URL 就錯誤回 `RETRY`。
+
+命名規則：
+
+```text
+Reel caption / title
+→ canonical Reel ID
+→ Facebook_Reel
+```
+
+下載完成後會優先使用 Reel 內文標題命名，不再直接以 `/share/v/<短碼>/` 作為檔名。若沒有可信 caption，才退回 `Facebook_Reel_<實際 Reel ID>.mp4`。
+
+
 ### 多圖貼文保護
 
 Facebook 多圖貼文會使用 Playwright viewer-intercept 收集候選媒體，並比對原生 Grid / Photo link 數量。
@@ -421,6 +475,8 @@ URL | Post Account | Post Title | 狀態 | Retry
 - `Post Account`：下載前先預取發文帳號，例如 `successful101_official`
 - `Post Title`：下載前先預取 caption；若一般 headless 只能取得 Instagram 通用頁面文字，會在已登入結構化擷取後更新為真正 caption、帳號或 shortcode
 - `Post Account`、`Post Title`、`狀態`、`Retry` 皆置中顯示
+- GUI 會顯示 `IG：已登入 / 未登入 / Profile 使用中` 與 `FB：已登入 / 未登入 / Profile 使用中`
+- 可按「更新登入狀態」重新檢查；Facebook 會優先從 Chrome cookie database 判斷登入狀態
 - 視窗放大時，URL / Account / Title 會自動加寬
 - 視窗縮小時會保留最小欄寬，超出部分交由水平捲軸，不會黏在一起
 - 帳號或標題預取失敗時，不會阻止正常下載，下載階段仍會再次補抓
@@ -584,6 +640,9 @@ IG persistent profile structured media count=
 carousel flipping skipped
 IG Playwright 已成功寫入
 TEMP 有效檔案=
+IG headless 媒體未通過品質/完整性 gate
+IG structured shortcode ownership
+IG 第 N 個影片完整 MP4 重建完成
 ```
 
 若看到：
@@ -605,6 +664,9 @@ FB merged candidate media count=
 FB filtered media count=
 FB unique output media count=
 FB move_files blocked
+FB Reel video candidate count=
+FB Reel 主影片已下載
+FB 單檔完成:
 ```
 
 若 Facebook Reel 被抓到大量 mp4，可能是推薦影片或預載片段污染，需以 Reel 主影片篩選邏輯處理，不應直接搬成 `Facebook_Post` 多檔資料夾。
@@ -623,7 +685,7 @@ rmdir /s /q post
 
 ### 2. 顯示 BLOCKED 是不是程式錯？
 
-不一定。`BLOCKED` 通常代表登入、checkpoint、challenge、私人帳號、特定受眾或權限限制。
+`BLOCKED` 通常代表登入、checkpoint、challenge、私人帳號、年齡／特定受眾或權限限制。新版在 headless 只取得低解析度縮圖時，會先改用已登入 IG Parser Profile 重抓，不會直接把匿名 yt-dlp 的限制訊息當成最終 `BLOCKED`。
 
 ### 3. 顯示 MISSING 是什麼？
 
@@ -668,6 +730,37 @@ python main.py
 ---
 
 ## 版本紀錄
+
+### v11.93 Persistent Profile After Quality-Reject Fix
+
+- 修正瀏覽器可查看貼文，但一般 headless 只取得 640px 裁切縮圖後被誤判 `BLOCKED`
+- headless 媒體若全部因解析度、裁切、比例或完整性 hard gate 被拒絕，改用已登入 IG Parser Profile 重抓
+- 先嘗試隱藏的 persistent context；只有需要登入／年齡／受眾確認時才開啟可見 Profile
+- 保留低解析度縮圖拒絕、完整 Carousel、影片 MP4 驗證與跨貼文防污染
+- Profile 本身也無法確認時才回 `BLOCKED`
+
+### v11.92 Facebook Reel Title-Only Fix
+
+- 恢復既有可正常下載 Facebook Reel 的 browser network / metadata 候選流程
+- 修正 visible `<video>` 使用 `blob:` 時錯誤回 `RETRY`
+- Reel 輸出檔名優先使用 caption / title
+- 抓不到 caption 時才使用 canonical Reel ID
+- 不再直接使用 `/share/v/<短碼>/` 作為正式檔名
+- 保留 Facebook 一般貼文、多圖、相簿與完整性檢查
+
+### v11.90 Instagram Structured Shortcode Ownership Fix
+
+- 修正 authenticated structured extraction 已取得完整媒體，但 child item 缺少 `_target_shortcode` 而被最終 hard gate 全部拒絕
+- structured media 只在精確匹配目標 shortcode 後寫入 ownership 標記
+- 每個輸出元素下載前再次驗證 ownership
+- 保留防抓其他貼文、完整數量與原始順序檢查
+
+### v11.89 GUI Post Account / Post Title Restore
+
+- 恢復 `Post Account` 與 `Post Title` 兩個欄位
+- 兩欄標題及內容皆置中
+- 新增 IG / FB Parser 登入狀態顯示與手動更新按鈕
+- Facebook 登入狀態可讀取 Chrome cookie database，避免 Profile 使用中時誤判未登入
 
 ### v11.78.2 Authenticated Structured Extraction + Git-OK Naming Rule
 
