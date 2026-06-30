@@ -1,3 +1,5 @@
+# v12.01 Profile Parent Checkpoint Fix
+# v12.00 Profile Batch Fast Sequential Worker
 import random
 import threading
 import time
@@ -109,14 +111,26 @@ def _handle_instagram_profile_expand(url: str):
     if status != "SUCCESS":
         return status, message, False
 
-    result = queue_manager.add_tasks(post_urls)
+    if hasattr(queue_manager, "insert_tasks_after"):
+        result = queue_manager.insert_tasks_after(
+            url,
+            post_urls,
+            batch_parent=url,
+        )
+        insert_note = f"插入目前任務後方 {int(result.get('inserted', 0) or 0)} 筆，"
+    else:
+        # Backward-compatible fallback for older queue_manager.py.
+        result = queue_manager.add_tasks(post_urls)
+        insert_note = ""
+
     added = int(result.get("added", 0) or 0)
     skipped_processed = int(result.get("skipped_processed", result.get("skipped", 0)) or 0)
     skipped_duplicate = int(result.get("skipped_duplicate", result.get("duplicated", 0)) or 0)
 
     summary = (
         f"IG 主頁已展開：掃到 {len(post_urls)} 筆，"
-        f"新增 {added} 筆，略過已下載 {skipped_processed} 筆，略過重複 {skipped_duplicate} 筆"
+        f"{insert_note}新增下載 {added} 筆，"
+        f"略過已下載 {skipped_processed} 筆，略過重複 {skipped_duplicate} 筆"
     )
     if message:
         summary = f"{summary}；{message}"
@@ -148,6 +162,8 @@ def _worker_loop():
             continue
 
         url = task["url"]
+        profile_batch_parent = (task.get("profile_batch_parent") or "").strip()
+        is_profile_batch_child = bool(profile_batch_parent)
         logger.info(f"開始: {url}")
 
         queue_manager.update_runtime(
@@ -244,8 +260,15 @@ def _worker_loop():
                 )
                 _interruptible_sleep(3)
 
-        # 統一由 queue_manager 處理 checkpoint / failed / unavailable / retry 檔案同步
-        queue_manager.set_task_result(url, status, error)
+        # 統一由 queue_manager 處理 checkpoint / failed / unavailable / retry 檔案同步。
+        # Instagram 主頁只是批次展開器，不是已下載媒體；即使本次展開成功，
+        # 也不可寫入永久 checkpoint，否則中途停止後重開會被誤判為全部完成。
+        queue_manager.set_task_result(
+            url,
+            status,
+            error,
+            checkpoint_success=not profile_expanded,
+        )
 
         # 額外保留歷史事件流水帳（只要不是成功就寫一筆）
         if status != "SUCCESS":
@@ -265,8 +288,17 @@ def _worker_loop():
 
         if status == "SUCCESS":
             if profile_expanded:
-                logger.info("IG 主頁展開完成，略過一般下載冷卻，繼續處理展開後的貼文任務")
-                _cooldown_sleep(2, url)
+                logger.info("IG 主頁展開完成，略過一般下載冷卻，立即處理第一筆主頁貼文")
+                _cooldown_sleep(1, url)
+            elif is_profile_batch_child:
+                # Profile children are already exact-owner, sequentially expanded
+                # tasks. Keep a small anti-burst gap, but do not apply the normal
+                # 20-40 second manual-task cooldown to every child.
+                sleep_sec = 2
+                logger.info(
+                    f"IG 主頁批次子任務完成，短冷卻 {sleep_sec}s 後繼續下一篇"
+                )
+                _cooldown_sleep(sleep_sec, url)
             else:
                 sleep_sec = int(random.uniform(20, 40))
                 logger.info(f"冷卻 {sleep_sec}s...")

@@ -1,6 +1,6 @@
 # 🚀 Media Batch Downloader
 
-> Current documentation: v11.93 Persistent Profile After Quality-Reject Fix
+> Current documentation: v12.01 Instagram Profile Batch Resume & Checkpoint Fix
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。它支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、失敗清單整理，以及 Instagram / Facebook 的多引擎下載 fallback。
 
@@ -33,6 +33,9 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
 - 支援自動簡體轉繁體
 - 支援安全檔名與資料夾命名
+- 支援 Instagram 主頁批次展開：背景蒐集該帳號全部 Post / Reel URL，依主頁順序插入目前任務後方逐一下載
+- Instagram 主頁父任務不寫入永久 checkpoint；中途停止後重開會重新掃描主頁，只補下載尚未完成的子貼文
+- 主頁展開任務依 shortcode 去重，避免 `?igsh=`、`/p/`、`/reel/` 不同格式造成重複下載
 - 支援已下載 checkpoint，避免重複下載
 - 安全延遲與重試機制，降低帳號風控風險
 - 支援 FAILED / BLOCKED / MISSING / RETRY / UNAVAILABLE 狀態管理
@@ -197,6 +200,54 @@ downloader_GUI/data/playwright_fb_profile
 - 請勿將 `cookies.txt`、`accounts.json` 或任何登入 Profile 目錄提交到 Git
 
 ---
+
+## Instagram 主頁批次下載與斷點續跑
+
+支援直接貼上 Instagram 帳號主頁：
+
+```text
+https://www.instagram.com/<username>/
+https://www.instagram.com/<username>/reels/
+```
+
+正式流程：
+
+```text
+主頁背景掃描
+→ 攔截 GraphQL / private API / embedded JSON
+→ 只接受 owner.username 等於目標帳號的 shortcode
+→ 收齊 Header 宣告的 Post / Reel 數量
+→ 將所有 child URL 插入主頁任務後方
+→ Worker 依序下載每一篇 Post / Reel
+```
+
+安全規則：
+
+- 主頁掃描優先使用已登入 IG Parser Profile 的 headless persistent context
+- 只有登入、checkpoint、challenge、年齡或受眾確認時才開可見瀏覽器
+- 不從整頁 HTML、performance resource 或推薦貼文補 URL
+- 每個結構化節點都必須驗證 owner 等於目標帳號
+- 主頁 Header 宣告數量與蒐集數不一致時回 `RETRY`，不假 `SUCCESS`
+- 展開後的 child 任務依 shortcode 去重
+- child 任務插入目前主頁任務正後方，不會排到整個佇列尾端
+- 主頁批次子任務使用短冷卻；一般手動任務仍保留原本安全冷卻
+- 主頁父任務只是展開器，不會寫入 `processed_links.log`
+
+### 中途停止後重新開啟
+
+Instagram 主頁下載到一半時，即使按「停止」並關閉程式：
+
+```text
+已完成的 Post / Reel
+→ 保留在 processed_links.log
+→ 下次重新掃描時自動略過
+
+尚未完成的 Post / Reel
+→ 重新插入佇列
+→ 繼續下載
+```
+
+主頁 URL 本身不會永久標記為全部完成。新版啟動時也會自動清除舊版本錯誤寫入 checkpoint 的 Instagram 主頁 URL，但不會刪除任何已完成的單篇 Post / Reel 紀錄。
 
 ## Instagram 下載機制
 
@@ -562,6 +613,25 @@ pre-processing/output/undownload_link.txt
 
 ---
 
+## Instagram 主頁 checkpoint 規則
+
+Instagram 主頁 URL 是批次展開器，不是實際媒體下載任務，因此不會寫入：
+
+```text
+data/processed_links.log
+```
+
+只有真正完成輸出的單篇 `/p/<shortcode>/` 或 `/reel/<shortcode>/` 會寫入 checkpoint。
+
+這可避免：
+
+- 主頁只下載一部分便中途停止
+- 關閉程式後再次啟動
+- 主頁被錯誤標示為 `SUCCESS`
+- 剩餘子貼文永遠不再加入佇列
+
+新版會在 `load_checkpoint()` 時自動移除舊版本留下的主頁 checkpoint，同時保留所有已完成 child URL。
+
 ## 已下載跳過 / 斷點續跑
 
 程式使用：
@@ -730,6 +800,20 @@ python main.py
 ---
 
 ## 版本紀錄
+
+### v12.01 Instagram Profile Batch Resume & Checkpoint Fix
+
+- Instagram 主頁改為背景 GraphQL / API / embedded JSON URL harvest
+- 只接受 `owner.username == 目標帳號` 的 Post / Reel shortcode
+- 收齊主頁 Header 宣告數量後才展開任務
+- 主頁 child tasks 插入目前父任務正後方，立即依序下載
+- Instagram 任務依 shortcode 去重，避免 `?igsh=`、`/p/`、`/reel/` 變體重複
+- 主頁批次子任務使用短冷卻，一般任務安全冷卻保持不變
+- Instagram 主頁父任務不再寫入永久 checkpoint
+- 啟動時自動移除舊版錯誤保存的主頁 checkpoint
+- 中途停止後重開會重新掃描主頁，只補下載尚未完成的 child tasks
+- 保留已完成 Post / Reel checkpoint、Facebook、Retry、Blocked、Missing 與 GUI 正常功能
+
 
 ### v11.93 Persistent Profile After Quality-Reject Fix
 

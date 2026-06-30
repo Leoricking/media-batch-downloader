@@ -1,3 +1,5 @@
+# v12.01 Profile Parent Checkpoint Fix
+# v12.00 Profile Batch Priority Queue
 import os
 import re
 import threading
@@ -86,6 +88,122 @@ def _extract_urls_from_text(text: str) -> list[str]:
     return urls
 
 
+
+def _task_identity_key(url: str) -> str:
+    """Return a conservative identity key used only for queue dedupe.
+
+    Instagram share URLs can differ by ?igsh=... while pointing to the same
+    shortcode.  Profile expansion must not enqueue the same post twice merely
+    because one copy is /p/<code>/ and another is /reel/<code>/ or has query
+    parameters.  Non-Instagram URLs keep their exact value.
+    """
+    clean = (url or "").strip()
+    if not clean:
+        return ""
+
+    low = clean.lower()
+    if "instagram.com" in low:
+        m = re.search(r"/(?:p|reel|reels)/([^/?#&]+)", clean, flags=re.I)
+        if m:
+            return f"instagram:{m.group(1)}"
+
+    return clean
+
+
+def insert_tasks_after(anchor_url: str, urls: list[str], batch_parent: str = "") -> dict:
+    """Insert child tasks immediately after *anchor_url*.
+
+    This is used by Instagram profile expansion only. Existing add_tasks()
+    behavior remains unchanged for normal GUI imports.
+
+    Profile child tasks carry batch_parent metadata so worker.py can process
+    them consecutively with a short cooldown without changing normal task
+    throttling.
+    """
+    added = 0
+    skipped = 0
+    duplicated = 0
+
+    clean_anchor = (anchor_url or "").strip()
+    clean_parent = (batch_parent or clean_anchor).strip()
+
+    with _LOCK:
+        existing_keys = {
+            _task_identity_key(t.get("url", ""))
+            for t in _TASKS
+            if t.get("url")
+        }
+        processed_keys = {_task_identity_key(u) for u in _PROCESSED if u}
+
+        anchor_index = -1
+        for i, task in enumerate(_TASKS):
+            if task.get("url") == clean_anchor:
+                anchor_index = i
+                break
+
+        insert_at = anchor_index + 1 if anchor_index >= 0 else len(_TASKS)
+        new_tasks = []
+
+        for raw in urls or []:
+            url = (raw or "").strip()
+            if not url:
+                continue
+
+            key = _task_identity_key(url)
+            if not key:
+                continue
+
+            if key in existing_keys:
+                duplicated += 1
+                continue
+
+            now = time.time()
+            if key in processed_keys:
+                skipped += 1
+                task = {
+                    "url": url,
+                    "status": "SUCCESS",
+                    "retry": 0,
+                    "title": "",
+                    "account": "",
+                    "error": "已在 processed_links.log 中",
+                    "profile_batch_parent": clean_parent,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            else:
+                added += 1
+                task = {
+                    "url": url,
+                    "status": "PENDING",
+                    "retry": 0,
+                    "title": "",
+                    "account": "",
+                    "error": "",
+                    "profile_batch_parent": clean_parent,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+
+            new_tasks.append(task)
+            existing_keys.add(key)
+
+        if new_tasks:
+            _TASKS[insert_at:insert_at] = new_tasks
+
+        _recompute_runtime_counts_locked()
+
+    return {
+        "added": added,
+        "skipped": skipped,
+        "duplicated": duplicated,
+        "skipped_processed": skipped,
+        "skipped_duplicate": duplicated,
+        "inserted": len(new_tasks),
+        "total": len(_TASKS),
+    }
+
+
 def _find_task(url: str) -> Optional[dict]:
     for task in _TASKS:
         if task.get("url") == url:
@@ -137,16 +255,102 @@ def _recompute_runtime_counts_locked():
     _RUNTIME["done"] = done
 
 
+
+def _is_instagram_profile_queue_url(url: str) -> bool:
+    """Return True only for an Instagram account/profile URL.
+
+    Profile URLs are queue expanders, not downloaded media. They must never be
+    treated as permanently completed checkpoint entries because their child
+    posts may be only partially downloaded when the app is stopped.
+    """
+    clean = (url or "").strip()
+    if not clean:
+        return False
+
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(clean)
+    except Exception:
+        return False
+
+    host = (parsed.netloc or "").lower()
+    if host not in {"instagram.com", "www.instagram.com"}:
+        return False
+
+    parts = [p for p in (parsed.path or "").split("/") if p]
+    if not parts:
+        return False
+
+    reserved = {
+        "p", "reel", "reels", "tv", "stories", "explore", "accounts",
+        "direct", "graphql", "api", "challenge", "oauth", "settings",
+    }
+
+    if parts[0].lower() in reserved:
+        return False
+
+    if len(parts) == 1:
+        return bool(re.fullmatch(r"[A-Za-z0-9._]{1,30}", parts[0]))
+
+    if len(parts) == 2 and parts[1].lower() in {"reels", "tagged"}:
+        return bool(re.fullmatch(r"[A-Za-z0-9._]{1,30}", parts[0]))
+
+    return False
+
+
+def _rewrite_checkpoint_locked():
+    """Rewrite checkpoint from the in-memory processed set atomically enough for GUI use."""
+    _ensure_dirs()
+    tmp_path = CHECKPOINT_FILE + ".tmp"
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for item in sorted(_PROCESSED):
+            if item:
+                f.write(item + "\n")
+
+    try:
+        os.replace(tmp_path, CHECKPOINT_FILE)
+    except Exception:
+        try:
+            if os.path.exists(CHECKPOINT_FILE):
+                os.remove(CHECKPOINT_FILE)
+        except Exception:
+            pass
+        os.rename(tmp_path, CHECKPOINT_FILE)
+
+
 def load_checkpoint():
     _ensure_dirs()
     with _LOCK:
         _PROCESSED.clear()
+        removed_profile_entries = 0
+
         if os.path.exists(CHECKPOINT_FILE):
             try:
                 with open(CHECKPOINT_FILE, "r", encoding="utf-8", errors="ignore") as f:
-                    _PROCESSED.update(x.strip() for x in f if x.strip())
+                    for raw in f:
+                        url = raw.strip()
+                        if not url:
+                            continue
+
+                        # v12.01 migration:
+                        # Older versions permanently checkpointed Instagram
+                        # profile expanders as SUCCESS. Remove those stale parent
+                        # entries while preserving every completed post/reel URL.
+                        if _is_instagram_profile_queue_url(url):
+                            removed_profile_entries += 1
+                            continue
+
+                        _PROCESSED.add(url)
             except Exception:
                 pass
+
+        if removed_profile_entries:
+            try:
+                _rewrite_checkpoint_locked()
+            except Exception:
+                pass
+
         _recompute_runtime_counts_locked()
 
 
@@ -171,6 +375,7 @@ def clear_checkpoint():
         _recompute_runtime_counts_locked()
 
 
+# Normal GUI import path. Profile expansion uses insert_tasks_after().
 def add_tasks(urls: list[str]) -> dict:
     added = 0
     skipped = 0
@@ -236,7 +441,7 @@ def get_task() -> Optional[dict]:
     return None
 
 
-def set_task_result(url: str, status: str, error: str = ""):
+def set_task_result(url: str, status: str, error: str = "", checkpoint_success: bool = True):
     status = _normalize_status(status)
     error = error or ""
     _ensure_dirs()
@@ -262,8 +467,19 @@ def set_task_result(url: str, status: str, error: str = ""):
             task["updated_at"] = time.time()
 
         if status == "SUCCESS":
-            _PROCESSED.add(url)
-            _append_unique_line(CHECKPOINT_FILE, url)
+            if checkpoint_success and not _is_instagram_profile_queue_url(url):
+                _PROCESSED.add(url)
+                _append_unique_line(CHECKPOINT_FILE, url)
+            else:
+                # Profile parent is only a session-level expansion success.
+                # It must remain re-runnable after restart until all child media
+                # tasks have independently entered the checkpoint.
+                if url in _PROCESSED:
+                    _PROCESSED.discard(url)
+                    try:
+                        _rewrite_checkpoint_locked()
+                    except Exception:
+                        pass
         elif status == "RETRY":
             _append_unique_line(RETRY_NEEDED_FILE, url)
             _append_unique_line(FAILED_LOG_FILE, f"[RETRY]\t{url}\t{error}")

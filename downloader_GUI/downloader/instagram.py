@@ -54,6 +54,11 @@ def _to_traditional(text: str) -> str:
 logger = get_logger("instagram")
 
 # v11.90 Structured Shortcode Ownership Fix
+# v11.98 Profile Backend URL Harvest + Sequential Queue Expansion
+# v11.97 Profile Headless-First Persistent Scan
+# v11.96 Profile Verified Click Scan Fix
+# v11.95 Profile Grid Anchor + Declared Count Fix
+# v11.94 Profile Grid Exact-Scope Fix
 # v11.93 Persistent Profile After Quality-Reject Fix
 # v11.88 Final Hard-Gated Exact Media Pipeline
 # v11.87 Verified Carousel Walk Final
@@ -3397,56 +3402,330 @@ def _dedupe_profile_child_urls(urls: list[str]) -> list[str]:
     return out
 
 
+
+def _profile_media_kind_from_node(node: dict) -> str:
+    """Resolve whether a structured profile media node should use /p/ or /reel/."""
+    product_type = str(
+        node.get("product_type")
+        or node.get("media_product_type")
+        or node.get("__typename")
+        or ""
+    ).lower()
+
+    if any(token in product_type for token in ["clip", "reel"]):
+        return "reel"
+
+    # Instagram private API: media_type=2 is video, but not every video post is a
+    # Reel. Only classify it as Reel when product_type explicitly says clips.
+    return "p"
+
+
+def _profile_node_owner(node: dict) -> str:
+    """Read the owner username from common GraphQL/private-API node layouts."""
+    candidates = []
+
+    for key in ["owner", "user", "creator", "author"]:
+        value = node.get(key)
+        if isinstance(value, dict):
+            candidates.extend([
+                value.get("username"),
+                value.get("user_name"),
+                value.get("handle"),
+            ])
+
+    candidates.extend([
+        node.get("username"),
+        node.get("owner_username"),
+        node.get("user_name"),
+    ])
+
+    for value in candidates:
+        clean = _clean_ig_account(value)
+        if clean:
+            return clean
+
+    return ""
+
+
+def _extract_profile_urls_from_structured_payload(
+    payload,
+    username: str,
+) -> list[str]:
+    """Extract exact-owner post/reel URLs from IG GraphQL/API JSON.
+
+    Recommendation and adjacent-account nodes are ignored because every accepted
+    media node must carry owner/user.username equal to the requested profile.
+    """
+    target = _clean_ig_account(username).lower()
+    if not target:
+        return []
+
+    out: list[str] = []
+    seen = set()
+    stack = [payload]
+
+    while stack:
+        value = stack.pop()
+
+        if isinstance(value, list):
+            stack.extend(reversed(value))
+            continue
+
+        if not isinstance(value, dict):
+            continue
+
+        shortcode = str(
+            value.get("shortcode")
+            or value.get("code")
+            or value.get("media_code")
+            or ""
+        ).strip()
+
+        if shortcode and re.fullmatch(r"[A-Za-z0-9_-]{5,40}", shortcode):
+            owner = _profile_node_owner(value).lower()
+            if owner == target:
+                kind = _profile_media_kind_from_node(value)
+                normalized = (
+                    f"https://www.instagram.com/reel/{shortcode}/"
+                    if kind == "reel"
+                    else f"https://www.instagram.com/p/{shortcode}/"
+                )
+                key = shortcode
+                if key not in seen:
+                    seen.add(key)
+                    out.append(normalized)
+
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                stack.append(child)
+
+    return _dedupe_profile_child_urls(out)
+
+
+def _attach_profile_structured_response_harvester(
+    page,
+    username: str,
+    harvested_urls: list[str],
+    harvested_seen: set[str],
+):
+    """Attach a background response listener for profile GraphQL/API media URLs."""
+    target = _clean_ig_account(username).lower()
+
+    def on_response(response):
+        try:
+            response_url = str(response.url or "")
+            low = response_url.lower()
+
+            if not any(marker in low for marker in [
+                "graphql/query",
+                "/api/v1/feed/user/",
+                "/api/v1/users/",
+                "/api/v1/clips/",
+                "web_profile_info",
+            ]):
+                return
+
+            content_type = ""
+            try:
+                content_type = (
+                    response.headers.get("content-type", "")
+                    or response.headers.get("Content-Type", "")
+                    or ""
+                ).lower()
+            except Exception:
+                content_type = ""
+
+            if content_type and "json" not in content_type:
+                return
+
+            payload = response.json()
+            urls = _extract_profile_urls_from_structured_payload(payload, target)
+
+            added = 0
+            for url in urls:
+                shortcode = _extract_shortcode(url) or ""
+                if not shortcode or shortcode in harvested_seen:
+                    continue
+                harvested_seen.add(shortcode)
+                harvested_urls.append(url)
+                added += 1
+
+            if added:
+                logger.info(
+                    f"IG 主頁背景 structured URL harvest: "
+                    f"@{username}, new={added}, total={len(harvested_urls)}"
+                )
+        except Exception:
+            return
+
+    page.on("response", on_response)
+    return on_response
+
+
+def _extract_profile_urls_from_embedded_json(page, username: str) -> list[str]:
+    """Parse JSON script payloads already embedded in the profile document.
+
+    This is owner-gated and does not regex the entire HTML for arbitrary links.
+    """
+    try:
+        payloads = page.evaluate(
+            """
+            () => {
+              const out = [];
+              const nodes = Array.from(document.querySelectorAll(
+                'script[type="application/json"], script[data-sjs], script[id*="__data"]'
+              ));
+              for (const node of nodes) {
+                const text = (node.textContent || '').trim();
+                if (text && text.length >= 20 && text.length <= 12000000) {
+                  out.push(text);
+                }
+              }
+              return out.slice(0, 80);
+            }
+            """
+        ) or []
+    except Exception:
+        payloads = []
+
+    out: list[str] = []
+    for raw in payloads:
+        try:
+            payload = __import__("json").loads(raw)
+        except Exception:
+            continue
+        out.extend(_extract_profile_urls_from_structured_payload(payload, username))
+
+    return _dedupe_profile_child_urls(out)
+
 def _extract_profile_post_urls_from_page(page) -> list[str]:
-    js = r'''
+    """Collect only profile-grid /p/ and /reel/ anchors under <main>.
+
+    v11.95 removes the over-strict nested-thumbnail visibility requirement from
+    v11.94. Instagram often keeps the anchor valid while the lazy thumbnail has
+    zero dimensions. Broad document HTML, performance resources and click-probe
+    discovery remain forbidden because they can include recommendation posts.
+    """
+    js = r"""
     () => {
-      const values = [];
-      function push(v) {
-        if (!v) return;
-        try { values.push(String(v)); } catch(e) {}
-      }
-      for (const a of Array.from(document.querySelectorAll('a[href]'))) {
-        push(a.href || '');
-        push(a.getAttribute('href') || '');
-      }
-      const attrNames = ['href', 'data-href', 'to', 'src', 'data-src', 'aria-label'];
-      for (const el of Array.from(document.querySelectorAll('main *'))) {
-        for (const name of attrNames) {
-          try { push(el.getAttribute(name) || ''); } catch(e) {}
+      const main = document.querySelector('main');
+      if (!main) return [];
+
+      const out = [];
+      const seen = new Set();
+
+      function excluded(a) {
+        if (a.closest(
+          'div[role="dialog"], nav, footer, aside, ' +
+          '[role="navigation"], [aria-modal="true"]'
+        )) return true;
+
+        let node = a;
+        for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+          const text = (
+            (node.getAttribute && node.getAttribute('aria-label') || '') + ' ' +
+            (node.innerText || '') + ' ' +
+            (node.textContent || '')
+          ).toLowerCase();
+
+          if (
+            text.includes('suggested for you') ||
+            text.includes('recommended') ||
+            text.includes('為你推薦') ||
+            text.includes('推薦帳號') ||
+            text.includes('探索更多') ||
+            text.includes('discover people')
+          ) return true;
         }
+        return false;
       }
-      try { push(document.documentElement.innerHTML || ''); } catch(e) {}
-      try { for (const e of performance.getEntriesByType('resource')) push(e.name || ''); } catch(e) {}
-      return values;
+
+      const anchors = Array.from(main.querySelectorAll(
+        'a[href^="/p/"], a[href^="/reel/"], a[href^="/reels/"], ' +
+        'a[href*="instagram.com/p/"], a[href*="instagram.com/reel/"]'
+      ));
+
+      for (const a of anchors) {
+        if (excluded(a)) continue;
+
+        const href = a.href || a.getAttribute('href') || '';
+        const m = String(href).match(
+          /(?:https?:\/\/(?:www\.)?instagram\.com)?\/(p|reel|reels)\/([^/?#&"'<>\\\s]+)\/?/i
+        );
+        if (!m) continue;
+
+        const kind = String(m[1] || '').toLowerCase() === 'p' ? 'p' : 'reel';
+        const shortcode = String(m[2] || '').trim();
+        if (!shortcode) continue;
+
+        const hasTileContent = !!a.querySelector('img, video, canvas, svg, div, span');
+        const r = a.getBoundingClientRect();
+        const gridSized = r.width >= 70 && r.height >= 70;
+        if (!hasTileContent && !gridSized) continue;
+
+        const key = kind + ':' + shortcode;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        out.push({
+          url: 'https://www.instagram.com/' + kind + '/' + shortcode + '/',
+          top: Number.isFinite(r.top) ? r.top : 0,
+          left: Number.isFinite(r.left) ? r.left : 0
+        });
+      }
+
+      out.sort((a, b) => {
+        if (Math.abs(a.top - b.top) > 12) return a.top - b.top;
+        return a.left - b.left;
+      });
+
+      return out.map(x => x.url);
     }
-    '''
+    """
     try:
         raw_values = page.evaluate(js) or []
     except Exception:
         raw_values = []
-    candidates = []
-    patterns = [
-        r"https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/[^/?#&\"'<>\\\s]+/?",
-        r"/(?:p|reel|reels)/[^/?#&\"'<>\\\s]+/?",
-        r"\\u002f(?:p|reel|reels)\\u002f[^\\/?#&\"'<>\\\s]+\\u002f",
-        r"\\/(?:p|reel|reels)\\/[^\\/?#&\"'<>\\\s]+\\/",
-    ]
-    for value in raw_values:
-        text = html.unescape(unquote(str(value or "")))
-        if not text:
+
+    return _dedupe_profile_child_urls(raw_values)
+
+
+def _get_profile_declared_post_count(page, username: str = "") -> int:
+    """Read the profile header's declared post count when available."""
+    try:
+        raw = page.evaluate(
+            """
+            () => {
+              const main = document.querySelector('main') || document.body;
+              const header = main.querySelector('header') || main;
+              return (header.innerText || header.textContent || '').slice(0, 5000);
+            }
+            """
+        ) or ""
+    except Exception:
+        raw = ""
+
+    value_text = html.unescape(str(raw or ""))
+    for pat in [
+        r"([\d,.\s]+)\s*(?:posts?|貼文)",
+        r"(?:posts?|貼文)\s*([\d,.\s]+)",
+    ]:
+        m = re.search(pat, value_text, flags=re.I)
+        if not m:
             continue
-        text = text.replace(r'\u002f', '/').replace(r'\/', '/')
-        for pat in patterns:
-            for m in re.finditer(pat, text, flags=re.I):
-                candidates.append(m.group(0))
-    return _dedupe_profile_child_urls(candidates)
+        digits = re.sub(r"[^\d]", "", m.group(1) or "")
+        if digits.isdigit():
+            value = int(digits)
+            if 0 <= value <= 1000000:
+                return value
+    return 0
 
 
 def _get_profile_click_tile_records(page, limit: int = 18) -> list[dict]:
     js = r'''
     (limit) => {
       const root = document.querySelector('main') || document;
-      const nodes = Array.from(root.querySelectorAll('a, div[role="button"], button, img, video'));
+      const nodes = Array.from(root.querySelectorAll('a, div[role="button"], img, video'));
       const out = [];
       const seen = new Set();
       const W = window.innerWidth || 1600;
@@ -3472,6 +3751,8 @@ def _get_profile_click_tile_records(page, limit: int = 18) -> list[dict]:
         const w = box.width || 0;
         const h = box.height || 0;
         if (w < 120 || h < 120) continue;
+        const ratio = w / Math.max(h, 1);
+        if (ratio < 0.65 || ratio > 1.45) continue;
         if (box.bottom < 180 || box.top > H + 300 || box.right < 0 || box.left > W) continue;
         const clicker = n.closest && (n.closest('a[href], div[role="button"], button') || n);
         if (!clicker) continue;
@@ -3535,7 +3816,132 @@ def _extract_profile_post_urls_by_click_probe(page, entry_url: str, already_seen
     return _dedupe_profile_child_urls(found)
 
 
-def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tuple[str, list[str], str]:
+
+def _extract_profile_post_urls_by_verified_click_probe(
+    page,
+    entry_url: str,
+    username: str,
+    already_seen: set[str] | None = None,
+    max_clicks: int = 12,
+) -> list[str]:
+    """Discover profile tiles by clicking them and verifying the real post owner.
+
+    Instagram currently renders some profile grids without usable /p/ or /reel/
+    anchors.  In that layout the only reliable route is opening the visible tile.
+
+    Safety rules:
+    - only click grid-like media records returned from <main>;
+    - accept only a normalized post/reel URL;
+    - read the opened post account and require exact username equality;
+    - never harvest links from page HTML, performance resources, or recommendations;
+    - return to the same profile entry after every probe.
+    """
+    already_seen = already_seen or set()
+    target_user = _clean_ig_account(username).lower()
+    found: list[str] = []
+    rejected = 0
+
+    # Re-evaluate records after every navigation because React may rebuild the grid.
+    for click_index in range(max(1, int(max_clicks or 1))):
+        records = _get_profile_click_tile_records(page, limit=max_clicks + 8)
+        if not records or click_index >= len(records):
+            break
+
+        rec = records[click_index]
+        try:
+            x = float(rec.get("x") or 0)
+            y = float(rec.get("y") or 0)
+            if x <= 0 or y <= 0:
+                continue
+
+            before_url = page.url or entry_url
+            page.mouse.click(x, y)
+            page.wait_for_timeout(1100)
+
+            child_url = _normalize_profile_child_url(page.url or "")
+            if not child_url:
+                # Some layouts open a dialog while keeping the profile URL.
+                try:
+                    canonical = (
+                        page.locator('link[rel="canonical"]').first.get_attribute("href")
+                        or ""
+                    )
+                except Exception:
+                    canonical = ""
+                child_url = _normalize_profile_child_url(canonical)
+
+            accepted = False
+            if child_url and child_url not in already_seen and child_url not in found:
+                owner = _clean_ig_account(_get_ig_post_account(page)).lower()
+                if owner and owner == target_user:
+                    found.append(child_url)
+                    accepted = True
+                    logger.info(
+                        f"IG 主頁 verified tile accepted: @{username}, "
+                        f"url={child_url}, owner={owner}"
+                    )
+                else:
+                    rejected += 1
+                    logger.warning(
+                        f"IG 主頁 verified tile rejected: expected=@{username}, "
+                        f"observed={owner or 'unknown'}, url={child_url or 'unknown'}"
+                    )
+
+            # Restore the exact profile tab and scroll position conservatively.
+            restored = False
+            if _normalize_profile_child_url(page.url or ""):
+                try:
+                    page.go_back(wait_until="domcontentloaded", timeout=12000)
+                    page.wait_for_timeout(900)
+                    restored = True
+                except Exception:
+                    restored = False
+            else:
+                try:
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(500)
+                    restored = True
+                except Exception:
+                    restored = False
+
+            if not restored or _normalize_profile_child_url(page.url or ""):
+                try:
+                    page.goto(entry_url, wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_timeout(900)
+                except Exception:
+                    pass
+
+            if accepted and len(found) >= max_clicks:
+                break
+
+        except Exception as e:
+            logger.debug(f"IG 主頁 verified click probe skipped: {e}")
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            try:
+                if _normalize_profile_child_url(page.url or ""):
+                    page.goto(entry_url, wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_timeout(800)
+            except Exception:
+                pass
+            continue
+
+    if rejected:
+        logger.info(
+            f"IG 主頁 verified click probe rejected={rejected}, "
+            f"accepted={len(found)}, target=@{username}"
+        )
+
+    return _dedupe_profile_child_urls(found)
+
+def _scan_profile_post_urls_once(
+    profile_url: str,
+    max_posts: int | None = None,
+    headless_mode: bool = True,
+) -> tuple[str, list[str], str]:
     """Scan an Instagram profile/reels tab and return discovered post / reel URLs.
 
     This function only expands the profile into individual post tasks.  It does
@@ -3578,33 +3984,40 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
     logger.info(
         f"IG 主頁掃描開始: @{username}, entries={scan_entry_urls}, "
         f"max_posts={max_posts or 'unlimited'}, max_scrolls={max_scrolls}, "
-        f"stable_rounds={stable_rounds}, profile={user_data_dir}"
+        f"stable_rounds={stable_rounds}, profile={user_data_dir}, "
+        f"mode={'headless' if headless_mode else 'visible-fallback'}"
     )
 
     context = None
     try:
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                channel="chrome",
-                headless=False,
-                no_viewport=True,
-                locale="zh-TW",
-                user_agent=(
+            launch_kwargs = {
+                "user_data_dir": user_data_dir,
+                "channel": "chrome",
+                "headless": bool(headless_mode),
+                "locale": "zh-TW",
+                "user_agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/123.0.0.0 Safari/537.36"
                 ),
-                args=[
+                "args": [
                     f"--profile-directory={profile_dir}",
                     "--disable-blink-features=AutomationControlled",
                     "--disable-dev-shm-usage",
                     "--no-sandbox",
                     "--no-first-run",
                     "--no-default-browser-check",
-                    "--start-maximized",
                 ],
-            )
+            }
+
+            if headless_mode:
+                launch_kwargs["viewport"] = {"width": 1600, "height": 1200}
+            else:
+                launch_kwargs["no_viewport"] = True
+                launch_kwargs["args"].append("--start-maximized")
+
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
 
             try:
                 context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
@@ -3614,6 +4027,16 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
             page = _get_fresh_persistent_target_page(context)
             combined_urls: list[str] = []
             seen_urls = set()
+
+            structured_urls: list[str] = []
+            structured_seen: set[str] = set()
+            _attach_profile_structured_response_harvester(
+                page,
+                username,
+                structured_urls,
+                structured_seen,
+            )
+
             had_missing_page = False
             had_blocked_page = False
             blocked_message = ""
@@ -3635,6 +4058,12 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
                 except Exception:
                     pass
 
+                declared_post_count = _get_profile_declared_post_count(page, username)
+                if declared_post_count:
+                    logger.info(
+                        f"IG 主頁 @{username}: header declared posts={declared_post_count}"
+                    )
+
                 if _is_missing_ig_page(page):
                     had_missing_page = True
                     logger.warning(f"IG 主頁掃描 @{username}: entry missing/unavailable {entry_url}")
@@ -3650,14 +4079,45 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
                 last_count = len(combined_urls)
 
                 for round_i in range(max_scrolls + 1):
-                    current_urls = _extract_profile_post_urls_from_page(page)
-                    if not current_urls and round_i <= max(3, stable_rounds):
-                        current_urls = _extract_profile_post_urls_by_click_probe(
-                            page,
-                            entry_url,
-                            already_seen=seen_urls,
-                            max_clicks=12,
+                    # v11.98 backend-first profile expansion:
+                    # 1) GraphQL/private-API response URLs, exact owner-gated
+                    # 2) embedded JSON payloads, exact owner-gated
+                    # 3) visible profile DOM anchors
+                    # 4) verified tile-click fallback only when backend/DOM expose
+                    #    no new URLs in the current round
+                    current_urls = list(structured_urls)
+                    current_urls.extend(
+                        _extract_profile_urls_from_embedded_json(page, username)
+                    )
+                    current_urls.extend(
+                        _extract_profile_post_urls_from_page(page)
+                    )
+                    current_urls = _dedupe_profile_child_urls(current_urls)
+
+                    has_new_backend_url = any(
+                        (_extract_shortcode(u) or "") not in {
+                            _extract_shortcode(x) or "" for x in combined_urls
+                        }
+                        for u in current_urls
+                    )
+
+                    if not has_new_backend_url:
+                        remaining = (
+                            max(1, declared_post_count - len(combined_urls))
+                            if declared_post_count
+                            else 12
                         )
+                        current_urls.extend(
+                            _extract_profile_post_urls_by_verified_click_probe(
+                                page,
+                                entry_url,
+                                username,
+                                already_seen=seen_urls,
+                                max_clicks=min(12, remaining),
+                            )
+                        )
+                        current_urls = _dedupe_profile_child_urls(current_urls)
+
                     added_this_round = 0
 
                     for u in current_urls:
@@ -3671,10 +4131,18 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
 
                     logger.info(
                         f"IG 主頁掃描 @{username}: entry={entry_i}, round={round_i}, "
-                        f"total={len(combined_urls)}, new={added_this_round}"
+                        f"total={len(combined_urls)}, new={added_this_round}, "
+                        f"declared={declared_post_count or 'unknown'}"
                     )
 
                     if max_posts and len(combined_urls) >= max_posts:
+                        break
+
+                    if declared_post_count and len(combined_urls) >= declared_post_count:
+                        logger.info(
+                            f"IG 主頁 @{username}: collected declared total "
+                            f"{declared_post_count}; stop before recommendation area"
+                        )
                         break
 
                     if len(combined_urls) == last_count:
@@ -3687,7 +4155,12 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
                         break
 
                     try:
-                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                        if stable >= 2:
+                            page.keyboard.press("End")
+                        else:
+                            page.evaluate(
+                                "() => window.scrollBy(0, Math.max(700, Math.floor(window.innerHeight * 0.9)))"
+                            )
                         page.wait_for_timeout(wait_ms)
                     except Exception:
                         time.sleep(wait_ms / 1000.0)
@@ -3700,15 +4173,56 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
                     except Exception:
                         pass
 
+                if declared_post_count and len(combined_urls) >= declared_post_count:
+                    break
+
             if not combined_urls:
                 if had_blocked_page:
                     return "BLOCKED", [], blocked_message or "IG Parser Profile 尚未登入或沒有權限查看此主頁"
                 if had_missing_page:
                     return "MISSING", [], f"Instagram 主頁不存在、已移除，或目前帳號沒有權限查看：@{username}"
-                return "RETRY", [], f"主頁 @{username} 未掃到貼文或 Reel；可能是尚未載入、貼文為空、或 IG 暫時限制"
+                return "RETRY", [], (
+                    f"主頁 @{username} 在{'背景' if headless_mode else '可見'}模式未掃到貼文或 Reel；"
+                    "可能是 Grid 尚未載入、需要人工驗證，或 IG 暫時限制"
+                )
+
+            combined_urls = _dedupe_profile_child_urls(combined_urls)
+            if not combined_urls:
+                return "RETRY", [], (
+                    f"IG 主頁 @{username} 沒有取得可驗證的 Grid 貼文連結；"
+                    "為避免把推薦內容當成該帳號貼文，拒絕假 SUCCESS"
+                )
+
+            declared_total = 0
+            try:
+                page.goto(
+                    f"https://www.instagram.com/{username}/",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                page.wait_for_timeout(1200)
+                declared_total = _get_profile_declared_post_count(page, username)
+            except Exception:
+                declared_total = 0
+
+            if declared_total and len(combined_urls) < declared_total:
+                return "RETRY", [], (
+                    f"IG 主頁 @{username} 掃描不完整：宣告 {declared_total} 筆，"
+                    f"只取得 {len(combined_urls)} 筆；未收齊前不加入下載佇列"
+                )
+
+            if declared_total and len(combined_urls) > declared_total:
+                return "RETRY", [], (
+                    f"IG 主頁 @{username} 掃描結果超過宣告數：宣告 {declared_total} 筆，"
+                    f"取得 {len(combined_urls)} 筆；疑似混入推薦內容，拒絕假 SUCCESS"
+                )
 
             _remember_profile_child_owner(username, combined_urls)
-            msg = f"IG 主頁 @{username} 掃描完成：發現 {len(combined_urls)} 筆貼文 / Reel"
+            msg = (
+                f"IG 主頁 @{username} 精確 Grid 掃描完成："
+                f"發現 {len(combined_urls)} 筆貼文 / Reel"
+                + (f"（header={declared_total}）" if declared_total else "")
+            )
             logger.info(msg)
             return "SUCCESS", combined_urls, msg
 
@@ -3729,6 +4243,57 @@ def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tu
         except Exception:
             pass
 
+
+
+def scan_profile_post_urls(profile_url: str, max_posts: int | None = None) -> tuple[str, list[str], str]:
+    """Expand an Instagram profile with headless-first persistent authentication.
+
+    Normal path:
+      logged-in IG Parser Profile + headless Chromium
+
+    Visible Chrome is opened only when the background pass cannot safely finish
+    because of login/checkpoint/challenge/audience confirmation, or because the
+    current IG profile-grid layout cannot expose verifiable tiles headlessly.
+
+    The single-post, carousel, Reel, img_index and Facebook download paths are
+    intentionally untouched.
+    """
+    status_h, urls_h, message_h = _scan_profile_post_urls_once(
+        profile_url,
+        max_posts=max_posts,
+        headless_mode=True,
+    )
+
+    if status_h != "BLOCKED":
+        # SUCCESS / MISSING / FAILED / RETRY all stay background-only.
+        # Incomplete URL collection is not a reason to open visible Chrome.
+        return status_h, urls_h, message_h
+
+    reason_low = (message_h or "").lower()
+    needs_manual_auth = any(marker in reason_low for marker in [
+        "登入",
+        "login",
+        "checkpoint",
+        "challenge",
+        "信任裝置",
+        "驗證",
+        "特定受眾",
+        "年齡",
+    ])
+
+    if not needs_manual_auth:
+        return status_h, urls_h, message_h
+
+    logger.info(
+        "IG 主頁需要人工登入／驗證，才啟用可見瀏覽器 fallback："
+        f"status={status_h}, reason={message_h}"
+    )
+
+    return _scan_profile_post_urls_once(
+        profile_url,
+        max_posts=max_posts,
+        headless_mode=False,
+    )
 
 def _is_ig_audience_restricted_page(page) -> bool:
     """Detect IG age/audience restriction pages.
