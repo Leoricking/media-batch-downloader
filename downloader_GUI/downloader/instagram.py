@@ -1,3 +1,9 @@
+# v12.09 Exact Shortcode Structured Scan + Best-Available Image Gate
+# v12.08 Original CDN Variant Without Declared-Size Gate
+# v12.07 Structured Original CDN Variant Fallback
+# v12.06 Persistent Profile Headless-First Single Download Fix
+# v12.05 Structured Candidate Build Exact-URL Fix
+# v12.04 Exact Image Variant Retry Fix
 import html
 import json
 import hashlib
@@ -8,7 +14,7 @@ import shutil
 import subprocess
 import threading
 import time
-from urllib.parse import urlparse, unquote, parse_qs, urlencode
+from urllib.parse import urlparse, unquote, parse_qs, parse_qsl, urlencode, urlunparse
 
 import instaloader
 import requests
@@ -54,6 +60,7 @@ def _to_traditional(text: str) -> str:
 logger = get_logger("instagram")
 
 # v11.90 Structured Shortcode Ownership Fix
+# v12.03 Latest Profile Flow + Structured High-Resolution Retry
 # v11.98 Profile Backend URL Harvest + Sequential Queue Expansion
 # v11.97 Profile Headless-First Persistent Scan
 # v11.96 Profile Verified Click Scan Fix
@@ -4484,11 +4491,40 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
         if w <= 0 or h <= 0:
             return False, "圖片尺寸無效"
 
-        # Instagram normal Post images are expected to have at least a 720px
-        # long edge. Reject 320/480/640 preview variants outright.
+        # Normal images still require a 720px long edge. A narrow exception is
+        # allowed only for an exact authenticated structured child where:
+        # - Instagram itself declares this as the largest explicit candidate;
+        # - the URL is not an explicit 240/320/480/640 resize preview;
+        # - actual bytes closely match the declared candidate dimensions;
+        # - long/short edges remain at least 640/480.
         if max(w, h) < 720:
-            return False, (
-                f"下載結果是低解析度縮圖：actual={w}x{h}"
+            best_available = bool(
+                item.get("_best_available_structured_image")
+                and item.get("from") == "authenticated-structured-json"
+            )
+            declared_w = int(item.get("sourceWidth") or 0)
+            declared_h = int(item.get("sourceHeight") or 0)
+            declared_match = bool(
+                declared_w > 0
+                and declared_h > 0
+                and abs(w - declared_w) <= max(4, int(declared_w * 0.03))
+                and abs(h - declared_h) <= max(4, int(declared_h * 0.03))
+            )
+            acceptable_best_available = bool(
+                best_available
+                and declared_match
+                and max(w, h) >= 640
+                and min(w, h) >= 480
+            )
+
+            if not acceptable_best_available:
+                return False, (
+                    f"下載結果是低解析度縮圖：actual={w}x{h}"
+                )
+
+            logger.info(
+                f"IG authenticated best-available image accepted: "
+                f"actual={w}x{h}, declared={declared_w}x{declared_h}"
             )
 
         if min(w, h) < 360:
@@ -4540,11 +4576,39 @@ def _normalized_media_identity(url: str) -> str:
         return str(url or "").strip().lower()
 
 
+def _normalized_exact_media_url(url: str) -> str:
+    """Normalize a media URL while preserving the query string.
+
+    Instagram often serves multiple image resolutions from the same CDN path and
+    distinguishes them only through query parameters such as ``stp``.  Those
+    variants must remain separate for still-image quality fallback.
+    """
+    try:
+        cleaned = html.unescape(unquote(str(url or "").strip()))
+        parsed = urlparse(cleaned)
+        host = (parsed.netloc or "").lower()
+        path = re.sub(r"/+", "/", parsed.path or "")
+        query = parsed.query or ""
+        return f"{host}{path}?{query}".lower() if query else f"{host}{path}".lower()
+    except Exception:
+        return str(url or "").strip().lower()
+
+
 def _find_exact_harvested_media(harvested_media: dict, item: dict):
-    """Return only the cached response belonging to this exact slide media."""
+    """Return only cached media that belongs to the exact requested candidate.
+
+    Video fragments keep path-based matching because init/media range requests
+    commonly use changing query tokens.  Still images require full URL matching,
+    including the query string, so a cached 679px preview cannot be reused for a
+    different 1080px structured candidate sharing the same CDN path.
+    """
     media_url = item.get("src", "") or ""
     media_type = (item.get("type") or "image").lower()
-    wanted_identity = _normalized_media_identity(media_url)
+    wanted_identity = (
+        _normalized_media_identity(media_url)
+        if media_type == "video"
+        else _normalized_exact_media_url(media_url)
+    )
 
     best = None
     best_score = -1
@@ -4557,11 +4621,13 @@ def _find_exact_harvested_media(harvested_media: dict, item: dict):
         if media_type == "video":
             if candidate_type != "video" and not content_type.startswith("video/"):
                 continue
+            candidate_identity = _normalized_media_identity(candidate_url)
         else:
             if candidate_type == "video" or content_type.startswith("video/"):
                 continue
+            candidate_identity = _normalized_exact_media_url(candidate_url)
 
-        if _normalized_media_identity(candidate_url) != wanted_identity:
+        if candidate_identity != wanted_identity:
             continue
 
         score = int(candidate.get("score") or 0)
@@ -4748,7 +4814,12 @@ def _validate_downloaded_media_type(path: str, item: dict) -> tuple[bool, str]:
 
 
 def _download_filtered_items_from_context(context, filtered, harvested_media, title: str, shortcode: str, referer: str):
-    """Write only media explicitly owned by the current shortcode."""
+    """Write only media explicitly owned by the current shortcode.
+
+    For structured still images, try candidates in true resolution order. If a
+    CDN response is smaller than declared or fails the quality gate, retry the
+    next exact-child URL instead of failing the whole carousel immediately.
+    """
     if not filtered:
         return "FAILED", "IG 沒有可下載的目標媒體"
 
@@ -4756,141 +4827,149 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
         owner = item.get("_target_shortcode")
         if owner != shortcode:
             return "FAILED", (
-                f"IG 媒體 shortcode 不符："
-                f"expected={shortcode}, actual={owner or 'missing'}"
+                f"IG 媒體 shortcode 不符：expected={shortcode}, "
+                f"actual={owner or 'missing'}"
             )
 
     success_count = 0
 
     for i, item in enumerate(filtered, 1):
-        media_type = item.get("type", "image")
-        media_url = item.get("src", "")
+        media_type = (item.get("type") or "image").lower()
+        primary_url = item.get("src", "")
 
-        ext = (
-            ".mp4"
-            if media_type == "video" or any(x in media_url.lower() for x in [".mp4", ".m4v", ".mov"])
-            else _ext_from_url(media_url, ".jpg")
-        )
+        candidate_urls = [primary_url]
+        if media_type != "video":
+            candidate_urls.extend(item.get("_alternate_image_urls") or [])
 
-        dst = os.path.join(TEMP_DIR, f"ig_{i}{ext}")
-        media_key = _media_key_from_url(media_url)
+        deduped_urls = []
+        seen_candidates = set()
+        for candidate_url in candidate_urls:
+            candidate_url = str(candidate_url or "").strip()
+            if not candidate_url:
+                continue
 
-        try:
-            embedded_video_body = item.get("_complete_video_body") or b""
-            harvested = _find_exact_harvested_media(harvested_media, item)
-            harvested_body = harvested.get("body") if harvested else b""
-            harvested_type = (
-                (harvested.get("type") or "").lower() if harvested else ""
-            )
-            harvested_content_type = (
-                harvested.get("content_type", "") if harvested else ""
-            )
-            is_video_item = (
-                media_type == "video"
-                or harvested_type == "video"
-                or harvested_content_type.lower().startswith("video/")
-                or any(x in media_url.lower() for x in [".mp4", ".m4v", ".mov"])
-            )
-
-            use_cached_body = bool(harvested_body)
-            fragment_video = bool(
-                use_cached_body
-                and is_video_item
-                and not _is_playable_mp4_body(harvested_body)
-            )
-
-            if embedded_video_body:
-                _write_media_body(
-                    dst,
-                    embedded_video_body,
-                    media_url=media_url,
-                    content_type="video/mp4",
-                )
-                logger.info(
-                    f"IG 第 {i} 個影片使用 browser init/media fragments "
-                    "組成完整 MP4"
-                )
-            elif fragment_video:
-                logger.info(
-                    f"IG 第 {i} 個影片 cache 為 fragmented MP4 segment；"
-                    "從 byte 0 重新分段下載並重建完整 MP4"
-                )
-                _download_complete_mp4_with_ranges(
-                    context,
-                    media_url,
-                    dst,
-                    referer=referer,
-                )
-                logger.info(f"IG 第 {i} 個影片完整 MP4 重建完成")
-            elif use_cached_body:
-                _write_media_body(
-                    dst,
-                    harvested_body,
-                    media_url=media_url,
-                    content_type=harvested_content_type,
-                )
-                logger.info(f"IG 使用 browser network cache 寫入第 {i} 個媒體")
+            # Still-image resolution variants frequently share the same CDN path
+            # and differ only in query parameters.  Preserve those exact variants
+            # so the quality gate can retry 1080px/original candidates after a
+            # cached preview fails.  Video keeps the existing path identity for
+            # fragment/range consolidation.
+            if media_type == "video":
+                key = _media_key_from_url(candidate_url) or candidate_url
             else:
-                if is_video_item:
-                    _download_complete_mp4_with_ranges(
-                        context,
-                        media_url,
-                        dst,
-                        referer=referer,
-                    )
-                    logger.info(f"IG 第 {i} 個影片完整 MP4 下載完成")
+                key = _normalized_exact_media_url(candidate_url)
+
+            if key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            deduped_urls.append(candidate_url)
+        candidate_urls = deduped_urls or [primary_url]
+
+        candidate_errors = []
+        candidate_succeeded = False
+
+        for candidate_index, media_url in enumerate(candidate_urls, 1):
+            attempt_item = dict(item)
+            attempt_item["src"] = media_url
+            ext = (
+                ".mp4"
+                if media_type == "video" or any(x in media_url.lower() for x in [".mp4", ".m4v", ".mov"])
+                else _ext_from_url(media_url, ".jpg")
+            )
+            dst = os.path.join(TEMP_DIR, f"ig_{i}{ext}")
+
+            try:
+                embedded_video_body = attempt_item.get("_complete_video_body") or b""
+                harvested = _find_exact_harvested_media(harvested_media, attempt_item)
+                harvested_body = harvested.get("body") if harvested else b""
+                harvested_type = ((harvested.get("type") or "").lower() if harvested else "")
+                harvested_content_type = (harvested.get("content_type", "") if harvested else "")
+                is_video_item = (
+                    media_type == "video"
+                    or harvested_type == "video"
+                    or harvested_content_type.lower().startswith("video/")
+                    or any(x in media_url.lower() for x in [".mp4", ".m4v", ".mov"])
+                )
+
+                use_cached_body = bool(harvested_body)
+                fragment_video = bool(
+                    use_cached_body
+                    and is_video_item
+                    and not _is_playable_mp4_body(harvested_body)
+                )
+
+                if embedded_video_body:
+                    _write_media_body(dst, embedded_video_body, media_url=media_url, content_type="video/mp4")
+                    logger.info(f"IG 第 {i} 個影片使用 browser init/media fragments 組成完整 MP4")
+                elif fragment_video:
+                    logger.info(f"IG 第 {i} 個影片 cache 為 fragmented MP4 segment；從 byte 0 重新分段下載並重建完整 MP4")
+                    _download_complete_mp4_with_ranges(context, media_url, dst, referer=referer)
+                    logger.info(f"IG 第 {i} 個影片完整 MP4 重建完成")
+                elif use_cached_body:
+                    _write_media_body(dst, harvested_body, media_url=media_url, content_type=harvested_content_type)
+                    logger.info(f"IG 使用 browser network cache 寫入第 {i} 個媒體")
                 else:
-                    _download_with_playwright_request(
-                        context,
-                        media_url,
-                        dst,
-                        referer=referer,
+                    if is_video_item:
+                        _download_complete_mp4_with_ranges(context, media_url, dst, referer=referer)
+                        logger.info(f"IG 第 {i} 個影片完整 MP4 下載完成")
+                    else:
+                        _download_with_playwright_request(context, media_url, dst, referer=referer)
+
+                actual_candidates = [
+                    path for path in _list_media_files(TEMP_DIR)
+                    if os.path.basename(path).startswith(f"ig_{i}")
+                ]
+                actual_path = actual_candidates[-1] if actual_candidates else dst
+
+                type_ok, type_reason = _validate_downloaded_media_type(actual_path, attempt_item)
+                if not type_ok:
+                    raise Exception(type_reason)
+
+                geometry_ok, geometry_reason = _validate_downloaded_media_geometry(actual_path, attempt_item)
+                if not geometry_ok:
+                    raise Exception(geometry_reason)
+
+                candidate_succeeded = True
+                success_count += 1
+                if media_type != "video" and candidate_index > 1:
+                    logger.info(
+                        f"IG 第 {i} 張圖片已改用第 {candidate_index} 個結構化高解析度候選並通過驗證"
                     )
+                break
 
-            # _write_media_body may change extension based on magic bytes. Locate the
-            # actual file and reject square/cropped variants when the visible post
-            # frame is portrait/landscape. This prevents false SUCCESS.
-            actual_candidates = [x for x in _list_media_files(TEMP_DIR) if os.path.basename(x).startswith(f"ig_{i}")]
-            actual_path = actual_candidates[-1] if actual_candidates else dst
-            type_ok, type_reason = _validate_downloaded_media_type(
-                actual_path,
-                item,
-            )
-            if not type_ok:
-                try:
-                    if os.path.exists(actual_path):
-                        os.remove(actual_path)
-                except Exception:
-                    pass
-                raise Exception(type_reason)
+            except Exception as exc:
+                for path in list(_list_media_files(TEMP_DIR)):
+                    if os.path.basename(path).startswith(f"ig_{i}"):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
 
-            geometry_ok, geometry_reason = _validate_downloaded_media_geometry(
-                actual_path,
-                item,
-            )
-            if not geometry_ok:
-                try:
-                    if os.path.exists(actual_path):
-                        os.remove(actual_path)
-                except Exception:
-                    pass
-                raise Exception(geometry_reason)
-            success_count += 1
+                candidate_errors.append(str(exc))
 
-        except Exception as e:
-            if item.get("requested_slide_video_replacement"):
-                raise Exception(
-                    f"IG requested slide video download failed at index {i}: {e}"
-                ) from e
-            logger.warning(f"IG 略過無效媒體: {media_url[:180]} | {e}")
+                if media_type != "video" and candidate_index < len(candidate_urls):
+                    logger.info(
+                        f"IG 第 {i} 張圖片候選未通過品質 gate，改試下一個結構化高解析度 URL "
+                        f"({candidate_index + 1}/{len(candidate_urls)}): {exc}"
+                    )
+                    continue
+
+                if item.get("requested_slide_video_replacement"):
+                    raise Exception(
+                        f"IG requested slide video download failed at index {i}: {exc}"
+                    ) from exc
+
+                logger.warning(
+                    f"IG 略過無效媒體: {media_url[:180]} | {' | '.join(candidate_errors)}"
+                )
+                break
+
+        if not candidate_succeeded:
+            continue
 
     if success_count <= 0:
-        return "FAILED", (
-            "IG 媒體全部未通過影片/圖片完整性與解析度驗證"
-        )
+        return "FAILED", "IG 媒體全部未通過影片/圖片完整性與解析度驗證"
 
     temp_files_after_capture = _list_media_files(TEMP_DIR)
-
     if success_count != len(filtered) or len(temp_files_after_capture) != len(filtered):
         return "FAILED", (
             f"IG 媒體完整性檢查失敗：expected={len(filtered)}, "
@@ -6407,24 +6486,141 @@ def _capture_ig_structured_response(response, payloads: list) -> None:
         return
 
 
-def _best_ig_image_candidate(node: dict) -> str:
-    candidates = []
 
-    def add(url, width=0, height=0, bonus=0):
-        url = html.unescape(unquote(str(url or "").strip()))
-        if not _looks_like_real_ig_media_url(url):
-            return
-        if any(ext in url.lower() for ext in [".mp4", ".m4v", ".mov"]):
-            return
+def _build_ig_original_image_url_variants(
+    media_url: str,
+    declared_width: int = 0,
+    declared_height: int = 0,
+) -> list[str]:
+    """Build conservative same-image CDN variants without resize/crop directives.
+
+    Instagram sometimes returns only responsive preview candidates even though
+    the structured node declares a larger original frame.  These variants are
+    attempted only after the explicit structured candidates fail quality checks.
+
+    All generated responses still pass the existing real-image, shortcode,
+    dimensions, aspect-ratio and file-integrity gates before they can be saved.
+    """
+    raw = html.unescape(str(media_url or "").strip())
+    if not _looks_like_real_ig_media_url(raw):
+        return []
+
+    try:
+        dw = int(declared_width or 0)
+        dh = int(declared_height or 0)
+    except Exception:
+        dw, dh = 0, 0
+
+    # Do not require original_width/original_height here. Some authenticated
+    # Instagram carousel nodes omit those fields even when the CDN ``stp``
+    # transformation is serving only a responsive preview. Generated variants
+    # are never trusted directly; the existing real-byte dimensions, aspect
+    # ratio, image header, shortcode ownership and completeness gates still
+    # decide whether the file may be saved.
+    try:
+        parsed = urlparse(raw)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except Exception:
+        return []
+
+    variants = []
+    seen = {_normalized_exact_media_url(raw)}
+
+    def emit(new_pairs):
         try:
-            score = int(width or 0) * int(height or 0) + int(bonus or 0)
+            candidate = urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    urlencode(new_pairs, doseq=True),
+                    parsed.fragment,
+                )
+            )
         except Exception:
-            score = int(bonus or 0)
-        candidates.append((score, url))
+            return
+
+        key = _normalized_exact_media_url(candidate)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        variants.append(candidate)
+
+    stp_value = ""
+    for key, value in pairs:
+        if key.lower() == "stp":
+            stp_value = value or ""
+            break
+
+    if stp_value:
+        # Variant 1: remove only explicit size/crop tokens, retaining format flags.
+        cleaned_tokens = []
+        for token in stp_value.split("_"):
+            low = token.lower()
+            if re.fullmatch(r"s\d+x\d+", low):
+                continue
+            if re.fullmatch(r"c\d+(?:\.\d+){2,3}a?", low):
+                continue
+            if re.fullmatch(r"p\d+x\d+", low):
+                continue
+            cleaned_tokens.append(token)
+
+        cleaned_stp = "_".join(t for t in cleaned_tokens if t)
+        cleaned_pairs = []
+        for key, value in pairs:
+            if key.lower() == "stp":
+                if cleaned_stp:
+                    cleaned_pairs.append((key, cleaned_stp))
+            else:
+                cleaned_pairs.append((key, value))
+        emit(cleaned_pairs)
+
+        # Variant 2: remove the stp transformation entirely.
+        emit([(key, value) for key, value in pairs if key.lower() != "stp"])
+
+    return variants
+
+def _all_ig_image_candidates(node: dict) -> list[dict]:
+    """Return all structured image candidates ordered by true resolution.
+
+    Pixel area is authoritative. Source family is only a tie-breaker. This
+    prevents a small image_versions2 preview from outranking a larger
+    display_resource merely because of a fixed source bonus.
+    """
+    candidates = []
+    seen = set()
+
+    def add(url, width=0, height=0, source_rank=0):
+        clean_url = html.unescape(unquote(str(url or "").strip()))
+        if not _looks_like_real_ig_media_url(clean_url):
+            return
+        if any(ext in clean_url.lower() for ext in [".mp4", ".m4v", ".mov"]):
+            return
+        # Still-image resolution variants frequently share the same CDN
+        # host/path and differ only in query parameters such as ``stp``.
+        # Keep the full normalized URL here; otherwise high-resolution
+        # candidates are discarded before the download retry loop can see them.
+        key = _normalized_exact_media_url(clean_url)
+        if key in seen:
+            return
+        seen.add(key)
+        try:
+            w = max(0, int(width or 0))
+            h = max(0, int(height or 0))
+        except Exception:
+            w, h = 0, 0
+        candidates.append({
+            "url": clean_url,
+            "width": w,
+            "height": h,
+            "area": w * h,
+            "source_rank": int(source_rank or 0),
+        })
 
     for item in ((node.get("image_versions2") or {}).get("candidates") or []):
         if isinstance(item, dict):
-            add(item.get("url"), item.get("width"), item.get("height"), 4000000)
+            add(item.get("url"), item.get("width"), item.get("height"), 4)
 
     for item in (node.get("display_resources") or []):
         if isinstance(item, dict):
@@ -6432,7 +6628,7 @@ def _best_ig_image_candidate(node: dict) -> str:
                 item.get("src") or item.get("url"),
                 item.get("config_width") or item.get("width"),
                 item.get("config_height") or item.get("height"),
-                3000000,
+                3,
             )
 
     for item in (node.get("thumbnail_resources") or []):
@@ -6441,17 +6637,26 @@ def _best_ig_image_candidate(node: dict) -> str:
                 item.get("src") or item.get("url"),
                 item.get("config_width") or item.get("width"),
                 item.get("config_height") or item.get("height"),
-                1000000,
+                1,
             )
 
-    for key in [
-        "display_url", "image_url", "thumbnail_url",
-        "src", "url",
-    ]:
-        add(node.get(key), node.get("width"), node.get("height"))
+    for key in ["display_url", "image_url", "thumbnail_url", "src", "url"]:
+        add(node.get(key), node.get("width"), node.get("height"), 2)
 
-    candidates.sort(key=lambda row: row[0], reverse=True)
-    return candidates[0][1] if candidates else ""
+    candidates.sort(
+        key=lambda row: (
+            row.get("area", 0),
+            row.get("source_rank", 0),
+            _media_quality_score(row.get("url", "")),
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def _best_ig_image_candidate(node: dict) -> str:
+    candidates = _all_ig_image_candidates(node)
+    return candidates[0]["url"] if candidates else ""
 
 
 def _best_ig_video_candidate(node: dict) -> str:
@@ -6576,16 +6781,55 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
             "from": "authenticated-structured-json",
         }
 
-    url = _best_ig_image_candidate(node)
-    if not url:
+    image_candidates = _all_ig_image_candidates(node)
+    if not image_candidates:
         return None
 
-    width = node.get("original_width") or node.get("width") or 0
-    height = node.get("original_height") or node.get("height") or 0
+    primary = image_candidates[0]
+    url = primary.get("url", "")
+    width = node.get("original_width") or node.get("width") or primary.get("width") or 0
+    height = node.get("original_height") or node.get("height") or primary.get("height") or 0
     try:
         frame_ratio = float(width) / float(height) if float(height) > 0 else 0
     except Exception:
         frame_ratio = 0
+
+    # Keep only explicit candidates returned for this exact structured child.
+    # Removing/rewriting signed CDN transformation parameters produces 403 and
+    # must not be applied globally to unrelated hydration nodes.
+    alternate_urls = [
+        row.get("url", "") for row in image_candidates[1:] if row.get("url")
+    ]
+
+    explicit_max_width = max(
+        [int(row.get("width") or 0) for row in image_candidates] or [0]
+    )
+    explicit_max_height = max(
+        [int(row.get("height") or 0) for row in image_candidates] or [0]
+    )
+
+    primary_url_low = str(url or "").lower()
+    has_explicit_small_resize = bool(
+        re.search(r"(?:^|[_?&=])s(?:240|320|360|480|540|640)x\d+", primary_url_low)
+    )
+
+    best_available_structured = bool(
+        primary.get("width")
+        and primary.get("height")
+        and max(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= 640
+        and min(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= 480
+        and not has_explicit_small_resize
+    )
+
+    deduped_alternates = []
+    seen_alternates = {_normalized_exact_media_url(url)}
+    for candidate_url in alternate_urls:
+        candidate_url = str(candidate_url or "").strip()
+        key = _normalized_exact_media_url(candidate_url)
+        if not key or key in seen_alternates:
+            continue
+        seen_alternates.add(key)
+        deduped_alternates.append(candidate_url)
 
     return {
         "src": url,
@@ -6593,6 +6837,12 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
         "score": 50000000 + _media_quality_score(url),
         "_carousel_slide_index": slide_index,
         "frameRatio": frame_ratio,
+        "sourceWidth": int(primary.get("width") or width or 0),
+        "sourceHeight": int(primary.get("height") or height or 0),
+        "_explicitMaxWidth": explicit_max_width,
+        "_explicitMaxHeight": explicit_max_height,
+        "_best_available_structured_image": best_available_structured,
+        "_alternate_image_urls": deduped_alternates,
         "from": "authenticated-structured-json",
     }
 
@@ -6619,8 +6869,15 @@ def _extract_structured_media_from_candidate(node: dict, shortcode: str):
 
 
 def _find_structured_media_in_payload(payload, shortcode: str):
-    """Find the exact shortcode node and return its ordered children."""
+    """Find and convert only exact-shortcode structured nodes.
+
+    Older logic attempted media conversion on every dictionary whose shortcode
+    was absent. Large Instagram hydration payloads contain hundreds of unrelated
+    recommendation/avatar/image nodes, causing candidate explosions and noisy
+    logs. This implementation traverses broadly but converts narrowly.
+    """
     best = []
+    best_score = -1
     stack = [payload]
     visited = 0
 
@@ -6629,24 +6886,22 @@ def _find_structured_media_in_payload(payload, shortcode: str):
         visited += 1
 
         if isinstance(current, dict):
-            direct = _extract_structured_media_from_candidate(current, shortcode)
-            if direct:
-                current_shortcode = _ig_node_shortcode(current)
-                children = _ig_node_children(current)
-                exact = bool(current_shortcode == shortcode)
-                score = (
-                    (1000000 if exact else 0)
-                    + (10000 if children else 0)
-                    + len(direct)
+            current_shortcode = _ig_node_shortcode(current)
+
+            if current_shortcode == shortcode:
+                direct = _extract_structured_media_from_candidate(
+                    current,
+                    shortcode,
                 )
-                previous_score = getattr(
-                    _DOWNLOAD_CONTEXT,
-                    "_structured_best_score",
-                    -1,
-                )
-                if score > previous_score:
-                    _DOWNLOAD_CONTEXT._structured_best_score = score
-                    best = direct
+                if direct:
+                    children = _ig_node_children(current)
+                    score = (
+                        (10000 if children else 0)
+                        + len(direct)
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best = direct
 
             for value in current.values():
                 if isinstance(value, (dict, list)):
@@ -7626,9 +7881,17 @@ def _collect_ig_media_playwright(url: str):
                     p,
                     url,
                     reason="headless context reported missing; verify with logged-in IG_Parser profile",
+                    headless_mode=True,
                 )
                 if status_p == "SUCCESS":
                     return status_p, error_p
+                if status_p == "BLOCKED" and error_p == "IG_VISIBLE_PROFILE_REQUIRED":
+                    return _collect_ig_media_playwright_persistent(
+                        p,
+                        url,
+                        reason="manual login/age/audience confirmation required after missing-page verification",
+                        headless_mode=False,
+                    )
                 if status_p in {"RETRY", "BLOCKED"}:
                     return status_p, error_p
                 return "MISSING", error_p or "Instagram 顯示貼文不存在或已移除"
@@ -7638,9 +7901,17 @@ def _collect_ig_media_playwright(url: str):
                     p,
                     url,
                     reason="IG age/audience restricted page in cookies.txt context",
+                    headless_mode=True,
                 )
                 if status_p == "SUCCESS":
                     return status_p, error_p
+                if status_p == "BLOCKED" and error_p == "IG_VISIBLE_PROFILE_REQUIRED":
+                    return _collect_ig_media_playwright_persistent(
+                        p,
+                        url,
+                        reason="explicit age/audience confirmation required",
+                        headless_mode=False,
+                    )
                 return status_p, error_p
 
             if _is_generic_ig_page(page):
@@ -7648,10 +7919,18 @@ def _collect_ig_media_playwright(url: str):
                     p,
                     url,
                     reason="IG login/challenge page in cookies.txt context",
+                    headless_mode=True,
                 )
                 if status_p == "SUCCESS":
                     return status_p, error_p
-                return "BLOCKED", error_p or "Playwright 看到的是 login / challenge / checkpoint 頁面，不是貼文主體"
+                if status_p == "BLOCKED" and error_p == "IG_VISIBLE_PROFILE_REQUIRED":
+                    return _collect_ig_media_playwright_persistent(
+                        p,
+                        url,
+                        reason="explicit login/challenge/checkpoint confirmation required",
+                        headless_mode=False,
+                    )
+                return status_p, error_p
 
             title = _get_prefetched_title(url) or _get_ig_full_caption_title(
                 page,

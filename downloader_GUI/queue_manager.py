@@ -1,3 +1,4 @@
+# v12.10 Instagram Metadata Identity Fix
 # v12.01 Profile Parent Checkpoint Fix
 # v12.00 Profile Batch Priority Queue
 import os
@@ -205,9 +206,29 @@ def insert_tasks_after(anchor_url: str, urls: list[str], batch_parent: str = "")
 
 
 def _find_task(url: str) -> Optional[dict]:
+    """Find a task by exact URL, then by conservative media identity.
+
+    Instagram download stages normalize share URLs by removing ``?igsh=...``.
+    Queue rows keep the user's original URL, so metadata publishing must still
+    resolve both forms to the same shortcode-backed task.
+    """
+    clean_url = (url or "").strip()
+    if not clean_url:
+        return None
+
     for task in _TASKS:
-        if task.get("url") == url:
+        if task.get("url") == clean_url:
             return task
+
+    identity = _task_identity_key(clean_url)
+    if not identity:
+        return None
+
+    for task in _TASKS:
+        task_url = (task.get("url") or "").strip()
+        if task_url and _task_identity_key(task_url) == identity:
+            return task
+
     return None
 
 
@@ -227,7 +248,7 @@ def update_task_title(url: str, title: str) -> bool:
 
         if task.get("status") == "DOWNLOADING":
             _RUNTIME["message"] = f"下載中：{clean_title}"
-            _RUNTIME["active_url"] = clean_url
+            _RUNTIME["active_url"] = task.get("url") or clean_url
 
         return True
 
