@@ -1,3 +1,4 @@
+# v12.12 Copy Retry Failed Missing URLs
 import json
 import math
 import os
@@ -688,6 +689,58 @@ class App:
             cursor="hand2",
         ).pack(side=tk.LEFT, padx=self._ui_px(2))
 
+        tk.Button(
+            act_frame,
+            text="📋 RETRY",
+            command=self._copy_retry_urls,
+            bg="#8E24AA",
+            fg="white",
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
+
+        tk.Button(
+            act_frame,
+            text="📋 FAILED",
+            command=self._copy_failed_urls,
+            bg="#C62828",
+            fg="white",
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
+
+        tk.Button(
+            act_frame,
+            text="📋 MISSING",
+            command=self._copy_missing_urls,
+            bg="#607D8B",
+            fg="white",
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
+
+        tk.Button(
+            act_frame,
+            text="📋 未成功",
+            command=self._copy_all_unsuccessful_urls,
+            bg="#AD1457",
+            fg="white",
+            padx=self._ui_px(5),
+            pady=self._ui_px(3),
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=self._ui_px(2))
+
         self.pause_btn = tk.Button(
             act_frame,
             text="⏸ 暫停",
@@ -916,6 +969,22 @@ class App:
             label="複製目前篩選 URL",
             command=self._copy_current_filtered_urls,
         )
+        self._tree_context_menu.add_command(
+            label="複製所有 RETRY URL",
+            command=self._copy_retry_urls,
+        )
+        self._tree_context_menu.add_command(
+            label="複製所有 FAILED URL",
+            command=self._copy_failed_urls,
+        )
+        self._tree_context_menu.add_command(
+            label="複製所有 MISSING URL",
+            command=self._copy_missing_urls,
+        )
+        self._tree_context_menu.add_command(
+            label="複製所有未成功 URL",
+            command=self._copy_all_unsuccessful_urls,
+        )
 
     def _on_tree_right_click(self, event):
         """右鍵點擊任務列時，立即保存完整 URL 快照並顯示選單。"""
@@ -1037,6 +1106,40 @@ class App:
             self.status_var.set(f"目前沒有 {status} URL")
             return
         self._copy_to_clipboard("\n".join(urls), f"已複製 {status} URL：{len(urls)} 筆")
+
+    def _copy_problem_urls(self, statuses=None, label: str = "未成功"):
+        """Copy URLs whose status is in the requested status set."""
+        if statuses is None:
+            statuses = ("FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE")
+        wanted = {str(s or "").upper() for s in statuses if str(s or "").strip()}
+        snapshot = queue_manager.get_snapshot()
+        urls = []
+        seen = set()
+        for task in snapshot:
+            status = str(task.get("status", "") or "").upper()
+            url = str(task.get("url", "") or "").strip()
+            if status in wanted and url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        if not urls:
+            self.status_var.set(f"目前沒有 {label} URL")
+            return
+        self._copy_to_clipboard("\n".join(urls), f"已複製 {label} URL：{len(urls)} 筆")
+
+    def _copy_retry_urls(self):
+        self._copy_problem_urls(("RETRY",), "RETRY")
+
+    def _copy_failed_urls(self):
+        self._copy_problem_urls(("FAILED",), "FAILED")
+
+    def _copy_missing_urls(self):
+        self._copy_problem_urls(("MISSING",), "MISSING")
+
+    def _copy_all_unsuccessful_urls(self):
+        self._copy_problem_urls(
+            ("FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE"),
+            "所有未成功",
+        )
 
     def _init_session(self):
         # v11.27 Parser Profile Login:
@@ -1575,9 +1678,45 @@ class App:
 
         tk.Button(
             filter_row,
+            text="複製 RETRY URL",
+            command=self._copy_retry_urls,
+            bg="#8E24AA",
+            fg="white",
+            padx=self._button_padx,
+            pady=self._ui_px(3),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(
+            filter_row,
+            text="複製 FAILED URL",
+            command=self._copy_failed_urls,
+            bg="#C62828",
+            fg="white",
+            padx=self._button_padx,
+            pady=self._ui_px(3),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(
+            filter_row,
             text="複製 MISSING URL",
             command=lambda: self._copy_status_urls("MISSING"),
             bg="#607D8B",
+            fg="white",
+            padx=self._button_padx,
+            pady=self._ui_px(3),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(
+            filter_row,
+            text="複製全部未成功",
+            command=self._copy_all_unsuccessful_urls,
+            bg="#AD1457",
             fg="white",
             padx=self._button_padx,
             pady=self._ui_px(3),

@@ -1,3 +1,4 @@
+# v12.13 Authenticated Short Video Carousel Best-Available Fix
 # v12.09 Exact Shortcode Structured Scan + Best-Available Image Gate
 # v12.08 Original CDN Variant Without Declared-Size Gate
 # v12.07 Structured Original CDN Variant Fallback
@@ -4793,10 +4794,6 @@ def _validate_downloaded_media_type(path: str, item: dict) -> tuple[bool, str]:
             return False, (
                 f"影片下載結果不是 MP4，而是 {real_ext or 'unknown'}"
             )
-        if size < 100 * 1024:
-            return False, (
-                f"影片檔案過小，疑似封面或殘片：{size} bytes"
-            )
         try:
             with open(path, "rb") as fh:
                 body = fh.read()
@@ -4804,6 +4801,24 @@ def _validate_downloaded_media_type(path: str, item: dict) -> tuple[bool, str]:
                 return False, "影片不是完整可播放 MP4"
         except Exception as e:
             return False, f"影片完整性驗證失敗：{e}"
+
+        if size < 100 * 1024:
+            authenticated_best_available = bool(
+                item.get("from") == "authenticated-structured-json"
+                and item.get("_target_shortcode")
+                and item.get("_carousel_slide_index")
+                and size >= 60 * 1024
+            )
+            if not authenticated_best_available:
+                return False, (
+                    f"影片檔案過小，疑似封面或殘片：{size} bytes"
+                )
+
+            logger.info(
+                f"IG authenticated best-available short video accepted: "
+                f"slide={item.get('_carousel_slide_index')}, bytes={size}"
+            )
+
         return True, ""
 
     if real_ext == ".mp4":

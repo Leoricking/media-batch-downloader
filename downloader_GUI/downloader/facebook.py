@@ -1,3 +1,4 @@
+# v11.93 FB Scoped Manifest Expected-Count Fix
 import hashlib
 import html
 import os
@@ -7,7 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
-from urllib.parse import urlparse, unquote, parse_qs, urlencode
+from urllib.parse import urlparse, unquote, parse_qs, parse_qsl, urlencode, urlunparse
 
 import requests
 import yt_dlp
@@ -42,6 +43,11 @@ from utils.filename import safe_title
 from utils.logger import get_logger
 
 try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+try:
     from opencc import OpenCC
 except Exception:
     OpenCC = None
@@ -54,6 +60,11 @@ except Exception:
     load_netscape_cookies_to_playwright = None
 
 # v11.91 Reel Exact-Scope Fix: visible active-video only + canonical reel lock + correct caption title
+# v11.98 FB Full-Gallery Best-Available Source Completion
+# v11.97 FB High-Resolution CDN Variant Retry + No False SUCCESS
+# v11.96 Plus-N Full Gallery Count + High-Resolution Output Gate
+# v11.95 Playwright Request content_type Scope Fix
+# v11.94 Scoped Best-Available Small Image Guard: allow verified 18-20KB still images only
 # v11.92 Reel Title-Only Fix: restore proven Reel download path + caption filename
 
 _cc = OpenCC("s2t") if OpenCC else None
@@ -62,6 +73,17 @@ _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
 _DL_TIMEOUT = 900
 _MAX_FB_ITEMS = 40
 _MIN_FILE_SIZE = 20 * 1024
+# v11.94:
+# Facebook photo posts can serve one real post-scoped PNG/JPG just under 20KB.
+# Keep the normal 20KB guard, but allow only verified still-image bytes >=18KB.
+_FB_BEST_AVAILABLE_IMAGE_MIN_SIZE = 18 * 1024
+# v11.99:
+# In exact +N full-gallery mode, one real FB CDN source can be ~15KB.  Allow it
+# only after count-proven full-gallery collection, never as a normal fallback.
+_FB_FULL_GALLERY_SOURCE_MIN_SIZE = 14 * 1024
+# v11.96: photo-post outputs must not finalize 480px mosaic thumbnails as SUCCESS.
+_FB_MIN_OUTPUT_IMAGE_LONG_EDGE = 720
+_FB_MIN_OUTPUT_IMAGE_SHORT_EDGE = 400
 _PREFERRED_IMAGE_SIZE = 80 * 1024
 
 
@@ -805,6 +827,115 @@ def _media_quality_score(url: str) -> int:
     return score
 
 
+
+def _normalized_exact_fb_media_url(src: str) -> str:
+    try:
+        parsed = urlparse(html.unescape(unquote(str(src or "").strip())))
+        return urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                "",
+                parsed.query,
+                "",
+            )
+        )
+    except Exception:
+        return str(src or "").strip()
+
+
+def _build_fb_highres_image_url_variants(src: str) -> list[str]:
+    """Build conservative same-image FB CDN variants for high-res retry.
+
+    Facebook gallery/viewer can expose only a 480px transformed URL first.
+    Generated variants are never trusted blindly; they must pass the existing
+    real-byte resolution, type and completeness gates before final output.
+    """
+    raw = html.unescape(unquote(str(src or "").strip()))
+    if not raw or not _looks_like_real_fb_media_url(raw):
+        return []
+
+    low = raw.lower()
+    if any(x in low for x in [".mp4", ".m4v", ".mov"]):
+        return []
+
+    try:
+        parsed = urlparse(raw)
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    except Exception:
+        return []
+
+    variants = []
+    seen = {_normalized_exact_fb_media_url(raw)}
+
+    def emit(new_pairs):
+        try:
+            candidate = urlunparse(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    parsed.params,
+                    urlencode(new_pairs, doseq=True),
+                    parsed.fragment,
+                )
+            )
+        except Exception:
+            return
+
+        key = _normalized_exact_fb_media_url(candidate)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        variants.append(candidate)
+
+    if any(key.lower() == "stp" for key, _value in pairs):
+        for target_stp in [
+            "dst-jpg_s2048x2048_tt6",
+            "dst-jpg_s1440x1440_tt6",
+            "dst-jpg_s1080x1080_tt6",
+            "dst-jpg_p960x960_tt6",
+            "dst-jpg_p720x720_tt6",
+        ]:
+            emit([
+                (key, target_stp if key.lower() == "stp" else value)
+                for key, value in pairs
+            ])
+
+        emit([(key, value) for key, value in pairs if key.lower() != "stp"])
+        emit([
+            (key, value)
+            for key, value in pairs
+            if key.lower() not in {"stp", "c"}
+        ])
+
+    return variants
+
+
+def _expand_fb_candidate_highres_variants(items: list[dict]) -> list[dict]:
+    expanded = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            expanded.append(item)
+            continue
+
+        expanded.append(item)
+        src = item.get("src", "")
+        if item.get("type") == "video" or any(x in str(src).lower() for x in [".mp4", ".m4v", ".mov"]):
+            continue
+
+        for order, variant in enumerate(_build_fb_highres_image_url_variants(src), 1):
+            clone = dict(item)
+            clone["src"] = variant
+            clone["score"] = int(item.get("score") or 0) + 800000 - order
+            clone["_variant_of"] = src
+            clone["_variant_reason"] = "fb-highres-cdn-transform"
+            expanded.append(clone)
+
+    return expanded
+
+
 def _dedupe_ordered(items):
     out = []
     seen = set()
@@ -829,9 +960,15 @@ def _dedupe_ordered(items):
         if not _looks_like_real_fb_media_url(src):
             continue
 
-        path = urlparse(src.split("?")[0]).path
-        basename = os.path.basename(path)
-        key = basename or src[:180]
+        is_video = item.get("type") == "video" or any(
+            x in src.lower() for x in [".mp4", ".m4v", ".mov"]
+        )
+        if is_video:
+            path = urlparse(src.split("?")[0]).path
+            basename = os.path.basename(path)
+            key = basename or src[:180]
+        else:
+            key = _normalized_exact_fb_media_url(src)
 
         if key in seen:
             continue
@@ -877,7 +1014,87 @@ def _ext_from_url(url: str, default_ext=".jpg"):
     return default_ext
 
 
-def _download_with_playwright_request(context, url: str, dst: str, referer: str):
+
+def _is_valid_fb_still_image_body(body: bytes, media_url: str = "", content_type: str = "") -> bool:
+    """Return True for real JPG/PNG/WEBP image bytes only."""
+    if not body:
+        return False
+
+    ct = (content_type or "").lower()
+    low = (media_url or "").lower()
+    head = body[:32]
+
+    if any(x in low for x in [".mp4", ".m4v", ".mov", "video"]):
+        return False
+    if ct.startswith("video/"):
+        return False
+    if "text/html" in ct or "application/json" in ct:
+        return False
+
+    return bool(
+        head.startswith(b"\xff\xd8\xff")
+        or head.startswith(b"\x89PNG\r\n\x1a\n")
+        or (head.startswith(b"RIFF") and b"WEBP" in head[:16])
+        or ct.startswith("image/")
+    )
+
+
+def _is_verified_best_available_fb_image(
+    body: bytes,
+    media_url: str = "",
+    content_type: str = "",
+    *,
+    size: int | None = None,
+) -> bool:
+    """Narrow allowance for real post-scoped still images just under 20KB."""
+    actual_size = int(size if size is not None else (len(body) if body else 0))
+
+    if actual_size < _FB_BEST_AVAILABLE_IMAGE_MIN_SIZE:
+        return False
+    if not _looks_like_real_fb_media_url(media_url):
+        return False
+    if _is_probable_fb_thumbnail_url(media_url):
+        return False
+
+    return _is_valid_fb_still_image_body(
+        body,
+        media_url=media_url,
+        content_type=content_type,
+    )
+
+
+def _is_verified_best_available_fb_image_file(path: str, media_url: str = "") -> bool:
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except Exception:
+        return False
+
+    if size < _FB_BEST_AVAILABLE_IMAGE_MIN_SIZE:
+        return False
+
+    if not _is_valid_fb_still_image_body(
+        head,
+        media_url=media_url or path,
+        content_type="image/unknown",
+    ):
+        return False
+
+    low_res, _reason = _is_low_resolution_fb_output(path, media_url)
+    if low_res:
+        return False
+
+    return True
+
+
+def _download_with_playwright_request(
+    context,
+    url: str,
+    dst: str,
+    referer: str,
+    allow_full_gallery_source: bool = False,
+):
     headers = {
         "Referer": referer,
         "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
@@ -893,10 +1110,47 @@ def _download_with_playwright_request(context, url: str, dst: str, referer: str)
     if not resp.ok:
         raise Exception(f"Playwright request failed: HTTP {resp.status}")
 
+    headers = resp.headers or {}
+    content_type = (
+        headers.get("content-type", "")
+        or headers.get("Content-Type", "")
+        or ""
+    )
+
     body = resp.body()
 
     if not body or len(body) < _MIN_FILE_SIZE:
-        raise Exception(f"Playwright request 檔案過小: {len(body) if body else 0} bytes")
+        if _is_verified_best_available_fb_image(
+            body,
+            media_url=url,
+            content_type=content_type,
+        ):
+            logger.info(
+                f"FB best-available scoped image accepted below 20KB: "
+                f"{len(body)} bytes | {os.path.basename(urlparse(str(url).split('?')[0]).path)}"
+            )
+        elif (
+            allow_full_gallery_source
+            and body
+            and len(body) >= _FB_FULL_GALLERY_SOURCE_MIN_SIZE
+            and _looks_like_real_fb_media_url(url)
+            and _is_valid_fb_still_image_body(
+                body,
+                media_url=url,
+                content_type=content_type,
+            )
+        ):
+            # v12.00:
+            # Exact +N full-gallery mode has already proven the complete post
+            # sequence.  Facebook may expose the final valid source with
+            # thumbnail-like transform params, so do not reject it by URL shape
+            # alone. The real bytes still pass image header and dimension checks.
+            logger.info(
+                f"FB full-gallery exact-count source accepted after high-res failed: "
+                f"{len(body)} bytes | {os.path.basename(urlparse(str(url).split('?')[0]).path)}"
+            )
+        else:
+            raise Exception(f"Playwright request 檔案過小: {len(body) if body else 0} bytes")
 
     with open(dst, "wb") as f:
         f.write(body)
@@ -904,7 +1158,79 @@ def _download_with_playwright_request(context, url: str, dst: str, referer: str)
     return len(body)
 
 
+
+def _get_image_dimensions(path: str) -> tuple[int, int]:
+    if Image is None:
+        return 0, 0
+    try:
+        with Image.open(path) as img:
+            return int(img.width or 0), int(img.height or 0)
+    except Exception:
+        return 0, 0
+
+
+def _is_low_resolution_fb_output(path: str, src: str = "") -> tuple[bool, str]:
+    """Reject clear Facebook mosaic/thumbnail still images before final output."""
+    ext = os.path.splitext(path or "")[1].lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return False, ""
+
+    w, h = _get_image_dimensions(path)
+    if not w or not h:
+        return False, ""
+
+    if max(w, h) < _FB_MIN_OUTPUT_IMAGE_LONG_EDGE or min(w, h) < _FB_MIN_OUTPUT_IMAGE_SHORT_EDGE:
+        return True, f"FB 圖片解析度過低：actual={w}x{h}"
+
+    return False, ""
+
+
+def _is_verified_fb_best_available_source_file(path: str, src: str = "") -> tuple[bool, str]:
+    """Accept a real low-res file only as full-gallery best available source.
+
+    This is intentionally NOT a general thumbnail bypass. It is used only after
+    +N full-gallery collection has already proven the expected item count, while
+    high-resolution CDN variants failed by 403 or by the normal resolution gate.
+    """
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+
+    if size < _FB_FULL_GALLERY_SOURCE_MIN_SIZE:
+        return False, f"best-available 檔案過小: {size} bytes"
+
+    if not _looks_like_real_fb_media_url(src):
+        return False, "不是可信 Facebook CDN 圖片"
+
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except Exception:
+        return False, "無法讀取圖片檔頭"
+
+    if not _is_valid_fb_still_image_body(
+        head,
+        media_url=src or path,
+        content_type="image/unknown",
+    ):
+        return False, "不是有效 JPG/PNG/WEBP 圖片"
+
+    w, h = _get_image_dimensions(path)
+    if not w or not h:
+        return False, "無法驗證圖片尺寸"
+
+    # Do not accept tiny UI thumbnails/icons.  480x320 is allowed only in the
+    # exact full-gallery best-available path because some FB meme/anime uploads
+    # are genuinely stored at that size.
+    if max(w, h) < 480 or min(w, h) < 300:
+        return False, f"best-available 尺寸仍過小: actual={w}x{h}"
+
+    return True, f"actual={w}x{h}, bytes={size}"
+
+
 def _download_best_candidate(context, candidates, dst_base: str, referer: str):
+    candidates = _expand_fb_candidate_highres_variants(candidates)
     candidates = _dedupe_ordered(candidates)
 
     if not candidates:
@@ -943,16 +1269,63 @@ def _download_best_candidate(context, candidates, dst_base: str, referer: str):
                 shutil.copy2(temp_path, tmp)
                 size = os.path.getsize(tmp)
                 if size < _MIN_FILE_SIZE:
-                    raise Exception(f"persisted 檔案過小: {size} bytes")
+                    best_ok = False
+                    best_reason = ""
+                    if item.get("_allow_fb_best_available_source"):
+                        best_ok, best_reason = _is_verified_fb_best_available_source_file(tmp, src)
+                    if best_ok:
+                        logger.info(
+                            f"FB verified full-gallery best-available persisted source accepted: "
+                            f"{best_reason} | {os.path.basename(temp_path)}"
+                        )
+                    elif _is_verified_best_available_fb_image_file(tmp, src):
+                        logger.info(
+                            f"FB best-available persisted image accepted below 20KB: "
+                            f"{size} bytes | {os.path.basename(temp_path)}"
+                        )
+                    else:
+                        raise Exception(f"persisted 檔案過小: {size} bytes")
             else:
                 size = _download_with_playwright_request(
                     context,
                     src,
                     tmp,
                     referer=referer,
+                    allow_full_gallery_source=bool(
+                        item.get("_allow_fb_best_available_source")
+                    ),
                 )
 
+            low_res, low_res_reason = _is_low_resolution_fb_output(tmp, src)
+            if low_res:
+                best_ok = False
+                best_reason = ""
+                if item.get("_allow_fb_best_available_source"):
+                    best_ok, best_reason = _is_verified_fb_best_available_source_file(tmp, src)
+                if best_ok:
+                    logger.info(
+                        f"FB verified full-gallery best-available source accepted: "
+                        f"{best_reason}; high-res variants unavailable; exact-count full-gallery source"
+                    )
+                else:
+                    raise Exception(low_res_reason)
+
             if size > best_size:
+                if item.get("_variant_reason"):
+                    w, h = _get_image_dimensions(tmp)
+                    if max(w, h) >= _FB_MIN_OUTPUT_IMAGE_LONG_EDGE and min(w, h) >= _FB_MIN_OUTPUT_IMAGE_SHORT_EDGE:
+                        logger.info(
+                            f"FB high-res CDN variant accepted: "
+                            f"{os.path.basename(urlparse(str(src).split('?')[0]).path)}, "
+                            f"actual={w}x{h}, bytes={size}"
+                        )
+                    else:
+                        logger.info(
+                            f"FB CDN variant still low-res; using only if exact-count source mode allows it: "
+                            f"{os.path.basename(urlparse(str(src).split('?')[0]).path)}, "
+                            f"actual={w}x{h}, bytes={size}"
+                        )
+
                 if best_tmp and os.path.exists(best_tmp):
                     os.remove(best_tmp)
 
@@ -1039,7 +1412,7 @@ def _list_media_files(root_dir: str):
             except Exception:
                 size = 0
 
-            if size >= _MIN_FILE_SIZE:
+            if size >= _MIN_FILE_SIZE or _is_verified_best_available_fb_image_file(path):
                 out.append(path)
 
     out.sort(key=_natural_key)
@@ -1163,6 +1536,72 @@ def move_files(title: str) -> bool:
             shutil.move(src, dst)
 
         logger.info(f"FB 多檔完成: {name}/ ({len(files)} 個)")
+
+    _cleanup_fb_debug_capture()
+    clear_temp()
+    return True
+
+
+
+def move_files_ordered(title: str, ordered_files: list[str]) -> bool:
+    """Move exact full-gallery outputs in the same order they were written.
+
+    v12.01:
+    Normal move_files() re-scans TEMP_DIR and applies generic size filtering and
+    natural sorting. That breaks exact +N full-gallery mode because one proven
+    FB source can be around 15KB and the viewer order must be preserved.
+    """
+    files = []
+    seen = set()
+    for path in ordered_files or []:
+        if not path or not os.path.exists(path):
+            continue
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        try:
+            if os.path.getsize(path) <= 0:
+                continue
+        except Exception:
+            continue
+        files.append(path)
+
+    if not files:
+        return False
+
+    name = _clean_fb_post_title_for_path(title, fallback="Facebook_Post")
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    video_exts = {".mp4", ".m4v", ".mov"}
+
+    if len(files) == 1:
+        src = files[0]
+        ext = os.path.splitext(src)[1].lower()
+        final_ext = ".mp4" if ext in video_exts else ".jpg"
+        dst = os.path.join(DOWNLOAD_DIR, f"{name}{final_ext}")
+        if os.path.exists(dst):
+            os.remove(dst)
+        shutil.move(src, dst)
+        logger.info(f"FB ordered 單檔完成: {os.path.basename(dst)}")
+    else:
+        folder = os.path.join(DOWNLOAD_DIR, name)
+        if os.path.exists(folder):
+            shutil.rmtree(folder, ignore_errors=True)
+        os.makedirs(folder, exist_ok=True)
+
+        for i, src in enumerate(files, 1):
+            ext = os.path.splitext(src)[1].lower()
+            final_ext = ".mp4" if ext in video_exts else ".jpg"
+            if FB_FILENAME_WITH_TITLE:
+                file_title = name[:70].strip(" ._-，,。") or "Facebook_Post"
+                dst = os.path.join(folder, f"{i:03d}_{file_title}{final_ext}")
+            else:
+                dst = os.path.join(folder, f"{i}{final_ext}")
+            if os.path.exists(dst):
+                os.remove(dst)
+            shutil.move(src, dst)
+
+        logger.info(f"FB ordered 多檔完成: {name}/ ({len(files)} 個)")
 
     _cleanup_fb_debug_capture()
     clear_temp()
@@ -3918,6 +4357,7 @@ def _pack_primary_candidates(pack: dict) -> list[dict]:
                 "type": pack.get("type") or _media_type_from_url(primary_src),
                 "src": primary_src,
                 "score": int(pack.get("score") or 0),
+                "_allow_fb_best_available_source": bool(pack.get("_allow_fb_best_available_source")),
             }]
         return []
 
@@ -3933,7 +4373,10 @@ def _pack_primary_candidates(pack: dict) -> list[dict]:
         key = _media_key_from_src(src)
         if key != primary_key:
             continue
-        dedupe_key = src.split("?")[0]
+        if cand.get("type") == "video" or any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]):
+            dedupe_key = src.split("?")[0]
+        else:
+            dedupe_key = _normalized_exact_fb_media_url(src)
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
@@ -3949,6 +4392,7 @@ def _pack_primary_candidates(pack: dict) -> list[dict]:
             "type": pack.get("type") or _media_type_from_url(primary_src),
             "src": primary_src,
             "score": int(pack.get("score") or 0),
+            "_allow_fb_best_available_source": bool(pack.get("_allow_fb_best_available_source")),
         }]
 
     return candidates[:1]
@@ -3963,6 +4407,7 @@ def _download_viewer_items(context, viewer_items, referer: str):
       the same fb_0008/fb_0011 image again.
     """
     success_count = 0
+    ordered_output_files = []
     seen_hashes = set()
     seen_media_keys = set()
 
@@ -4009,6 +4454,7 @@ def _download_viewer_items(context, viewer_items, referer: str):
                 )
 
             success_count += 1
+            ordered_output_files.append(final_dst)
             logger.info(
                 f"FB 已下載輸出第 {success_count} 張: {os.path.basename(final_dst)} "
                 f"({size} bytes) primary={primary_key}"
@@ -4018,7 +4464,7 @@ def _download_viewer_items(context, viewer_items, referer: str):
             logger.warning(f"FB 候選第 {attempt_i} 張下載失敗: {e}")
 
     logger.info(f"FB unique output media count={success_count}")
-    return success_count
+    return success_count, ordered_output_files
 
 def _media_key_from_src(src: str) -> str:
     if not src:
@@ -4709,6 +5155,37 @@ def _collect_fb_media_playwright(url: str):
             if manifest_ids:
                 logger.info(f"FB v11.17 manifest whitelist ids={len(manifest_ids)}")
 
+            # v11.93 scoped manifest target correction:
+            # In logged-in /share/ photo posts Facebook may show a +N overlay from
+            # a mixed viewer/recommendation context, while exact set=pcb scoped
+            # links/grid/manifest all prove the real target post contains fewer
+            # photos.  In that narrow case, use the exact post manifest count as
+            # the completeness target instead of retrying forever at +N.
+            try:
+                scoped_manifest_count = len(manifest_ids or [])
+                scoped_link_count = len(link_items or [])
+                if (
+                    expected_photo_count
+                    and plus_count_before
+                    and int(plus_count_before) <= 1
+                    and dominant_pcb_key
+                    and scoped_manifest_count >= 3
+                    and scoped_manifest_count == scoped_link_count
+                    and int(expected_photo_count) > scoped_manifest_count
+                    and len(ordered_links or []) <= scoped_manifest_count + 1
+                    and len(ordered_grid_items or []) <= scoped_manifest_count + 2
+                ):
+                    logger.info(
+                        "FB v11.93 corrected +N mixed-context target by scoped manifest: "
+                        f"expected {expected_photo_count}->{scoped_manifest_count}, "
+                        f"plus={plus_count_before}, links={len(ordered_links or [])}, "
+                        f"grid={len(ordered_grid_items or [])}, manifest={scoped_manifest_count}, "
+                        f"pcb={dominant_pcb_key}"
+                    )
+                    expected_photo_count = scoped_manifest_count
+            except Exception as _e:
+                logger.debug(f"FB v11.93 scoped manifest target correction skipped: {_e}")
+
             # v11.47 scoped ghost-link correction:
             # Some /share/ posts expose one extra set=pcb link that points to the post
             # container rather than a fourth photo.  In the failing 18uZbg4XsQ case,
@@ -4926,12 +5403,24 @@ def _collect_fb_media_playwright(url: str):
             if not dominant_cluster:
                 dominant_cluster = _dominant_media_cluster(viewer_items, min_count=3)
 
-            if dominant_cluster or manifest_ids:
+            manifest_ids_for_filter = list(manifest_ids or [])
+            if (
+                plus_count_before
+                and expected_photo_count
+                and len(manifest_ids_for_filter) < int(expected_photo_count)
+            ):
+                logger.info(
+                    f"FB v11.96 +N full-gallery mode: keep viewer items beyond manifest "
+                    f"manifest={len(manifest_ids_for_filter)}, expected={expected_photo_count}"
+                )
+                manifest_ids_for_filter = []
+
+            if dominant_cluster or manifest_ids_for_filter:
                 before_cluster_n = len(viewer_items)
                 filtered_by_cluster = _filter_items_by_media_cluster_or_manifest(
                     viewer_items,
                     dominant_cluster,
-                    manifest_ids=manifest_ids,
+                    manifest_ids=manifest_ids_for_filter,
                 )
                 # In post-scoped mode, prefer correctness over quantity.
                 # It is better to output 15 correct images than 16 with one recommendation/ad.
@@ -4953,15 +5442,29 @@ def _collect_fb_media_playwright(url: str):
                         f"FB v11.16 photo-only cleanup: items {before_photo_clean_n}->{len(viewer_items)}"
                     )
 
-                before_sort_keys = [
-                    _fb_media_numeric_id_from_src(p.get("src") or "") for p in viewer_items
-                ]
-                viewer_items = _sort_items_by_manifest_then_media_id(viewer_items, manifest_ids=manifest_ids)
-                after_sort_keys = [
-                    _fb_media_numeric_id_from_src(p.get("src") or "") for p in viewer_items
-                ]
-                if before_sort_keys != after_sort_keys:
-                    logger.info("FB v11.17 manifest/order sort applied by post manifest + media id")
+                if (
+                    plus_count_before
+                    and expected_photo_count
+                    and 'manifest_ids_for_filter' in locals()
+                    and not manifest_ids_for_filter
+                ):
+                    logger.info(
+                        "FB v12.01 +N full-gallery mode: preserve viewer sequence order; "
+                        "skip manifest/media-id sort because manifest is incomplete"
+                    )
+                else:
+                    before_sort_keys = [
+                        _fb_media_numeric_id_from_src(p.get("src") or "") for p in viewer_items
+                    ]
+                    viewer_items = _sort_items_by_manifest_then_media_id(
+                        viewer_items,
+                        manifest_ids=manifest_ids_for_filter if 'manifest_ids_for_filter' in locals() else manifest_ids,
+                    )
+                    after_sort_keys = [
+                        _fb_media_numeric_id_from_src(p.get("src") or "") for p in viewer_items
+                    ]
+                    if before_sort_keys != after_sort_keys:
+                        logger.info("FB v11.17 manifest/order sort applied by post manifest + media id")
 
                 before_dedupe_n = len(viewer_items)
                 viewer_items = _dedupe_items_by_media_id(viewer_items)
@@ -5002,16 +5505,41 @@ def _collect_fb_media_playwright(url: str):
 
             logger.info(f"FB filtered media count={len(viewer_items)}")
 
+            if (
+                plus_count_before
+                and expected_photo_count
+                and int(expected_photo_count) > 1
+                and len(viewer_items) >= int(expected_photo_count)
+            ):
+                logger.info(
+                    f"FB v11.98 full-gallery best-available source mode enabled: "
+                    f"items={len(viewer_items)}, expected={expected_photo_count}; "
+                    "high-res variants are still tried first"
+                )
+                for _pack in viewer_items:
+                    try:
+                        _pack["_allow_fb_best_available_source"] = True
+                        for _cand in (_pack.get("candidates") or []):
+                            if isinstance(_cand, dict):
+                                _cand["_allow_fb_best_available_source"] = True
+                    except Exception:
+                        pass
+
             if not viewer_items:
                 return "FAILED", "Facebook Playwright 頁面已開啟，但未抓到有效貼文主媒體"
 
-            success_count = _download_viewer_items(
+            success_count, ordered_output_files = _download_viewer_items(
                 context,
                 viewer_items,
                 referer=resolved,
             )
 
             if success_count <= 0:
+                if expected_photo_count and expected_photo_count > 1:
+                    return "RETRY", (
+                        "Facebook gallery candidates were collected but all failed "
+                        "resolution/download validation; retry fresh context"
+                    )
                 return "FAILED", "Facebook Playwright 有抓到媒體 URL，但全部下載失敗"
 
             # v11.23.2 Strict Completeness Guard:
@@ -5025,6 +5553,14 @@ def _collect_fb_media_playwright(url: str):
                 )
                 clear_temp()
                 return "RETRY", f"Facebook gallery incomplete {success_count}/{expected_photo_count}; retry fresh context"
+
+            if expected_photo_count and success_count >= expected_photo_count and ordered_output_files:
+                logger.info(
+                    f"FB v12.02 ordered move exact-count completion: "
+                    f"outputs={len(ordered_output_files)}, expected={expected_photo_count}"
+                )
+                if move_files_ordered(title, ordered_output_files):
+                    return "SUCCESS", ""
 
             if move_files(title):
                 return "SUCCESS", ""
