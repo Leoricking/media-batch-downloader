@@ -1,3 +1,5 @@
+# v12.06 Reel Blob Exact yt-dlp Fallback Fix
+# v12.05 Reel Active Video Only Fix
 # v12.04 Watch Fast yt-dlp Route + Anti-Hang Timeout
 # v12.03 Watch Video Route Fix: keep /watch/?v= out of photo-gallery pipeline
 # v11.93 FB Scoped Manifest Expected-Count Fix
@@ -202,6 +204,13 @@ def _extract_fb_reel_or_share_id(url: str) -> str:
     return ""
 
 
+
+def _canonical_fb_reel_url_from_id(reel_id: str, fallback_url: str = "") -> str:
+    reel_id = str(reel_id or "").strip()
+    if reel_id and reel_id.isdigit():
+        return f"https://www.facebook.com/reel/{reel_id}/"
+    return fallback_url or ""
+
 def _fb_reel_fallback_title(url: str) -> str:
     rid = _extract_fb_reel_or_share_id(url)
     return f"Facebook_Reel_{rid}" if rid else "Facebook_Reel"
@@ -326,11 +335,17 @@ def _get_active_fb_reel_video_candidates(page) -> list[dict]:
           const v=videos[0].v;
           const urls=[];
           const add=(u,score) => { u=(u||'').trim(); if(u && !u.startsWith('blob:')) urls.push({src:u,type:'video',score}); };
-          add(v.currentSrc||'', 10000000);
-          add(v.src||'', 9900000);
-          add(v.getAttribute('src')||'', 9800000);
-          for (const s of v.querySelectorAll('source[src]')) add(s.src||s.getAttribute('src')||'', 9700000);
-          return urls;
+          const rect = {
+            left: Math.round(v.getBoundingClientRect().left),
+            top: Math.round(v.getBoundingClientRect().top),
+            width: Math.round(v.getBoundingClientRect().width),
+            height: Math.round(v.getBoundingClientRect().height)
+        };
+        add(v.currentSrc||'', 10000000);
+        add(v.src||'', 9900000);
+        add(v.getAttribute('src')||'', 9800000);
+        for (const s of v.querySelectorAll('source[src]')) add(s.src||s.getAttribute('src')||'', 9700000);
+        return urls.map(x => ({...x, rect}));
         }
         """) or []
     except Exception:
@@ -342,7 +357,14 @@ def _get_active_fb_reel_video_candidates(page) -> list[dict]:
             continue
         if not any(x in src.lower() for x in ['.mp4','.m4v','.mov','video']):
             continue
-        out.append({'type':'video','src':src,'score':int(item.get('score') or 0)+_media_quality_score(src)})
+        out.append({
+            'type': 'video',
+            'src': src,
+            'score': int(item.get('score') or 0) + _media_quality_score(src),
+            'reason': 'active-visible-video-element',
+            'page_url': getattr(page, 'url', ''),
+            '_active_video_rect': item.get('rect') or {},
+        })
     return _dedupe_ordered(out)
 
 
@@ -5025,36 +5047,53 @@ def _collect_fb_media_playwright(url: str):
                     except Exception:
                         pass
 
-                    # Keep the proven pre-v11.91 collection path. It can use the browser
-                    # network/meta/html candidates even when the visible video src is blob:.
-                    reel_candidates = _collect_current_page_candidates(
-                        page,
-                        network_items=network_items,
-                        include_network=True,
-                        include_meta=True,
-                        include_html=True,
-                    )
+                    # v12.05:
+                    # Reels preload sibling/recommended videos.  The title/caption can
+                    # be correct while the old document-wide network candidate list
+                    # downloads another video.  For explicit Reel URLs, use only the
+                    # largest visible active <video> element.  If Facebook exposes only
+                    # blob: without a direct currentSrc/source URL, return RETRY instead
+                    # of falling back to full-page candidates and risking a wrong file.
+                    video_candidates = _get_active_fb_reel_video_candidates(page)
 
-                    video_candidates = []
-                    for cand in reel_candidates:
-                        src = cand.get("src") or ""
-                        if cand.get("type") == "video" or _is_probably_video_url(src) or any(
-                            x in src.lower() for x in [".mp4", ".m4v", ".mov"]
-                        ):
-                            c2 = dict(cand)
-                            c2["type"] = "video"
-                            c2["score"] = int(c2.get("score") or 0) + 3000000
-                            video_candidates.append(c2)
-
-                    video_candidates = _dedupe_ordered(video_candidates)
                     logger.info(
-                        f"FB Reel video candidate count={len(video_candidates)} "
-                        f"from total={len(reel_candidates)}; title={reel_title}"
+                        f"FB Reel active-video candidate count={len(video_candidates)}; "
+                        f"title={reel_title}; page={page.url}"
                     )
 
                     if not video_candidates:
+                        # v12.06:
+                        # The active <video> is often blob: only, so no direct
+                        # currentSrc/source URL is exposed.  Do not go back to
+                        # full-page network candidates because that caused
+                        # sibling/recommended Reel downloads.  Instead, fall
+                        # back only to yt-dlp with the exact canonical Reel ID.
+                        exact_reel_id = (
+                            _extract_fb_reel_or_share_id(url)
+                            or _extract_fb_reel_or_share_id(resolved)
+                            or observed_reel_id
+                        )
+                        exact_reel_url = _canonical_fb_reel_url_from_id(
+                            exact_reel_id,
+                            fallback_url=resolved,
+                        )
+                        logger.info(
+                            f"FB Reel active video is blob-only; try exact yt-dlp fallback: "
+                            f"target={exact_reel_id or '-'}, url={exact_reel_url}"
+                        )
+
+                        status_y, error_y = _download_via_ytdlp(
+                            exact_reel_url,
+                            watch_fast=True,
+                        )
+                        if status_y == "SUCCESS":
+                            return "SUCCESS", ""
+
                         clear_temp()
-                        return "RETRY", "Facebook Reel 未擷取到有效影片候選，避免誤存封面圖為 jpg"
+                        return "RETRY", (
+                            "Facebook Reel active video source not exposed and "
+                            f"exact yt-dlp fallback did not complete: {error_y}"
+                        )
 
                     final_dst, size = _download_best_candidate(
                         context,
@@ -5063,7 +5102,7 @@ def _collect_fb_media_playwright(url: str):
                         referer=resolved,
                     )
                     logger.info(
-                        f"FB Reel 主影片已下載: {os.path.basename(final_dst)} "
+                        f"FB Reel active 主影片已下載: {os.path.basename(final_dst)} "
                         f"({size // 1024} KB)"
                     )
 
@@ -5672,7 +5711,7 @@ def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
 
         if elapsed > _FB_WATCH_YTDLP_MAX_SECONDS:
             raise Exception(
-                f"FB watch yt-dlp download timeout after {int(elapsed)}s; "
+                f"FB video yt-dlp download timeout after {int(elapsed)}s; "
                 f"downloaded={downloaded} bytes"
             )
 
@@ -5680,13 +5719,13 @@ def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
             avg = downloaded / max(1.0, elapsed)
             if avg < _FB_WATCH_YTDLP_MIN_BYTES_PER_SEC:
                 raise Exception(
-                    f"FB watch yt-dlp too slow: avg={int(avg)} B/s, "
+                    f"FB video yt-dlp too slow: avg={int(avg)} B/s, "
                     f"downloaded={downloaded} bytes"
                 )
 
         if elapsed > 75 and now - last_hook_at > 35:
             raise Exception(
-                f"FB watch yt-dlp stalled: no progress for {int(now - last_hook_at)}s"
+                f"FB video yt-dlp stalled: no progress for {int(now - last_hook_at)}s"
             )
 
     for extra in variants:
