@@ -1,3 +1,5 @@
+# v12.04 Watch Fast yt-dlp Route + Anti-Hang Timeout
+# v12.03 Watch Video Route Fix: keep /watch/?v= out of photo-gallery pipeline
 # v11.93 FB Scoped Manifest Expected-Count Fix
 import hashlib
 import html
@@ -71,6 +73,11 @@ _cc = OpenCC("s2t") if OpenCC else None
 
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
 _DL_TIMEOUT = 900
+# v12.04:
+# /watch/?v= tasks should not spend 15+ minutes in Playwright deep scans or
+# unbounded slow yt-dlp downloads. Use a bounded single-video guard.
+_FB_WATCH_YTDLP_MAX_SECONDS = 240
+_FB_WATCH_YTDLP_MIN_BYTES_PER_SEC = 8 * 1024
 _MAX_FB_ITEMS = 40
 _MIN_FILE_SIZE = 20 * 1024
 # v11.94:
@@ -143,6 +150,28 @@ def _is_fb_reel_url(url: str) -> bool:
         "/watch/reel/",
         "fb.watch/",
     ])
+
+
+def _is_fb_watch_video_url(url: str) -> bool:
+    """Detect normal Facebook Watch/video URLs.
+
+    v12.03:
+    /watch/?v=<id> is a single video task, not a photo gallery.  It must not
+    enter the photo-link / +N completeness pipeline, because logged-in Facebook
+    pages can expose login_alert/photo links near the video and make the task
+    look like a 3-photo gallery.
+    """
+    low = (url or "").lower()
+    return bool(
+        "/watch/?v=" in low
+        or "/watch?v=" in low
+        or "/videos/" in low
+        or "video.php" in low
+    )
+
+
+def _is_fb_video_like_url(url: str) -> bool:
+    return _is_fb_reel_url(url) or _is_fb_watch_video_url(url)
 
 
 def _extract_fb_reel_or_share_id(url: str) -> str:
@@ -4968,7 +4997,7 @@ def _collect_fb_media_playwright(url: str):
             # visible video element causes false RETRY even though network/meta candidates are
             # downloadable. The only behavioral change here is naming: prefer the active
             # Reel caption/title instead of the share URL token.
-            if _is_fb_reel_url(url) or _is_fb_reel_url(resolved) or _is_fb_reel_url(page.url):
+            if _is_fb_video_like_url(url) or _is_fb_video_like_url(resolved) or _is_fb_video_like_url(page.url):
                 observed_reel_id = _extract_canonical_fb_reel_id_from_page(page)
                 reel_fallback = _fb_reel_fallback_title(
                     f"https://www.facebook.com/reel/{observed_reel_id}/"
@@ -5584,7 +5613,14 @@ def _collect_fb_media_playwright(url: str):
             pass
 
 
-def _download_via_ytdlp(url: str):
+def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
+    """Download FB video through yt-dlp with an anti-hang watchdog.
+
+    v12.04:
+    Facebook Watch pages are single-video tasks.  A Watch download must not sit
+    in the queue for many minutes at very low throughput.  The watchdog returns
+    RETRY instead of appearing frozen.
+    """
     clear_temp()
     resolved = _resolve_share_url(url)
 
@@ -5592,39 +5628,84 @@ def _download_via_ytdlp(url: str):
 
     if ffmpeg_path:
         formats = [
-            "bestvideo+bestaudio/best",
+            "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
             "best",
         ]
     else:
         logger.warning("未找到 ffmpeg，FB yt-dlp 將使用單檔格式，避免合併失敗")
-
         formats = [
-            "best[ext=mp4]/best[protocol^=http]/best",
-            "mp4/best",
-            "best",
+            "best[ext=mp4][height<=720]/best[protocol^=http][height<=720]/best",
         ]
 
-    variants = []
+    if watch_fast:
+        formats = formats[:1]
 
+    variants = []
     if os.path.exists(COOKIES_FILE):
         variants.append({
             "cookiefile": os.path.abspath(COOKIES_FILE),
         })
-
-    variants.append({})
+    if not watch_fast:
+        variants.append({})
+    if not variants:
+        variants.append({})
 
     last_error = "未知錯誤"
+
+    import time as _time
+    started_at = _time.time()
+    last_bytes = 0
+    last_hook_at = started_at
+
+    def _anti_hang_hook(d):
+        nonlocal last_bytes, last_hook_at
+        if not watch_fast:
+            return
+
+        now = _time.time()
+        elapsed = now - started_at
+        downloaded = int(d.get("downloaded_bytes") or 0)
+
+        if downloaded > last_bytes:
+            last_bytes = downloaded
+            last_hook_at = now
+
+        if elapsed > _FB_WATCH_YTDLP_MAX_SECONDS:
+            raise Exception(
+                f"FB watch yt-dlp download timeout after {int(elapsed)}s; "
+                f"downloaded={downloaded} bytes"
+            )
+
+        if elapsed > 45 and downloaded > 0:
+            avg = downloaded / max(1.0, elapsed)
+            if avg < _FB_WATCH_YTDLP_MIN_BYTES_PER_SEC:
+                raise Exception(
+                    f"FB watch yt-dlp too slow: avg={int(avg)} B/s, "
+                    f"downloaded={downloaded} bytes"
+                )
+
+        if elapsed > 75 and now - last_hook_at > 35:
+            raise Exception(
+                f"FB watch yt-dlp stalled: no progress for {int(now - last_hook_at)}s"
+            )
 
     for extra in variants:
         for fmt in formats:
             try:
                 ydl_opts = {
-                    "quiet": True,
+                    "quiet": False if watch_fast else True,
                     "no_warnings": True,
                     "outtmpl": os.path.join(TEMP_DIR, "%(title).120s.%(ext)s"),
                     "overwrites": True,
-                    "noplaylist": False,
+                    "noplaylist": True if watch_fast else False,
                     "format": fmt,
+                    "socket_timeout": 20,
+                    "retries": 1 if watch_fast else 3,
+                    "fragment_retries": 1 if watch_fast else 3,
+                    "file_access_retries": 1,
+                    "continuedl": False if watch_fast else True,
+                    "nopart": False,
+                    "progress_hooks": [_anti_hang_hook],
                     "http_headers": {
                         "User-Agent": (
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -5642,6 +5723,11 @@ def _download_via_ytdlp(url: str):
 
                 ydl_opts.update(extra)
 
+                logger.info(
+                    f"FB yt-dlp start: watch_fast={watch_fast}, fmt={fmt}, "
+                    f"resolved={resolved}"
+                )
+
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(
                         resolved,
@@ -5650,7 +5736,7 @@ def _download_via_ytdlp(url: str):
 
                     fallback_title = (
                         _fb_reel_fallback_title(resolved)
-                        if (_is_fb_reel_url(url) or _is_fb_reel_url(resolved))
+                        if (_is_fb_video_like_url(url) or _is_fb_video_like_url(resolved))
                         else "Facebook_Post"
                     )
                     title = (
@@ -5668,7 +5754,11 @@ def _download_via_ytdlp(url: str):
                 last_error = str(e)
                 logger.warning(f"Facebook yt-dlp 失敗: {last_error}")
 
+                if watch_fast:
+                    return "RETRY", last_error
+
     return _classify_error(last_error)
+
 
 
 def download(url: str):
@@ -5686,6 +5776,7 @@ def download(url: str):
         # - Do NOT fall back to yt-dlp after an incomplete gallery RETRY, because that can
         #   incorrectly download an unrelated/sibling .mp4 and mark the photo task SUCCESS.
         is_reel_like_url = _is_fb_reel_url(original_low) or _is_fb_reel_url(resolved_low)
+        is_watch_video_url = _is_fb_watch_video_url(original_low) or _is_fb_watch_video_url(resolved_low)
 
         force_playwright_first = (
             any(x in original_low for x in [
@@ -5700,19 +5791,49 @@ def download(url: str):
             and not is_reel_like_url
         )
 
-        explicit_video_url = is_reel_like_url or any(x in original_low or x in resolved_low for x in [
-            "/watch",
-            "/videos/",
-            "video.php",
-            "/reel",
-            "/reels/",
-            "fb.watch",
-        ])
+        explicit_video_url = is_reel_like_url or is_watch_video_url or any(
+            (x in original_low) or (x in resolved_low)
+            for x in [
+                "/watch",
+                "/videos/",
+                "video.php",
+                "/reel",
+                "/reels/",
+                "fb.watch",
+            ]
+        )
 
         if explicit_video_url and not force_playwright_first:
-            # Exact-scope Reel safety: Playwright sees the active visible Reel and
-            # canonical identity. yt-dlp on share/v or Reel pages can resolve/preload
-            # a sibling video and return a false SUCCESS, so it is not used first.
+            # v12.04:
+            # Normal /watch/?v= is a single-video task.  Do not spend the first
+            # attempt in Playwright/gallery deep scan. Reels/share-v still keep
+            # Playwright-first because they are more prone to sibling pollution.
+            if is_watch_video_url and not is_reel_like_url:
+                status3, error3 = _download_via_ytdlp(resolved, watch_fast=True)
+                if status3 == "SUCCESS":
+                    result_box[0] = (status3, error3)
+                    return
+
+                logger.info(
+                    f"FB watch fast yt-dlp did not complete; try Playwright active-video fallback: {error3}"
+                )
+                status2, error2 = _collect_fb_media_playwright(resolved)
+                if status2 == "SUCCESS":
+                    result_box[0] = (status2, error2)
+                    return
+
+                final_status, _ = _classify_error(f"ytdlp={error3} | playwright={error2}")
+                if status2 in ("BLOCKED", "UNAVAILABLE"):
+                    final_status = status2
+                elif status3 == "RETRY" or status2 == "RETRY":
+                    final_status = "RETRY"
+
+                result_box[0] = (
+                    final_status,
+                    f"ytdlp={error3} | playwright={error2}",
+                )
+                return
+
             status2, error2 = _collect_fb_media_playwright(resolved)
 
             if status2 == "SUCCESS":
@@ -5766,13 +5887,19 @@ def download(url: str):
         daemon=True,
     )
 
+    task_timeout = (
+        min(_DL_TIMEOUT, _FB_WATCH_YTDLP_MAX_SECONDS + 90)
+        if _is_fb_watch_video_url(url)
+        else _DL_TIMEOUT
+    )
+
     t.start()
-    t.join(_DL_TIMEOUT)
+    t.join(task_timeout)
 
     if t.is_alive():
         logger.error(f"Facebook 下載超時: {url}")
         clear_temp()
-        return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
+        return "RETRY", f"下載超時 ({task_timeout}s)"
 
     result = result_box[0] or ("FAILED", "未知錯誤")
     status, reason = result

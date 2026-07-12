@@ -1,3 +1,5 @@
+# v12.16 Exact Structured Best-Available Marker Fix
+# v12.14 Exact Structured Child High-Resolution CDN Variant Retry
 # v12.13 Authenticated Short Video Carousel Best-Available Fix
 # v12.09 Exact Shortcode Structured Scan + Best-Available Image Gate
 # v12.08 Original CDN Variant Without Declared-Size Gate
@@ -103,6 +105,13 @@ _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
 _DL_TIMEOUT = 300
 _MAX_CAROUSEL_ITEMS = 40
 _MIN_FILE_SIZE = 5 * 1024
+# v12.16:
+# Exact authenticated structured carousel children sometimes expose only a
+# largest available image around 576x547 or 600x450 while all generated higher
+# CDN variants return 403.  Keep normal high-res rules for all other paths, but
+# allow this narrow exact-child best-available gate.
+_IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE = 540
+_IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE = 360
 
 _L = None
 _cookie_file = None
@@ -4511,11 +4520,20 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                 and abs(w - declared_w) <= max(4, int(declared_w * 0.03))
                 and abs(h - declared_h) <= max(4, int(declared_h * 0.03))
             )
+            url_low = str(item.get("src") or "").lower()
+            explicit_tiny_transform = bool(
+                re.search(r"(?:^|[_&?])s(?:240|320)x(?:240|320)", url_low)
+                or re.search(r"(?:^|[_&?])p(?:240|320)x(?:240|320)", url_low)
+                or "s150x150" in url_low
+                or "s100x100" in url_low
+                or "s64x64" in url_low
+            )
             acceptable_best_available = bool(
                 best_available
                 and declared_match
-                and max(w, h) >= 640
-                and min(w, h) >= 480
+                and not explicit_tiny_transform
+                and max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
+                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
             )
 
             if not acceptable_best_available:
@@ -4524,8 +4542,9 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                 )
 
             logger.info(
-                f"IG authenticated best-available image accepted: "
-                f"actual={w}x{h}, declared={declared_w}x{declared_h}"
+                f"IG exact structured best-available image accepted: "
+                f"actual={w}x{h}, declared={declared_w}x{declared_h}, "
+                f"normal_highres_unavailable=True"
             )
 
         if min(w, h) < 360:
@@ -6569,6 +6588,20 @@ def _build_ig_original_image_url_variants(
             break
 
     if stp_value:
+        # Variant 0: try a compact set of common larger transforms.  These are
+        # still fully gated by real downloaded dimensions, but limiting the set
+        # prevents dozens of repeated HTTP 403 attempts before accepting the
+        # exact structured best-available image.
+        for target_stp in [
+            "dst-jpg_e35_s1080x1080_tt6",
+            "dst-jpg_e35_p1080x1080_tt6",
+            "dst-jpg_e35_tt6",
+        ]:
+            emit([
+                (key, target_stp if key.lower() == "stp" else value)
+                for key, value in pairs
+            ])
+
         # Variant 1: remove only explicit size/crop tokens, retaining format flags.
         cleaned_tokens = []
         for token in stp_value.split("_"):
@@ -6824,16 +6857,20 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
     )
 
     primary_url_low = str(url or "").lower()
-    has_explicit_small_resize = bool(
-        re.search(r"(?:^|[_?&=])s(?:240|320|360|480|540|640)x\d+", primary_url_low)
+    has_explicit_tiny_resize = bool(
+        re.search(r"(?:^|[_?&=])s(?:240|320)x\d+", primary_url_low)
+        or re.search(r"(?:^|[_?&=])p(?:240|320)x\d+", primary_url_low)
+        or "s150x150" in primary_url_low
+        or "s100x100" in primary_url_low
+        or "s64x64" in primary_url_low
     )
 
     best_available_structured = bool(
         primary.get("width")
         and primary.get("height")
-        and max(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= 640
-        and min(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= 480
-        and not has_explicit_small_resize
+        and max(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
+        and min(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+        and not has_explicit_tiny_resize
     )
 
     deduped_alternates = []
@@ -6846,6 +6883,29 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
         seen_alternates.add(key)
         deduped_alternates.append(candidate_url)
 
+    # v12.14:
+    # For exact authenticated structured children only, try conservative same-file
+    # CDN variants after all explicit responsive candidates fail.  This restores
+    # high-res retry for posts whose structured JSON exposes only stp=s240/s320/
+    # s480 transformed URLs.  Generated variants still must pass the existing
+    # geometry / ownership / completeness gates, so low-res thumbnails cannot
+    # become SUCCESS.
+    try:
+        variant_sources = [url] + deduped_alternates[:1]
+        for base_url in variant_sources:
+            for variant_url in _build_ig_original_image_url_variants(
+                base_url,
+                declared_width=int(width or primary.get("width") or 0),
+                declared_height=int(height or primary.get("height") or 0),
+            ):
+                key = _normalized_exact_media_url(variant_url)
+                if not key or key in seen_alternates:
+                    continue
+                seen_alternates.add(key)
+                deduped_alternates.append(variant_url)
+    except Exception as _e:
+        logger.debug(f"IG v12.14 high-res variant build skipped: {_e}")
+
     return {
         "src": url,
         "type": "image",
@@ -6857,6 +6917,10 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
         "_explicitMaxWidth": explicit_max_width,
         "_explicitMaxHeight": explicit_max_height,
         "_best_available_structured_image": best_available_structured,
+        "_best_available_reason": (
+            "exact-authenticated-structured-largest-candidate"
+            if best_available_structured else ""
+        ),
         "_alternate_image_urls": deduped_alternates,
         "from": "authenticated-structured-json",
     }
