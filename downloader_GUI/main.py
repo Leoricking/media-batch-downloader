@@ -1,4 +1,4 @@
-# v12.12 Copy Retry Failed Missing URLs
+# v12.14 Open link.txt + Preserve Copy URL Actions
 import json
 import math
 import os
@@ -501,6 +501,19 @@ class App:
             text="📂 預處理output",
             command=self._open_preprocess_output,
             bg="#37474F",
+            fg="white",
+            padx=self._ui_px(5),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
+
+        tk.Button(
+            btn_row2,
+            text="📝 link.txt",
+            command=self._open_link_txt,
+            bg="#455A64",
             fg="white",
             padx=self._ui_px(5),
             pady=self._button_pady,
@@ -1595,6 +1608,30 @@ class App:
     def _open_preprocess_output(self):
         self._open_path(PREPROCESS_OUTPUT_DIR)
         self.status_var.set(f"已開啟預處理 output：{PREPROCESS_OUTPUT_DIR}")
+
+    def _open_link_txt(self):
+        """Open pre-processing/link.txt; create it when missing."""
+        link_path = os.path.join(PREPROCESS_DIR, "link.txt")
+        try:
+            os.makedirs(PREPROCESS_DIR, exist_ok=True)
+            if not os.path.exists(link_path):
+                with open(link_path, "w", encoding="utf-8") as f:
+                    f.write("")
+
+            if sys.platform == "win32":
+                os.startfile(link_path)
+            else:
+                import subprocess
+                subprocess.Popen([
+                    "open" if sys.platform == "darwin" else "xdg-open",
+                    link_path,
+                ])
+
+            self.status_var.set(f"已開啟 link.txt：{link_path}")
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"無法開啟 link.txt：{e}", parent=self.root)
+            self.status_var.set(f"無法開啟 link.txt：{e}")
 
     def _pause_downloads(self):
         worker.pause()
