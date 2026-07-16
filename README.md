@@ -1,6 +1,6 @@
 # 🚀 Media Batch Downloader
 
-> Current documentation: v12.01 Instagram Profile Batch Resume & Checkpoint Fix
+> Current documentation: v12.22 Instagram Carousel Complete Fallback + v12.14 GUI link.txt Shortcut + v12.06 Facebook Reel Identity Fix
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。它支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、失敗清單整理，以及 Instagram / Facebook 的多引擎下載 fallback。
 
@@ -23,11 +23,16 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 支援下載前預取 Instagram Post Account 與 Post Title，先顯示於 GUI 再開始下載
 - GUI 任務表格顯示 URL / Post Account / Post Title / 狀態 / Retry，欄寬會依視窗大小自動調整
 - GUI 顯示 IG / FB Parser 登入狀態，可手動更新；Post Account 與 Post Title 標題及內容皆置中
+- GUI 新增「📝 link.txt」按鈕，可直接開啟 `pre-processing/link.txt`；檔案不存在時會自動建立
+- GUI 保留 `📋 RETRY`、`📋 FAILED`、`📋 MISSING`、`📋 未成功` 與右鍵複製全部未成功 URL 功能
 - Instagram structured media 會寫入並驗證目標 shortcode ownership，避免跨貼文媒體污染
+- Instagram persistent structured JSON 若只有 caption/account、沒有 media list，會啟用 exact visual carousel fallback
+- Instagram carousel 會偵測 pagination dot count，例如 5 顆 dots 就必須抓滿 5 張
+- Instagram visual fallback 若只抓到部分圖片，會用精準 `?img_index=N` 補抓缺少的 slide，少一張都不判 SUCCESS
 - Instagram 圖片會硬性拒絕 320 / 480 / 640 等低解析度縮圖、錯誤裁切與比例不符版本
 - Instagram Reel / 影片必須通過真實 MP4、檔案大小與可播放完整性驗證，封面圖不得假裝影片成功
 - 一般 headless 流程若只取得縮圖或品質檢查失敗，會改用已登入 IG Parser Profile 重抓；Profile 也無法確認時才回 BLOCKED
-- Facebook Reel 保留既有可下載的 browser network / metadata 流程，輸出檔名優先使用 Reel caption / title
+- Facebook Reel 先鎖定 active visible video；若 active video 只有 `blob:`，改用精準 canonical Reel ID 的 yt-dlp fallback，避免抓到推薦影片或下一支影片
 - `img_index=` 分享網址在受限貼文流程中只作為任務路由資訊；媒體清單改由結構化資料一次解析，不再逐張導航
 - 結構化媒體清單中的 child 數量、實際寫入數與輸出檔案數必須一致，才會判定 SUCCESS
 - 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
@@ -71,6 +76,7 @@ media-batch-downloader/
 │  ├─ downloads/
 │  └─ post/                 # 暫存資料夾，任務成功搬移或失敗結束後會自動清理
 ├─ pre-processing/
+│  ├─ link.txt              # GUI「📝 link.txt」會直接開啟此檔，不存在會自動建立
 │  ├─ link_sorter.py
 │  └─ output/
 │     ├─ download_link.txt
@@ -314,8 +320,10 @@ downloader_GUI/data/chrome_ig_parser
 - 一次取得完整 `carousel_media` / `children`，不點 Next、不按 ArrowRight、不 Swipe、不使用 pagination dot
 - `img_index=` 不再作為逐張定位 API，只保留為原始任務資訊
 - 圖片與影片依 children 原始順序輸出
-- 若結構化資料缺少 child、URL 重複或媒體數不完整，直接回 `RETRY`
-- 不會退回視覺翻頁，以避免錯 post、錯 slide 或漏下載
+- 若結構化資料缺少 child、URL 重複或媒體數不完整，優先回 `RETRY`
+- 若結構化 JSON 已確認目標 shortcode、caption/account 正確但 media list 為 0，會啟用 exact visual carousel fallback
+- visual fallback 仍鎖定 shortcode、偵測 pagination dots、檢查完整張數，並用 `?img_index=N` 補抓缺少 slide
+- 若補抓後 expected / written / temp_files 不一致，仍回 `RETRY` / `FAILED`，不會假成功
 
 若第一次使用 IG Parser，請先在 GUI 點「🌐 IG Parser」，登入 Instagram 並完成必要的年齡或帳號確認。完成後即可回到下載器批次執行，不需要手動匯出 cookies.txt。
 
@@ -345,9 +353,11 @@ downloader_GUI/data/chrome_ig_parser
 - 單張 Post 也使用同一套結構化節點解析
 - 混合 Carousel 可正確保留 `image / video / video / ...` 的原始排列
 - 不使用 Network Cache 的其他推薦貼文補數量
-- 不使用 `img_index=N` 逐張載入
-- 不進行畫面翻頁或滑鼠座標猜測
-- 若無法取得完整結構化清單，回 `RETRY`，不以不可靠的視覺翻頁補救
+- 正常 structured flow 不使用 `img_index=N` 逐張載入
+- 正常 structured flow 不進行畫面翻頁或滑鼠座標猜測
+- 只有在已登入 structured JSON 可證明目標貼文但 media list 為 0 時，才啟用 exact visual carousel fallback
+- fallback 會先抓取可見 slide，再以 dot count 判斷總張數，必要時用 `?img_index=N` 補齊缺少 slide
+- fallback 仍須通過 target shortcode、張數、圖片解析度與影片完整性驗證
 
 命名規則：
 
@@ -373,8 +383,11 @@ Instagram photos and videos
 IG authenticated structured extraction complete:
 IG structured caption resolved:
 IG structured account resolved:
-IG persistent profile structured media count=
-carousel flipping skipped
+IG persistent profile media count=
+IG authenticated structured extraction returned 0: target=...; try exact visual carousel fallback
+IG carousel dot count detected:
+IG v12.21 direct fill after dot-count accepted:
+IG Playwright 已成功寫入
 IG Playwright 已成功寫入
 TEMP 有效檔案=
 IG headless 媒體未通過品質/完整性 gate
@@ -382,15 +395,16 @@ IG structured shortcode ownership
 IG 第 N 個影片完整 MP4 重建完成
 ```
 
-受限貼文流程中不應再出現：
+受限貼文正常 structured flow 不應依賴下列視覺操作：
 
 ```text
 IG dynamic carousel walk
 Next click
 ArrowRight fallback
 media-edge Next click
-img_index recovery
 ```
+
+但在 structured JSON 僅有 caption/account、media list 為 0 的特殊情況，v12.17+ 會啟用 exact visual fallback；v12.20+ 會偵測 dot count，v12.21+ 會用 `?img_index=N` 補齊缺少 slide。
 
 ### IG 媒體格式與 WEBP 處理
 
@@ -486,7 +500,7 @@ downloader_GUI/data/playwright_fb_profile
 - `facebook.com/.../videos/...`
 - `fb.watch/...`
 
-Facebook Reel 頁面可能使用 `blob:` 作為可見 `<video>` 的播放來源，因此下載器會保留已驗證可用的 browser network / metadata / HTML 候選流程，不會因可見 `<video>` 沒有直接 MP4 URL 就錯誤回 `RETRY`。
+Facebook Reel 頁面可能使用 `blob:` 作為可見 `<video>` 的播放來源。新版會先嘗試 active visible video 的直接來源；若只有 `blob:`，會使用精準 canonical Reel ID 走 yt-dlp fallback，不再從全頁 network / metadata / HTML 候選池挑最大影片，避免抓到推薦影片或下一支影片。
 
 命名規則：
 
@@ -560,6 +574,11 @@ python main.py
    - 「🔁 重試失敗」
    - 「📄 查看失敗」
    - 「🚫 複製 BLOCKED」
+   - 「📋 RETRY」
+   - 「📋 FAILED」
+   - 「📋 MISSING」
+   - 「📋 未成功」
+   - 「📝 link.txt」
    - 「🌐 IG Parser」
    - 「🌐 FB Parser」
 5. 任務完成後會跳出下載結果摘要視窗。
@@ -582,6 +601,23 @@ python main.py
 ---
 
 ## 預處理分類
+
+### 快速開啟 link.txt
+
+GUI 內建：
+
+```text
+📝 link.txt
+```
+
+行為：
+
+```text
+開啟 pre-processing/link.txt
+若檔案不存在，會自動建立空白 link.txt
+```
+
+這個按鈕只處理文字清單檔案開啟，不會影響 Queue、Worker、IG 或 FB 下載流程。
 
 若你有大量原始文字或混合連結，可以先放進：
 
@@ -706,8 +742,11 @@ IG 清理暫存 post/
 IG authenticated structured extraction complete:
 IG structured caption resolved:
 IG structured account resolved:
-IG persistent profile structured media count=
-carousel flipping skipped
+IG persistent profile media count=
+IG authenticated structured extraction returned 0: target=...; try exact visual carousel fallback
+IG carousel dot count detected:
+IG v12.21 direct fill after dot-count accepted:
+IG Playwright 已成功寫入
 IG Playwright 已成功寫入
 TEMP 有效檔案=
 IG headless 媒體未通過品質/完整性 gate
@@ -734,8 +773,9 @@ FB merged candidate media count=
 FB filtered media count=
 FB unique output media count=
 FB move_files blocked
-FB Reel video candidate count=
-FB Reel 主影片已下載
+FB Reel active-video candidate count=
+FB Reel active video is blob-only; try exact yt-dlp fallback:
+FB Reel active 主影片已下載
 FB 單檔完成:
 ```
 
@@ -800,6 +840,58 @@ python main.py
 ---
 
 ## 版本紀錄
+
+### v12.22 Direct img_index Function Name Fix
+
+- 修正 v12.21 補抓缺少 slide 時呼叫不存在函式造成 `NameError`
+- 將 direct img_index 補抓流程改為使用既有 `_load_exact_post_slide()`
+- 保留 v12.21 的 dot count、`?img_index=N` 補齊、shortcode ownership、張數與媒體完整性 gate
+- 解決 `name '_collect_direct_index_slide_media' is not defined`
+
+### v12.21 Direct img_index Fill Missing Carousel Slides
+
+- 當 visual carousel fallback 已抓到部分 slide，但 dot count 顯示還有更多圖片時，自動用 `?img_index=N` 補抓缺少 slide
+- 例如 dot count=5、visual walk 只抓到 3 張時，會補抓第 4 / 第 5 張
+- 每個補抓 slide 仍必須驗證目標 shortcode 與 media key，不允許重複圖或跨貼文媒體
+- 少於 dot count 的張數不會判定 `SUCCESS`
+
+### v12.20 Carousel Dot Count Fix
+
+- 強化 Instagram carousel pagination dots 偵測
+- 支援 persistent profile 內主媒體被推到畫面上方時，仍能從媒體下方 / 底部區域偵測 dots
+- 偵測到 5 顆 dots 時，expected count 必須為 5，避免只抓 3 張就成功
+
+### v12.19 Visual Fallback Unknown-Count Finish Fix
+
+- 修正 persistent profile 中殘留 top-page `下一步` 控制導致永遠 `RETRY`
+- 當 visual fallback 已證明真的翻動且收集多張 unique media，但沒有可信任 dot count 時，不再只因殘留 Next 就拒絕
+- v12.20 後若能偵測 dot count，仍以 dot count 為準，不允許少圖成功
+
+### v12.18 Visual Carousel Next False-Positive Fix
+
+- 新增 strict media-area Next 偵測
+- 避免頁面上方 / header 的 `下一步` 被誤判為 carousel 尚未完成
+- 保留可見 Next 與媒體區 Next 的雙層 log，方便 debug
+
+### v12.17 Persistent Structured-Zero Exact Visual Fallback
+
+- 當 IG Parser Profile 已取得正確 caption/account，但 authenticated structured media list 為 0 時，啟用 exact visual carousel fallback
+- visual fallback 每步仍檢查 target shortcode，並保留完整性 gate
+- 無法證明完整 media list 時仍回 `RETRY`
+
+### v12.14 Open link.txt + Preserve Copy URL Actions
+
+- GUI 新增「📝 link.txt」按鈕
+- 可直接開啟 `pre-processing/link.txt`
+- 若 `link.txt` 不存在，會自動建立空白檔
+- 保留 v12.12 的 `📋 RETRY`、`📋 FAILED`、`📋 MISSING`、`📋 未成功` 與右鍵複製未成功 URL 功能
+
+### v12.06 Facebook Reel Blob Exact yt-dlp Fallback Fix
+
+- Facebook Reel 先取 active visible video
+- active video 只有 `blob:` 時，不回退全頁 network 候選池
+- 改用精準 canonical Reel ID 的 yt-dlp fallback
+- 避免 title 正確但實際抓到推薦影片 / 下一支影片
 
 ### v12.01 Instagram Profile Batch Resume & Checkpoint Fix
 
