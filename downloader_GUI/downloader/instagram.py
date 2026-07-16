@@ -1,3 +1,9 @@
+# v12.22 Direct img_index Function Name Fix
+# v12.21 Direct img_index Fill Missing Carousel Slides
+# v12.20 Carousel Dot Count Fix
+# v12.19 Visual Fallback Unknown-Count Finish Fix
+# v12.18 Visual Carousel Next False-Positive Fix
+# v12.17 Persistent Structured-Zero Exact Visual Fallback
 # v12.16 Exact Structured Best-Available Marker Fix
 # v12.14 Exact Structured Child High-Resolution CDN Variant Retry
 # v12.13 Authenticated Short Video Carousel Best-Available Fix
@@ -5162,52 +5168,158 @@ def _goto_instagram_target_clean(page, target_url: str, target_shortcode: str = 
 
 
 def _get_carousel_total_count(page) -> int:
-    """Detect carousel page count from dots/indicators near the main media.
+    """Detect carousel total count from pagination dots near the active media.
 
-    This is intentionally advisory only.  It is used to stop repeated flipping
-    and to know whether network cache should fill 1 missing carousel item.
+    v12.20:
+    Persistent profile pages can shift the main media upward and keep the media
+    root as document.  The old detector used a narrow y-range near the lower edge
+    of the largest image and often returned 1 even when 5 white dots were visible.
+    This resolver searches the active media root for compact visible circular
+    dot-like elements below or overlapping the lower part of the media pane and
+    dedupes by x-position.
     """
     js = r"""
     () => {
-      const scope = document.querySelector('div[role="dialog"]') || document.querySelector('article') || document;
-      const medias = Array.from(scope.querySelectorAll('img, video'))
-        .map(el => {
-          const r = el.getBoundingClientRect();
-          const st = getComputedStyle(el);
-          return {el, r, area: Math.max(0, r.width) * Math.max(0, r.height), visible: st.display !== 'none' && st.visibility !== 'hidden' && r.width > 120 && r.height > 120};
-        })
-        .filter(x => x.visible)
-        .sort((a,b) => b.area - a.area);
-      if (!medias.length) return 0;
-      const mr = medias[0].r;
-      const candidates = [];
-      const nodes = Array.from(document.querySelectorAll('div, span, button, svg, circle'));
-      for (const el of nodes) {
+      const vw = innerWidth || 1600;
+      const vh = innerHeight || 1000;
+
+      const visible = el => {
         const r = el.getBoundingClientRect();
         const st = getComputedStyle(el);
-        const w = r.width, h = r.height;
-        if (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') <= 0) continue;
-        if (w < 3 || h < 3 || w > 22 || h > 22) continue;
-        const cx = r.left + w / 2;
-        const cy = r.top + h / 2;
-        const nearX = cx >= mr.left + mr.width * 0.25 && cx <= mr.right - mr.width * 0.25;
-        const nearY = cy >= mr.bottom - 90 && cy <= mr.bottom + 35;
-        if (!nearX || !nearY) continue;
-        candidates.push({x: Math.round(cx), y: Math.round(cy), w, h});
+        return st.display !== 'none' && st.visibility !== 'hidden' &&
+          parseFloat(st.opacity || '1') > 0 &&
+          r.width > 0 && r.height > 0 &&
+          r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh;
+      };
+
+      const roots = [];
+      const dialog = document.querySelector('div[role="dialog"]');
+      const article = document.querySelector('article');
+      if (dialog && visible(dialog)) roots.push(dialog);
+      if (article && visible(article)) roots.push(article);
+      roots.push(document);
+
+      function mediaRectFor(root) {
+        const nodes = Array.from(root.querySelectorAll('img,video'))
+          .map(el => {
+            const r = el.getBoundingClientRect();
+            const st = getComputedStyle(el);
+            const overlapX = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+            const overlapY = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+            const area = overlapX * overlapY;
+            const src = String(el.currentSrc || el.src || el.getAttribute('src') || '').toLowerCase();
+            const bad = src.includes('profile_pic') || src.includes('s150x150') ||
+              src.includes('s100x100') || src.includes('s64x64') ||
+              src.includes('emoji') || src.includes('sprite') ||
+              src.includes('static.cdninstagram.com');
+            return {el, r, area, ok:
+              st.display !== 'none' && st.visibility !== 'hidden' &&
+              parseFloat(st.opacity || '1') > 0 &&
+              r.width >= 220 && r.height >= 180 &&
+              overlapX >= 180 && overlapY >= 120 && !bad
+            };
+          })
+          .filter(x => x.ok)
+          .sort((a,b) => b.area - a.area);
+        return nodes.length ? nodes[0].r : null;
       }
-      candidates.sort((a,b) => a.x - b.x);
-      const grouped = [];
-      for (const c of candidates) {
-        if (!grouped.length || Math.abs(grouped[grouped.length - 1].x - c.x) > 7) grouped.push(c);
+
+      function styleScore(el, r) {
+        const st = getComputedStyle(el);
+        const bg = st.backgroundColor || '';
+        const cls = String(el.getAttribute('class') || '').toLowerCase();
+        const aria = String(el.getAttribute('aria-current') || '').toLowerCase();
+        let score = 0;
+        if (aria === 'true' || aria === 'page') score += 20;
+        if (cls.includes('active') || cls.includes('selected')) score += 10;
+        if (bg && !bg.includes('rgba(0, 0, 0, 0)') && !bg.includes('transparent')) score += 8;
+        if (r.width >= 4 && r.width <= 14 && r.height >= 4 && r.height <= 14) score += 10;
+        if (Math.abs(r.width - r.height) <= 5) score += 8;
+        const radius = parseFloat(st.borderRadius || '0') || 0;
+        if (radius >= Math.min(r.width, r.height) * 0.35) score += 8;
+        return score;
       }
-      const n = grouped.length;
-      return (n >= 2 && n <= 20) ? n : 0;
+
+      for (const root of roots) {
+        const mr = mediaRectFor(root);
+        if (!mr) continue;
+
+        const mediaLeft = Math.max(0, mr.left);
+        const mediaRight = Math.min(vw, mr.right);
+        const mediaTop = Math.max(0, mr.top);
+        const mediaBottom = Math.min(vh, mr.bottom);
+
+        const candidates = [];
+        const nodes = Array.from(root.querySelectorAll(
+          'div,span,button,svg,circle,[aria-current]'
+        ));
+
+        for (const el of nodes) {
+          const r = el.getBoundingClientRect();
+          const st = getComputedStyle(el);
+          if (st.display === 'none' || st.visibility === 'hidden' ||
+              parseFloat(st.opacity || '1') <= 0) continue;
+
+          const w = r.width || 0, h = r.height || 0;
+          if (w < 3 || h < 3 || w > 24 || h > 24) continue;
+
+          const cx = r.left + w / 2;
+          const cy = r.top + h / 2;
+
+          // Dots are horizontally centered inside the media pane and usually
+          // sit near the bottom.  Allow overlap with the bottom region because
+          // IG can shift the whole media upward in persistent profile mode.
+          const xOk = cx >= mediaLeft + (mediaRight - mediaLeft) * 0.25 &&
+                      cx <= mediaRight - (mediaRight - mediaLeft) * 0.25;
+          const yOk = cy >= mediaTop + (mediaBottom - mediaTop) * 0.62 &&
+                      cy <= mediaBottom + 45;
+          if (!xOk || !yOk) continue;
+
+          const sc = styleScore(el, r);
+          if (sc < 12) continue;
+
+          candidates.push({x: Math.round(cx), y: Math.round(cy), w, h, score: sc});
+        }
+
+        candidates.sort((a,b) => a.x - b.x || b.score - a.score);
+
+        const grouped = [];
+        for (const c of candidates) {
+          if (!grouped.length || Math.abs(grouped[grouped.length - 1].x - c.x) > 8) {
+            grouped.push(c);
+          } else if (c.score > grouped[grouped.length - 1].score) {
+            grouped[grouped.length - 1] = c;
+          }
+        }
+
+        // Keep only one horizontal row.  Real IG dots are on the same y line.
+        if (grouped.length >= 2) {
+          grouped.sort((a,b) => a.y - b.y);
+          let best = [];
+          for (const seed of grouped) {
+            const row = grouped
+              .filter(x => Math.abs(x.y - seed.y) <= 8)
+              .sort((a,b) => a.x - b.x);
+            if (row.length > best.length) best = row;
+          }
+          const n = best.length;
+          if (n >= 2 && n <= 20) {
+            return n;
+          }
+        }
+      }
+
+      return 0;
     }
     """
     try:
-        return int(page.evaluate(js) or 0)
+        value = int(page.evaluate(js) or 0)
+        if 2 <= value <= 20:
+            logger.info(f"IG carousel dot count detected: {value}")
+            return value
     except Exception:
-        return 0
+        pass
+    return 0
 
 
 def _get_current_media_key(page) -> str:
@@ -5389,6 +5501,85 @@ def _is_actionable_carousel_next(page) -> bool:
                     return True
         except Exception:
             continue
+    return False
+
+
+
+def _is_strict_media_area_carousel_next(page) -> bool:
+    """Return True only for a Next control spatially attached to the main media."""
+    media = _find_main_ig_media_geometry(page)
+    if not media:
+        return False
+
+    try:
+        viewport_w = float(page.evaluate("() => innerWidth"))
+        viewport_h = float(page.evaluate("() => innerHeight"))
+    except Exception:
+        viewport_w, viewport_h = 1400.0, 1000.0
+
+    for sel in _carousel_next_selectors():
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 20)):
+                try:
+                    node = loc.nth(i)
+                    if not node.is_visible(timeout=180):
+                        continue
+
+                    clickable = node
+                    try:
+                        ancestor = node.locator(
+                            "xpath=ancestor-or-self::*[self::button or @role='button'][1]"
+                        )
+                        if ancestor.count() > 0 and ancestor.first.is_visible(timeout=120):
+                            clickable = ancestor.first
+                    except Exception:
+                        pass
+
+                    box = clickable.bounding_box()
+                    if not box:
+                        continue
+
+                    cx = float(box["x"]) + float(box["width"]) / 2.0
+                    cy = float(box["y"]) + float(box["height"]) / 2.0
+                    if not (2 <= cx <= viewport_w - 2 and 2 <= cy <= viewport_h - 2):
+                        continue
+
+                    if not _is_box_near_main_media_next(box, media):
+                        continue
+
+                    disabled = False
+                    try:
+                        disabled = bool(clickable.is_disabled())
+                    except Exception:
+                        pass
+                    try:
+                        disabled = disabled or (
+                            (clickable.get_attribute("aria-disabled") or "").lower() == "true"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        disabled = disabled or "disabled" in (
+                            clickable.get_attribute("class") or ""
+                        ).lower()
+                    except Exception:
+                        pass
+
+                    if not disabled:
+                        logger.info(
+                            f"IG strict media-area remaining Next detected: "
+                            f"x={int(cx)}, y={int(cy)}, target_media=({int(float(media.get('left') or 0))},"
+                            f"{int(float(media.get('top') or 0))},"
+                            f"{int(float(media.get('right') or 0))},"
+                            f"{int(float(media.get('bottom') or 0))})"
+                        )
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
     return False
 
 
@@ -7405,13 +7596,43 @@ def _collect_ig_media_playwright_persistent_impl(
         if not filtered:
             logger.warning(
                 f"IG authenticated structured extraction returned 0: "
-                f"target={shortcode}; visual carousel flipping is disabled"
+                f"target={shortcode}; try exact visual carousel fallback"
             )
-            return "RETRY", (
-                "IG authenticated browser opened the post, but the complete "
-                "structured media list was not available. Carousel flipping is "
-                "disabled to prevent wrong-post or wrong-slide downloads."
-            )
+
+            # v12.17:
+            # Some logged-in IG pages expose caption/account in structured JSON
+            # but omit the media list. Do not return RETRY immediately. Use the
+            # existing exact-shortcode visual carousel walker as a narrow fallback:
+            # it starts from the current target post, verifies the target shortcode
+            # after every action, rejects incomplete carousels when a Next control
+            # remains, and still goes through the same final ownership / geometry /
+            # completeness gates before SUCCESS.
+            try:
+                filtered = _collect_complete_post_carousel(
+                    context,
+                    page,
+                    shortcode,
+                    harvested_media,
+                    original_url=url,
+                )
+            except Exception as visual_exc:
+                logger.warning(
+                    f"IG exact visual carousel fallback failed: "
+                    f"target={shortcode}, error={visual_exc}"
+                )
+                filtered = []
+
+            if filtered:
+                logger.info(
+                    f"IG exact visual carousel fallback accepted: "
+                    f"count={len(filtered)}, target={shortcode}"
+                )
+            else:
+                return "RETRY", (
+                    "IG authenticated browser opened the post and metadata was "
+                    "available, but neither structured media nor exact visual "
+                    "carousel fallback could prove the complete media list."
+                )
 
         structured_title = getattr(
             _DOWNLOAD_CONTEXT,
@@ -7470,7 +7691,7 @@ def _collect_ig_media_playwright_persistent_impl(
 
         expected_count = len(filtered)
         logger.info(
-            f"IG persistent profile structured media count={expected_count}; "
+            f"IG persistent profile media count={expected_count}; "
             f"network harvest={len(harvested_media)}, target={shortcode}"
         )
 
@@ -7823,10 +8044,11 @@ def _collect_complete_post_carousel(
             # after exactly that many unique media items were captured.
             break
 
-    initial_next_available = (
+    loose_next_visible_after_walk = (
         _is_actionable_carousel_next(page)
         or _has_visible_carousel_next(page)
     )
+    strict_next_visible_after_walk = _is_strict_media_area_carousel_next(page)
 
     logger.info(
         f"IG hard-gated carousel result: "
@@ -7834,9 +8056,57 @@ def _collect_complete_post_carousel(
         f"requested_index={requested_index}, minimum={minimum_expected}, "
         f"first_probe_attempted={first_probe_attempted}, "
         f"first_probe_moved={first_probe_moved}, "
-        f"next_visible_after_walk={initial_next_available}, "
+        f"next_visible_after_walk={loose_next_visible_after_walk}, "
+        f"strict_next_visible_after_walk={strict_next_visible_after_walk}, "
         f"target={shortcode}"
     )
+
+    if loose_next_visible_after_walk and not strict_next_visible_after_walk:
+        logger.info(
+            f"IG v12.18 ignored non-media-area remaining Next control: "
+            f"collected={len(collected)}, detected={detected}, target={shortcode}"
+        )
+
+    # v12.21:
+    # If a reliable dot/count says the post has more slides than the visual walk
+    # could reach, fill the missing tail by opening exact ?img_index=N pages in
+    # fresh tabs.  This avoids relying on the persistent-profile top-shifted Next
+    # button, while every item is still verified against the same shortcode and
+    # goes through the same final media geometry/completeness gates.
+    if len(collected) < minimum_expected:
+        for missing_index in range(len(collected) + 1, minimum_expected + 1):
+            item = _load_exact_post_slide(
+                context,
+                shortcode,
+                missing_index,
+                harvested_media,
+            )
+            if not item:
+                logger.warning(
+                    f"IG direct img_index fill failed: "
+                    f"index={missing_index}, collected={len(collected)}, "
+                    f"minimum={minimum_expected}, target={shortcode}"
+                )
+                return []
+
+            key = _media_key_from_url(item.get("src", ""))
+            if not key:
+                return []
+
+            if key in seen:
+                logger.warning(
+                    f"IG direct img_index fill duplicate rejected: "
+                    f"index={missing_index}, key={key}, target={shortcode}"
+                )
+                return []
+
+            seen.add(key)
+            collected.append(item)
+            logger.info(
+                f"IG direct img_index fill accepted: "
+                f"index={missing_index}, total={len(collected)}/{minimum_expected}, "
+                f"target={shortcode}"
+            )
 
     # Shared URLs with img_index=N prove at least N slides exist.
     if len(collected) < minimum_expected:
@@ -7849,15 +8119,71 @@ def _collect_complete_post_carousel(
 
     # If navigation still reports another slide after collection stopped, the
     # result is incomplete and must never be SUCCESS.
-    if initial_next_available and (
+    if strict_next_visible_after_walk and (
         detected <= 1 or len(collected) < detected
     ):
-        logger.warning(
-            f"IG remaining next control proves incomplete carousel: "
-            f"collected={len(collected)}, detected={detected}, "
-            f"target={shortcode}"
-        )
-        return []
+        # v12.19:
+        # Some persistent-profile layouts keep a localized "下一步" control around
+        # the top of the shifted media area even after the carousel walker has
+        # already collected every reachable unique slide.  When there is no
+        # reliable dot/count signal (detected<=1), but the walker proved a real
+        # multi-slide transition and collected multiple unique media keys, do not
+        # reject solely because that residual control is still visible.  The
+        # downstream gate still requires exact shortcode ownership and exact
+        # written-file count equality before SUCCESS.
+        if detected <= 1 and first_probe_moved and len(collected) >= 2:
+            refreshed_detected = _get_carousel_total_count(page)
+            if refreshed_detected and len(collected) < refreshed_detected:
+                logger.warning(
+                    f"IG v12.20 dot count proves incomplete carousel: "
+                    f"collected={len(collected)}, detected={refreshed_detected}, "
+                    f"target={shortcode}"
+                )
+                # Use direct ?img_index=N fill before rejecting.  The previous
+                # visual walk may stop at slide 3 while the dot count correctly
+                # says 5.
+                for missing_index in range(len(collected) + 1, refreshed_detected + 1):
+                    item = _load_exact_post_slide(
+                        context,
+                        shortcode,
+                        missing_index,
+                        harvested_media,
+                    )
+                    if not item:
+                        logger.warning(
+                            f"IG v12.21 direct fill after dot-count failed: "
+                            f"index={missing_index}, collected={len(collected)}, "
+                            f"detected={refreshed_detected}, target={shortcode}"
+                        )
+                        return []
+                    key = _media_key_from_url(item.get("src", ""))
+                    if not key or key in seen:
+                        logger.warning(
+                            f"IG v12.21 direct fill after dot-count duplicate/empty rejected: "
+                            f"index={missing_index}, target={shortcode}"
+                        )
+                        return []
+                    seen.add(key)
+                    collected.append(item)
+                    logger.info(
+                        f"IG v12.21 direct fill after dot-count accepted: "
+                        f"index={missing_index}, total={len(collected)}/{refreshed_detected}, "
+                        f"target={shortcode}"
+                    )
+                detected = refreshed_detected
+            logger.info(
+                f"IG v12.19 accept visual fallback with unknown carousel count: "
+                f"collected={len(collected)}, detected={detected}, "
+                f"refreshed_detected={refreshed_detected or 'unknown'}, "
+                f"remaining_next=True, target={shortcode}"
+            )
+        else:
+            logger.warning(
+                f"IG remaining media-area next control proves incomplete carousel: "
+                f"collected={len(collected)}, detected={detected}, "
+                f"target={shortcode}"
+            )
+            return []
 
     # A Carousel probe that moved confirms multi-slide content. Never permit it
     # to collapse back to one output item.
