@@ -1,6 +1,6 @@
 # 🚀 Media Batch Downloader
 
-> Current documentation: v12.22 Instagram Carousel Complete Fallback + v12.14 GUI link.txt Shortcut + v12.06 Facebook Reel Identity Fix
+> Current documentation: v12.23 Facebook Metadata Identity Fix + v12.22 Instagram Carousel Complete Fallback + v12.14 GUI link.txt Shortcut
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。它支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、失敗清單整理，以及 Instagram / Facebook 的多引擎下載 fallback。
 
@@ -18,6 +18,9 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - 保留 cookies.txt 作為 legacy / emergency fallback
 - 支援 IG Parser 專用 Chrome Profile，處理年齡 / 特定對象限制貼文
 - 支援 FB Parser 專用 Chrome Profile，處理 Facebook 登入、2FA、相簿與 Reel fallback
+- Facebook Story / share/p / story_fbid 會使用 proximal photo identity gate，避免被 `set=a`、`set=pcb`、+N、viewer 後續圖與推薦貼文污染
+- Facebook Story 會優先使用貼文 caption 作為 Post Title，避免抓到圖片附近留言、局部註解或鄰近貼文文字
+- Facebook 任務會同步更新 GUI 的 Post Account 與 Post Title，並支援 story、post、photo、Reel、watch、share URL identity matching
 - Instagram 年齡／特定受眾限制貼文改用已登入 IG Parser Profile 的結構化 JSON，一次取得完整圖片／影片清單，不再依賴畫面翻頁
 - 支援受限 Carousel 的 shortcode 鎖定、完整數量檢查、原始順序保留與防推薦貼文污染
 - 支援下載前預取 Instagram Post Account 與 Post Title，先顯示於 GUI 再開始下載
@@ -32,7 +35,7 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - Instagram 圖片會硬性拒絕 320 / 480 / 640 等低解析度縮圖、錯誤裁切與比例不符版本
 - Instagram Reel / 影片必須通過真實 MP4、檔案大小與可播放完整性驗證，封面圖不得假裝影片成功
 - 一般 headless 流程若只取得縮圖或品質檢查失敗，會改用已登入 IG Parser Profile 重抓；Profile 也無法確認時才回 BLOCKED
-- Facebook Reel 先鎖定 active visible video；若 active video 只有 `blob:`，改用精準 canonical Reel ID 的 yt-dlp fallback，避免抓到推薦影片或下一支影片
+- Facebook Reel 保留已驗證可成功的主影片候選流程，並加強 foreground / metadata 識別，避免標題正確但下載到推薦影片
 - `img_index=` 分享網址在受限貼文流程中只作為任務路由資訊；媒體清單改由結構化資料一次解析，不再逐張導航
 - 結構化媒體清單中的 child 數量、實際寫入數與輸出檔案數必須一致，才會判定 SUCCESS
 - 支援 IG 媒體真實檔頭判斷，WEBP 會轉成真正 JPEG，避免假 .jpg
@@ -500,7 +503,7 @@ downloader_GUI/data/playwright_fb_profile
 - `facebook.com/.../videos/...`
 - `fb.watch/...`
 
-Facebook Reel 頁面可能使用 `blob:` 作為可見 `<video>` 的播放來源。新版會先嘗試 active visible video 的直接來源；若只有 `blob:`，會使用精準 canonical Reel ID 走 yt-dlp fallback，不再從全頁 network / metadata / HTML 候選池挑最大影片，避免抓到推薦影片或下一支影片。
+Facebook Reel 頁面可能使用 `blob:` 作為可見 `<video>` 的播放來源。新版保留已驗證可成功的 browser network / metadata 候選流程，並搭配 foreground response 與標題／帳號 metadata publish。若前景候選不足，才使用既有候選池作為備援；任務仍會以 Reel caption / title 命名，避免把分享短碼當成正式檔名。
 
 命名規則：
 
@@ -524,6 +527,45 @@ Facebook 多圖貼文會使用 Playwright viewer-intercept 收集候選媒體，
 - 若圖片與影片候選混在一起，圖片貼文優先保留圖片，避免推薦影片污染
 - 若多檔輸出仍是 fallback title `Facebook_Post`，會阻擋高風險輸出，避免錯誤候選檔搬成正式結果
 
+### Facebook Story / share/p / Metadata
+
+對 `story.php?story_fbid=...`、`share/p/...` 這類貼文任務，新版使用更嚴格的 identity gate：
+
+```text
+story_fbid / post_id
+→ 選擇與 story_fbid 最接近且可信的 photo fbid
+→ 排除 login_alerts、notification、comment、推薦貼文與無關 album
+→ 強制 expected count = 1
+→ 不跑 viewer next
+→ 不 append gallery 後續候選
+```
+
+這可以避免：
+
+- 標題正確但下載到其他貼文
+- 被 `set=a` / `set=pcb` album first-anchor 帶到錯圖
+- +N / viewer 後續圖污染
+- 圖片附近留言或局部註解覆蓋真正貼文 caption
+
+Facebook metadata 會同步寫回 GUI：
+
+```text
+Post Account = 粉專 / 帳號名稱
+Post Title   = 真正貼文 caption
+```
+
+`queue_manager.py` 也支援 Facebook identity matching：
+
+```text
+facebook:story:<story_fbid>
+facebook:post:<post_id>
+facebook:photo:<fbid>
+facebook:video:<reel_id>
+facebook:share:<share_id>
+```
+
+因此即使下載流程使用 resolved URL、canonical URL、去除 `#` 的 URL 或 photo URL，GUI 仍可更新同一列任務的 Post Account / Post Title。
+
 ---
 
 ## GUI 任務表格
@@ -537,8 +579,8 @@ URL | Post Account | Post Title | 狀態 | Retry
 欄位行為：
 
 - `URL`：保留原始任務網址，靠左顯示
-- `Post Account`：下載前先預取發文帳號，例如 `successful101_official`
-- `Post Title`：下載前先預取 caption；若一般 headless 只能取得 Instagram 通用頁面文字，會在已登入結構化擷取後更新為真正 caption、帳號或 shortcode
+- `Post Account`：下載前或下載中寫回發文帳號；Instagram 顯示帳號名稱，Facebook 顯示粉專 / 帳號名稱
+- `Post Title`：下載前或下載中寫回真正 caption；Facebook Story 會避免使用圖片附近留言、局部註解或鄰近貼文文字作為標題
 - `Post Account`、`Post Title`、`狀態`、`Retry` 皆置中顯示
 - GUI 會顯示 `IG：已登入 / 未登入 / Profile 使用中` 與 `FB：已登入 / 未登入 / Profile 使用中`
 - 可按「更新登入狀態」重新檢查；Facebook 會優先從 Chrome cookie database 判斷登入狀態
@@ -773,9 +815,13 @@ FB merged candidate media count=
 FB filtered media count=
 FB unique output media count=
 FB move_files blocked
-FB Reel active-video candidate count=
-FB Reel active video is blob-only; try exact yt-dlp fallback:
-FB Reel active 主影片已下載
+FB Reel video candidate count=
+FB Reel 主影片已下載
+FB v12.17 explicit story proximal photo selected:
+FB v12.19 explicit story caption priority selected:
+FB v12.21 publish metadata:
+title_ok=True
+account_ok=True
 FB 單檔完成:
 ```
 
@@ -840,6 +886,51 @@ python main.py
 ---
 
 ## 版本紀錄
+
+### v12.23 README Facebook Metadata Documentation Update
+
+- 更新 README 以反映目前 Facebook v12.21 與 queue_manager v12.11 行為
+- 補充 Facebook Story / share/p / story_fbid identity gate
+- 補充 Facebook Post Account / Post Title GUI metadata publish 流程
+- 補充 queue_manager Facebook identity matching 規則
+- 更新 Facebook Debug log 關鍵字
+
+### v12.21 Facebook Metadata Alias Publish Fix
+
+- Facebook 下載成功後同步 publish Post Title 與 Post Account
+- 支援 story、post、photo、Reel、watch、share URL alias
+- log 顯示 `title_ok=True` / `account_ok=True` 以確認 GUI row 已更新
+- 修正 FB Story 內容成功但 GUI Post Account / Post Title 空白問題
+
+### v12.20 Facebook Publish Account + Title Metadata Fix
+
+- 新增 `_split_fb_title_account()`，可將 `caption - PageName` 拆成 Post Title 與 Post Account
+- 新增 `_get_fb_page_account()`，從 FB meta / article / page link 擷取粉專名稱
+- 新增 `_publish_fb_task_metadata()`，統一寫回 GUI title/account
+
+### v12.19 Facebook Story Caption Priority Fix
+
+- 修正 Story 圖片內容正確但檔名使用圖片附近留言或局部註解的問題
+- Story title 優先使用 post-level scoped caption
+- local-node 只作 fallback，並過濾 `第4個要改成`、`第八傻`、`如果你原諒` 等局部文字
+
+### v12.18 Facebook Reel Foreground + Story Scoped Title Fix
+
+- Reel 新增 foreground response 候選，降低標題正確但影片抓到推薦內容的風險
+- Story 根據 proximal photo link 嘗試取得 scoped title
+- 保留 v12.17 的 story proximal photo identity gate
+
+### v12.17 Facebook Reel Restore + Story Proximal Photo Identity Fix
+
+- 恢復已驗證可正常下載 Facebook Reel 的候選流程
+- 對 explicit story/post URL 使用 proximal photo fbid 選擇正確圖片
+- 跳過 story viewer walk 與 gallery append，避免 `set=a`、`set=pcb` 與推薦貼文污染
+
+### queue_manager v12.11 Facebook Metadata Identity Fix
+
+- queue metadata update 支援 Facebook identity matching
+- 新增 `facebook:story`、`facebook:post`、`facebook:photo`、`facebook:video`、`facebook:share`
+- 修正 Facebook resolved/canonical/photo URL 與 GUI 原始 URL 不一致時 metadata 無法寫回的問題
 
 ### v12.22 Direct img_index Function Name Fix
 

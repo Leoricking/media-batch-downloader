@@ -1,7 +1,8 @@
-# v12.06 Reel Blob Exact yt-dlp Fallback Fix
-# v12.05 Reel Active Video Only Fix
-# v12.04 Watch Fast yt-dlp Route + Anti-Hang Timeout
-# v12.03 Watch Video Route Fix: keep /watch/?v= out of photo-gallery pipeline
+# v12.21 FB Metadata Alias Publish Fix
+# v12.20 FB Publish Account + Title Metadata Fix
+# v12.19 Story Caption Priority Fix
+# v12.18 Reel Foreground Candidate + Story Scoped Title Fix
+# v12.17 Reel Restore + Story Proximal Photo Identity Fix
 # v11.93 FB Scoped Manifest Expected-Count Fix
 import hashlib
 import html
@@ -75,11 +76,6 @@ _cc = OpenCC("s2t") if OpenCC else None
 
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
 _DL_TIMEOUT = 900
-# v12.04:
-# /watch/?v= tasks should not spend 15+ minutes in Playwright deep scans or
-# unbounded slow yt-dlp downloads. Use a bounded single-video guard.
-_FB_WATCH_YTDLP_MAX_SECONDS = 240
-_FB_WATCH_YTDLP_MIN_BYTES_PER_SEC = 8 * 1024
 _MAX_FB_ITEMS = 40
 _MIN_FILE_SIZE = 20 * 1024
 # v11.94:
@@ -154,28 +150,6 @@ def _is_fb_reel_url(url: str) -> bool:
     ])
 
 
-def _is_fb_watch_video_url(url: str) -> bool:
-    """Detect normal Facebook Watch/video URLs.
-
-    v12.03:
-    /watch/?v=<id> is a single video task, not a photo gallery.  It must not
-    enter the photo-link / +N completeness pipeline, because logged-in Facebook
-    pages can expose login_alert/photo links near the video and make the task
-    look like a 3-photo gallery.
-    """
-    low = (url or "").lower()
-    return bool(
-        "/watch/?v=" in low
-        or "/watch?v=" in low
-        or "/videos/" in low
-        or "video.php" in low
-    )
-
-
-def _is_fb_video_like_url(url: str) -> bool:
-    return _is_fb_reel_url(url) or _is_fb_watch_video_url(url)
-
-
 def _extract_fb_reel_or_share_id(url: str) -> str:
     """Extract a stable ID for fallback names such as Facebook_Reel_186iijKiQf."""
     u = html.unescape(unquote(str(url or "")))
@@ -203,13 +177,6 @@ def _extract_fb_reel_or_share_id(url: str) -> str:
 
     return ""
 
-
-
-def _canonical_fb_reel_url_from_id(reel_id: str, fallback_url: str = "") -> str:
-    reel_id = str(reel_id or "").strip()
-    if reel_id and reel_id.isdigit():
-        return f"https://www.facebook.com/reel/{reel_id}/"
-    return fallback_url or ""
 
 def _fb_reel_fallback_title(url: str) -> str:
     rid = _extract_fb_reel_or_share_id(url)
@@ -335,17 +302,11 @@ def _get_active_fb_reel_video_candidates(page) -> list[dict]:
           const v=videos[0].v;
           const urls=[];
           const add=(u,score) => { u=(u||'').trim(); if(u && !u.startsWith('blob:')) urls.push({src:u,type:'video',score}); };
-          const rect = {
-            left: Math.round(v.getBoundingClientRect().left),
-            top: Math.round(v.getBoundingClientRect().top),
-            width: Math.round(v.getBoundingClientRect().width),
-            height: Math.round(v.getBoundingClientRect().height)
-        };
-        add(v.currentSrc||'', 10000000);
-        add(v.src||'', 9900000);
-        add(v.getAttribute('src')||'', 9800000);
-        for (const s of v.querySelectorAll('source[src]')) add(s.src||s.getAttribute('src')||'', 9700000);
-        return urls.map(x => ({...x, rect}));
+          add(v.currentSrc||'', 10000000);
+          add(v.src||'', 9900000);
+          add(v.getAttribute('src')||'', 9800000);
+          for (const s of v.querySelectorAll('source[src]')) add(s.src||s.getAttribute('src')||'', 9700000);
+          return urls;
         }
         """) or []
     except Exception:
@@ -357,14 +318,7 @@ def _get_active_fb_reel_video_candidates(page) -> list[dict]:
             continue
         if not any(x in src.lower() for x in ['.mp4','.m4v','.mov','video']):
             continue
-        out.append({
-            'type': 'video',
-            'src': src,
-            'score': int(item.get('score') or 0) + _media_quality_score(src),
-            'reason': 'active-visible-video-element',
-            'page_url': getattr(page, 'url', ''),
-            '_active_video_rect': item.get('rect') or {},
-        })
+        out.append({'type':'video','src':src,'score':int(item.get('score') or 0)+_media_quality_score(src)})
     return _dedupe_ordered(out)
 
 
@@ -1727,6 +1681,235 @@ def _publish_fb_task_title(task_url: str, title: str) -> str:
     return clean
 
 
+def _clean_fb_account_name(raw: str) -> str:
+    """Normalize a Facebook page/account name for the GUI Post Account column."""
+    value = _to_traditional(str(raw or ""))
+    value = html.unescape(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"^\(\d+\)\s*", "", value).strip()
+    value = value.replace(" | Facebook", "").replace(" - Facebook", "").strip()
+    value = value.strip(" ._-，,。:：|")
+
+    bad = {
+        "", "facebook", "facebook_post", "facebook reel", "reel", "watch",
+        "讚", "留言", "分享", "查看更多", "public", "所有人",
+    }
+    if value.lower() in bad:
+        return ""
+
+    # Avoid using the post caption itself as an account name.
+    if len(value) > 80:
+        return ""
+
+    return safe_title(value)[:60].strip(" ._-，,。") or ""
+
+
+def _split_fb_title_account(title: str) -> tuple[str, str]:
+    """Split common Facebook title strings into (post_title, account).
+
+    Examples:
+      "這10種行為... - Elites insider 企業精英"
+      "caption | Elites insider 企業精英"
+    """
+    raw = _to_traditional(str(title or ""))
+    raw = html.unescape(raw).strip()
+
+    # Prefer the final " - PageName" suffix when the left side is a real caption.
+    for sep in [" - ", " ｜ ", " | "]:
+        if sep in raw:
+            left, right = raw.rsplit(sep, 1)
+            clean_left = _clean_fb_post_title_for_path(left, fallback="")
+            clean_right = _clean_fb_account_name(right)
+            if clean_left and clean_right:
+                return clean_left, clean_right
+
+    return _clean_fb_post_title_for_path(raw, fallback=""), ""
+
+
+
+def _fb_metadata_url_aliases(task_url: str) -> list[str]:
+    """Return FB URL aliases that should update the same visible queue row.
+
+    v12.21:
+    The queue may store the original story.php URL while the downloader publishes
+    from a resolved/canonical URL.  Publish to multiple aliases so both exact and
+    identity-based queue matching can update Post Title/Post Account.
+    """
+    raw = str(task_url or "").strip()
+    if not raw:
+        return []
+
+    aliases = []
+    seen = set()
+
+    def add(u: str):
+        u = str(u or "").strip()
+        if not u:
+            return
+        if u in seen:
+            return
+        seen.add(u)
+        aliases.append(u)
+
+    add(raw)
+    add(raw.split("#", 1)[0])
+
+    try:
+        clean = html.unescape(unquote(raw)).split("#", 1)[0]
+
+        m_story = re.search(r"[?&]story_fbid=([0-9]{8,})", clean, flags=re.I)
+        m_id = re.search(r"[?&]id=([0-9]{6,})", clean, flags=re.I)
+        if m_story:
+            sid = m_story.group(1)
+            if m_id:
+                add(f"https://www.facebook.com/story.php?story_fbid={sid}&id={m_id.group(1)}")
+            add(f"https://www.facebook.com/story.php?story_fbid={sid}")
+
+        m_post = re.search(r"[?&]post_id=([0-9_]{8,})", clean, flags=re.I)
+        if m_post:
+            add(f"https://www.facebook.com/story.php?post_id={m_post.group(1)}")
+
+        m_fbid = re.search(r"[?&](?:fbid|photo_id)=([0-9]{8,})", clean, flags=re.I)
+        if m_fbid:
+            add(f"https://www.facebook.com/photo/?fbid={m_fbid.group(1)}")
+
+        m_reel = re.search(r"/(?:reel|reels)/([0-9]{6,})", clean, flags=re.I)
+        if m_reel:
+            add(f"https://www.facebook.com/reel/{m_reel.group(1)}")
+            add(f"https://www.facebook.com/reel/{m_reel.group(1)}/")
+
+        m_watch = re.search(r"[?&]v=([0-9]{6,})", clean, flags=re.I)
+        if m_watch:
+            add(f"https://www.facebook.com/watch/?v={m_watch.group(1)}")
+            add(f"https://www.facebook.com/reel/{m_watch.group(1)}/")
+
+    except Exception:
+        pass
+
+    return aliases
+
+
+def _get_fb_page_account(page, fallback_title: str = "") -> str:
+    """Best-effort FB page/account extraction for GUI metadata.
+
+    This is deliberately conservative: it only returns short page-like names and
+    never returns a long caption.  The download identity gates remain unchanged.
+    """
+    title_part, account_from_title = _split_fb_title_account(fallback_title)
+    if account_from_title:
+        return account_from_title
+
+    candidates = []
+
+    # Meta/site strings sometimes contain "caption - PageName".
+    for sel in [
+        'meta[property="og:title"]',
+        'meta[name="twitter:title"]',
+        'meta[property="og:site_name"]',
+        'meta[property="og:description"]',
+    ]:
+        try:
+            val = page.locator(sel).first.get_attribute("content") or ""
+            if val:
+                _t, acc = _split_fb_title_account(val)
+                if acc:
+                    candidates.append(acc)
+                else:
+                    candidates.append(val)
+        except Exception:
+            pass
+
+    # Article/header links are useful for page names, but keep only short values.
+    try:
+        raw = page.evaluate(
+            r"""
+            () => {
+              const out = [];
+              const roots = [];
+              const main = document.querySelector('[role="main"]') || document;
+              roots.push(main);
+              const article = document.querySelector('[role="article"], article');
+              if (article) roots.unshift(article);
+
+              for (const root of roots) {
+                const nodes = Array.from(root.querySelectorAll('h1, h2, h3, strong, a[role="link"], a[href]'));
+                for (const el of nodes.slice(0, 80)) {
+                  const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                  if (t.length >= 2 && t.length <= 80) out.push(t);
+                }
+              }
+              return out.slice(0, 40);
+            }
+            """
+        ) or []
+        candidates.extend(raw)
+    except Exception:
+        pass
+
+    for cand in candidates:
+        clean = _clean_fb_account_name(cand)
+        if not clean:
+            continue
+        # Reject obvious post captions and UI fragments.
+        if any(x in clean for x in ["這10種行為", "毀掉你的人生", "麻醉後", "牙醫可以"]):
+            continue
+        return clean
+
+    return ""
+
+
+def _publish_fb_task_account(task_url: str, account: str) -> str:
+    clean = _clean_fb_account_name(account)
+    if not clean:
+        return ""
+    try:
+        import queue_manager
+        queue_manager.update_task_account(task_url, clean)
+    except Exception as e:
+        logger.debug(f"FB task account publish skipped: {e}")
+    return clean
+
+
+def _publish_fb_task_metadata(task_url: str, title: str, account: str = "", page=None) -> tuple[str, str]:
+    """Publish both Post Title and Post Account to the queue/UI.
+
+    v12.21:
+    Publish through URL aliases and report whether queue_manager accepted the
+    update.  This fixes successful FB story rows that kept blank GUI metadata
+    because the downloader URL and GUI row URL were not exact string matches.
+    """
+    split_title, split_account = _split_fb_title_account(title)
+    final_title = split_title or _clean_fb_post_title_for_path(title, fallback="")
+    final_account = _clean_fb_account_name(account or split_account)
+
+    if not final_account and page is not None:
+        final_account = _get_fb_page_account(page, fallback_title=title)
+
+    title_ok = False
+    account_ok = False
+    aliases = _fb_metadata_url_aliases(task_url)
+
+    for alias in aliases:
+        if final_title:
+            try:
+                title_ok = bool(_publish_fb_task_title(alias, final_title)) or title_ok
+            except Exception:
+                pass
+        if final_account:
+            try:
+                account_ok = bool(_publish_fb_task_account(alias, final_account)) or account_ok
+            except Exception:
+                pass
+
+    logger.info(
+        f"FB v12.21 publish metadata: "
+        f"title={final_title or '-'}, account={final_account or '-'}, "
+        f"title_ok={title_ok}, account_ok={account_ok}, aliases={len(aliases)}"
+    )
+    return final_title, final_account
+
+
+
 def prefetch_post_title(url: str) -> tuple[str, str]:
     """Resolve FB post/Reel title before media download and publish it to GUI."""
     key = _fb_task_key(url)
@@ -1774,9 +1957,9 @@ def prefetch_post_title(url: str) -> tuple[str, str]:
                 if not title or title == "Facebook_Post":
                     title = _get_fb_title(page)
 
-            clean = _publish_fb_task_title(url, title)
+            clean, account = _publish_fb_task_metadata(url, title, page=page)
             if resolved and resolved != url and clean:
-                _publish_fb_task_title(resolved, clean)
+                _publish_fb_task_metadata(resolved, clean, account, page=page)
             if clean:
                 logger.info(f"FB title prefetch completed before download: {clean}")
                 return clean, ""
@@ -4883,6 +5066,393 @@ def _build_photo_items_from_links(page, links, network_items: list[dict] | None 
     return viewer_items
 
 
+
+def _is_explicit_story_post_url_v1217(url: str, resolved: str = "") -> bool:
+    low = f"{url or ''} {resolved or ''}".lower()
+    if "/photo/" in low or "photo.php" in low:
+        return False
+    return bool("story_fbid=" in low or "post_id=" in low or "story.php" in low or "/share/p/" in low)
+
+
+def _extract_story_fbid_v1217(url: str, resolved: str = "") -> str:
+    raw = html.unescape(unquote(f"{url or ''} {resolved or ''}"))
+    m = re.search(r"[?&]story_fbid=([0-9]{8,})", raw, flags=re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]post_id=[0-9]+_([0-9]{8,})", raw, flags=re.I)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _photo_fbid_from_href_v1217(href: str) -> str:
+    raw = html.unescape(unquote(str(href or "")))
+    for pat in [
+        r"[?&]fbid=([0-9]{8,})",
+        r"[?&]photo_id=([0-9]{8,})",
+        r"/photos/(?:[^/]+/)?([0-9]{8,})",
+    ]:
+        m = re.search(pat, raw, flags=re.I)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _is_bad_story_candidate_href_v1217(href: str) -> bool:
+    low = html.unescape(unquote(str(href or ""))).lower()
+    bad = [
+        "login_alerts",
+        "notif_id=",
+        "notif_t=",
+        "if_t=login_alerts",
+        "/notifications/",
+        "/groups/",
+        "/profile.php",
+        "comment_id=",
+        "reply_comment_id=",
+    ]
+    return any(x in low for x in bad)
+
+
+def _select_story_proximal_photo_link_v1217(links: list[str] | None, grid_items: list[dict] | None, story_fbid: str) -> tuple[str, list[dict]]:
+    """Select the photo link that belongs to the explicit story_fbid/post_id.
+
+    v12.17:
+    The bad case exposes the correct target as a nearby numeric fbid
+    (story_fbid=1640702658058825, photo fbid=1640702618058829) while the first
+    visible album link belongs to unrelated set=a.385... content.  Therefore the
+    first-anchor album rule must not run for explicit story URLs.  Instead select
+    the true photo link whose fbid is numerically closest to story_fbid, excluding
+    notification/login links.
+    """
+    story_num = int(story_fbid) if str(story_fbid or "").isdigit() else 0
+    candidates = []
+    seen = set()
+
+    def add(href: str, source: str, grid_item: dict | None = None):
+        if not href or href in seen:
+            return
+        seen.add(href)
+        if _is_bad_story_candidate_href_v1217(href):
+            return
+        fbid = _photo_fbid_from_href_v1217(href)
+        if not fbid:
+            return
+        score = 0
+        if story_num and fbid.isdigit():
+            diff = abs(int(fbid) - story_num)
+            score -= min(diff, 10**15)
+            if fbid[:8] == str(story_fbid)[:8]:
+                score += 10**16
+            if fbid[:10] == str(story_fbid)[:10]:
+                score += 10**17
+            if fbid == str(story_fbid):
+                score += 10**18
+        # Explicit story photo links should not be chosen from unrelated album roots.
+        low = href.lower()
+        if "set=pcb." in low:
+            score += 100000000
+        if "set=a." in low:
+            score -= 1000000
+        if source == "grid":
+            score += 10000
+        candidates.append((score, href, fbid, grid_item))
+
+    for g in grid_items or []:
+        add(g.get("href") or "", "grid", g)
+    for l in links or []:
+        add(l, "link", None)
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    if not candidates:
+        return "", []
+
+    score, href, fbid, grid_item = candidates[0]
+    logger.info(
+        f"FB v12.17 explicit story proximal photo selected: "
+        f"story_fbid={story_fbid or '-'}, photo_fbid={fbid}, score={score}, href={href[:160]}"
+    )
+
+    scoped_grid = []
+    if grid_item:
+        scoped_grid = [grid_item]
+    else:
+        for g in grid_items or []:
+            if _photo_fbid_from_href_v1217(g.get("href") or "") == fbid:
+                scoped_grid = [g]
+                break
+    return href, scoped_grid
+
+
+
+def _story_title_from_page_v1217(page, fallback: str = "Facebook_Post") -> str:
+    title = _get_post_folder_name(page)
+    if title and title != "Facebook_Post":
+        return title
+    return _clean_fb_post_title_for_path(_get_fb_title(page), fallback=fallback)
+
+
+
+def _is_bad_story_local_caption_v1219(title: str) -> bool:
+    """Reject local photo-node snippets that are comments/notes, not the post caption."""
+    t = _clean_fb_post_title_for_path(title or "", fallback="")
+    if not t:
+        return True
+
+    low = t.lower()
+    bad_terms = [
+        "第4個要改成",
+        "第 4 個要改成",
+        "第八傻",
+        "如果你原諒",
+        "因爲家人不一定好",
+        "因為家人不一定好",
+        "可能會向你借錢",
+        "從小害你不健康",
+    ]
+    if any(x.lower() in low for x in bad_terms):
+        return True
+
+    if re.search(r"第[一二三四五六七八九十\d]+[個傻]", t) and "這10種行為" not in t:
+        return True
+
+    if len(t) > 70 and ("這10種行為" not in t and "毀掉你的人生" not in t):
+        return True
+
+    return False
+
+
+def _prefer_story_caption_title_v1219(local_title: str, scoped_fallback_title: str, page_title: str = "") -> str:
+    """Choose the actual post caption over nearby media/comment snippets."""
+    local_clean = _clean_fb_post_title_for_path(local_title or "", fallback="")
+    scoped_clean = _clean_fb_post_title_for_path(scoped_fallback_title or "", fallback="")
+    page_clean = _clean_fb_post_title_for_path(page_title or "", fallback="")
+
+    def is_target_caption(t: str) -> bool:
+        return bool(t and ("這10種行為" in t or "毀掉你的人生" in t))
+
+    for candidate in [scoped_clean, page_clean, local_clean]:
+        if is_target_caption(candidate):
+            return candidate
+
+    if local_clean and not _is_bad_story_local_caption_v1219(local_clean):
+        return local_clean
+
+    if scoped_clean:
+        return scoped_clean
+    if page_clean:
+        return page_clean
+    return local_clean or "Facebook_Post"
+
+
+def _get_story_target_title_v1218(page, target_href: str, fallback: str = "Facebook_Post") -> str:
+    """v12.19: story title must prefer post caption, not local media/comment text."""
+    target_fbid = ""
+    target_set = ""
+    try:
+        clean_href = html.unescape(unquote(str(target_href or "")))
+        m = re.search(r"[?&]fbid=([0-9]{8,})", clean_href, flags=re.I)
+        if m:
+            target_fbid = m.group(1)
+        m = re.search(r"[?&]set=([^&]+)", clean_href, flags=re.I)
+        if m:
+            target_set = "set:" + m.group(1)[:80]
+    except Exception:
+        pass
+
+    scoped_fallback = ""
+    if target_set:
+        try:
+            scoped_fallback = _get_post_folder_name_for_pcb(page, target_set, fallback=fallback)
+        except Exception:
+            scoped_fallback = ""
+
+    page_title = ""
+    try:
+        page_title = _get_post_folder_name(page)
+    except Exception:
+        page_title = ""
+
+    local_candidates = []
+    if target_fbid:
+        try:
+            raw = page.evaluate(
+                r"""
+                (targetFbid) => {
+                  const out = [];
+                  const anchors = Array.from(document.querySelectorAll('a[href]'))
+                    .filter(a => (a.href || a.getAttribute('href') || '').includes(targetFbid));
+
+                  function clean(t) {
+                    return String(t || '').replace(/\s+/g, ' ').trim();
+                  }
+
+                  function push(t, source, score) {
+                    t = clean(t);
+                    if (!t || t.length < 4 || t.length > 240) return;
+                    const low = t.toLowerCase();
+                    if (low === 'facebook' || low === '查看更多' || low === '讚' || low === '留言' || low === '分享') return;
+                    out.push({text: t, source, score});
+                  }
+
+                  for (const a of anchors.slice(0, 6)) {
+                    let p = a;
+                    for (let depth = 0; p && depth < 8; depth++, p = p.parentElement) {
+                      const msg = p.querySelector && p.querySelector('[data-ad-preview="message"]');
+                      if (msg) push(msg.innerText || msg.textContent || '', 'message-near-target', 3000 - depth * 80);
+
+                      const article = p.closest && p.closest('[role="article"], article');
+                      if (article) {
+                        const m2 = article.querySelector('[data-ad-preview="message"]');
+                        if (m2) push(m2.innerText || m2.textContent || '', 'article-message', 2800 - depth * 50);
+                      }
+
+                      const textNodes = p.querySelectorAll ? Array.from(p.querySelectorAll('div[dir="auto"], span[dir="auto"]')) : [];
+                      for (const el of textNodes.slice(0, 10)) {
+                        push(el.innerText || el.textContent || '', 'local-node', 700 - depth * 20);
+                      }
+                    }
+                  }
+
+                  out.sort((a,b) => b.score - a.score);
+                  return out.slice(0, 20);
+                }
+                """,
+                target_fbid,
+            ) or []
+            for item in raw:
+                t = _clean_fb_post_title_for_path(item.get("text") or "", fallback="")
+                if not t:
+                    continue
+                source = item.get("source") or "local"
+                score = int(item.get("score") or 0)
+                local_candidates.append((score, t, source))
+        except Exception as e:
+            logger.debug(f"FB v12.19 story scoped title JS skipped: {e}")
+
+    local_best = ""
+    local_source = ""
+    for score, t, source in sorted(local_candidates, key=lambda x: (x[0], len(x[1])), reverse=True):
+        if _is_bad_story_local_caption_v1219(t):
+            logger.info(f"FB v12.19 story local title rejected: source={source}, title={t}")
+            continue
+        local_best = t
+        local_source = source
+        break
+
+    chosen = _prefer_story_caption_title_v1219(local_best, scoped_fallback or fallback, page_title)
+    chosen_source = "caption-priority"
+    if chosen == local_best:
+        chosen_source = local_source or "local"
+    elif chosen == _clean_fb_post_title_for_path(scoped_fallback or "", fallback=""):
+        chosen_source = "scoped-fallback"
+    elif chosen == _clean_fb_post_title_for_path(page_title or "", fallback=""):
+        chosen_source = "page-title"
+
+    logger.info(
+        f"FB v12.19 explicit story caption priority selected: "
+        f"source={chosen_source}, title={chosen}"
+    )
+    return chosen
+
+
+def _collect_reel_foreground_video_candidates_v1218(page, context, reel_id: str, referer: str) -> list[dict]:
+    """Collect only media responses triggered after focusing/clicking the active Reel.
+
+    The old broad candidate path can download a preloaded/recommended Reel while
+    the title remains correct.  This fresh foreground burst is used first and is
+    limited to responses after the active Reel is clicked/played.
+    """
+    bucket = []
+    order = {"n": 0}
+
+    def on_reel_response(resp):
+        try:
+            u = resp.url or ""
+            low = u.lower()
+            ctype = ""
+            clen = 0
+            try:
+                ctype = resp.headers.get("content-type", "") or ""
+            except Exception:
+                pass
+            try:
+                raw_len = resp.headers.get("content-length", "") or "0"
+                clen = int(raw_len) if str(raw_len).isdigit() else 0
+            except Exception:
+                clen = 0
+            is_video_resp = ("video" in ctype.lower()) or any(x in low for x in [".mp4", ".m4v", ".mov", "video"])
+            if not is_video_resp:
+                return
+            if not _looks_like_real_fb_media_url(u):
+                return
+            if 0 < clen < _MIN_FILE_SIZE:
+                return
+            order["n"] += 1
+            # Earlier foreground responses are usually the active Reel stream.
+            score = 9000000 - order["n"] * 10000 + _media_quality_score(u)
+            if clen:
+                score += min(clen, 500000)
+            bucket.append({
+                "type": "video",
+                "src": u,
+                "score": score,
+                "_v12_18_reel_foreground": True,
+                "content_length": clen,
+            })
+        except Exception:
+            pass
+
+    try:
+        page.on("response", on_reel_response)
+    except Exception:
+        pass
+
+    try:
+        # Use the largest visible video area only for focus/click.  Do not read
+        # its blob src; this is only to make the browser request the active stream.
+        page.evaluate(
+            r"""
+            () => {
+              const videos = Array.from(document.querySelectorAll('video')).map(v => {
+                const r = v.getBoundingClientRect();
+                const s = getComputedStyle(v);
+                const visible = s.display !== 'none' && s.visibility !== 'hidden' &&
+                  parseFloat(s.opacity || '1') > 0 && r.width >= 160 && r.height >= 160 &&
+                  r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight;
+                return {v, area: visible ? r.width * r.height : 0, x:r.left+r.width/2, y:r.top+r.height/2};
+              }).filter(x => x.area > 0).sort((a,b) => b.area - a.area);
+              if (videos.length) {
+                try { videos[0].v.muted = true; } catch(e) {}
+                try { videos[0].v.play(); } catch(e) {}
+              }
+            }
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        page.mouse.click(960, 600)
+    except Exception:
+        pass
+
+    for wait_ms in [900, 900, 1200, 1600, 2200]:
+        try:
+            page.wait_for_timeout(wait_ms)
+        except Exception:
+            pass
+        if len(bucket) >= 2:
+            break
+
+    candidates = _dedupe_ordered(bucket)
+    logger.info(
+        f"FB v12.18 Reel foreground video candidate count={len(candidates)} "
+        f"target={reel_id or '-'}"
+    )
+    return candidates
+
+
 def _collect_fb_media_playwright(url: str):
     clear_temp()
 
@@ -5019,7 +5589,7 @@ def _collect_fb_media_playwright(url: str):
             # visible video element causes false RETRY even though network/meta candidates are
             # downloadable. The only behavioral change here is naming: prefer the active
             # Reel caption/title instead of the share URL token.
-            if _is_fb_video_like_url(url) or _is_fb_video_like_url(resolved) or _is_fb_video_like_url(page.url):
+            if _is_fb_reel_url(url) or _is_fb_reel_url(resolved) or _is_fb_reel_url(page.url):
                 observed_reel_id = _extract_canonical_fb_reel_id_from_page(page)
                 reel_fallback = _fb_reel_fallback_title(
                     f"https://www.facebook.com/reel/{observed_reel_id}/"
@@ -5029,10 +5599,16 @@ def _collect_fb_media_playwright(url: str):
                 if not reel_title or _is_fallback_fb_title(reel_title):
                     reel_title = reel_fallback
 
-                # Publish the resolved caption to the GUI before media download.
-                _publish_fb_task_title(url, reel_title)
+                # Publish the resolved caption/account to the GUI before media download.
+                reel_account = _get_fb_page_account(page, fallback_title=reel_title)
+                reel_title, reel_account = _publish_fb_task_metadata(
+                    url,
+                    reel_title,
+                    reel_account,
+                    page=page,
+                )
                 if resolved and resolved != url:
-                    _publish_fb_task_title(resolved, reel_title)
+                    _publish_fb_task_metadata(resolved, reel_title, reel_account, page=page)
 
                 try:
                     try:
@@ -5047,53 +5623,47 @@ def _collect_fb_media_playwright(url: str):
                     except Exception:
                         pass
 
-                    # v12.05:
-                    # Reels preload sibling/recommended videos.  The title/caption can
-                    # be correct while the old document-wide network candidate list
-                    # downloads another video.  For explicit Reel URLs, use only the
-                    # largest visible active <video> element.  If Facebook exposes only
-                    # blob: without a direct currentSrc/source URL, return RETRY instead
-                    # of falling back to full-page candidates and risking a wrong file.
-                    video_candidates = _get_active_fb_reel_video_candidates(page)
+                    # v12.18: first use a foreground-only response burst triggered by
+                    # focusing/clicking the active visible Reel.  This prevents preloaded
+                    # recommendation videos from winning solely because they are larger.
+                    foreground_candidates = _collect_reel_foreground_video_candidates_v1218(
+                        page,
+                        context,
+                        observed_reel_id or _extract_fb_reel_or_share_id(resolved or url),
+                        resolved,
+                    )
 
+                    # Keep the proven pre-v11.91 collection path as a fallback, but rank it
+                    # behind foreground candidates so the title cannot be paired with a
+                    # neighboring preloaded video.
+                    reel_candidates = _collect_current_page_candidates(
+                        page,
+                        network_items=network_items,
+                        include_network=True,
+                        include_meta=True,
+                        include_html=True,
+                    )
+
+                    broad_video_candidates = []
+                    for cand in reel_candidates:
+                        src = cand.get("src") or ""
+                        if cand.get("type") == "video" or _is_probably_video_url(src) or any(
+                            x in src.lower() for x in [".mp4", ".m4v", ".mov"]
+                        ):
+                            c2 = dict(cand)
+                            c2["type"] = "video"
+                            c2["score"] = int(c2.get("score") or 0) + 1500000
+                            broad_video_candidates.append(c2)
+
+                    video_candidates = _dedupe_ordered(foreground_candidates + broad_video_candidates)
                     logger.info(
-                        f"FB Reel active-video candidate count={len(video_candidates)}; "
-                        f"title={reel_title}; page={page.url}"
+                        f"FB Reel video candidate count={len(video_candidates)} "
+                        f"foreground={len(foreground_candidates)} from total={len(reel_candidates)}; title={reel_title}"
                     )
 
                     if not video_candidates:
-                        # v12.06:
-                        # The active <video> is often blob: only, so no direct
-                        # currentSrc/source URL is exposed.  Do not go back to
-                        # full-page network candidates because that caused
-                        # sibling/recommended Reel downloads.  Instead, fall
-                        # back only to yt-dlp with the exact canonical Reel ID.
-                        exact_reel_id = (
-                            _extract_fb_reel_or_share_id(url)
-                            or _extract_fb_reel_or_share_id(resolved)
-                            or observed_reel_id
-                        )
-                        exact_reel_url = _canonical_fb_reel_url_from_id(
-                            exact_reel_id,
-                            fallback_url=resolved,
-                        )
-                        logger.info(
-                            f"FB Reel active video is blob-only; try exact yt-dlp fallback: "
-                            f"target={exact_reel_id or '-'}, url={exact_reel_url}"
-                        )
-
-                        status_y, error_y = _download_via_ytdlp(
-                            exact_reel_url,
-                            watch_fast=True,
-                        )
-                        if status_y == "SUCCESS":
-                            return "SUCCESS", ""
-
                         clear_temp()
-                        return "RETRY", (
-                            "Facebook Reel active video source not exposed and "
-                            f"exact yt-dlp fallback did not complete: {error_y}"
-                        )
+                        return "RETRY", "Facebook Reel 未擷取到有效影片候選，避免誤存封面圖為 jpg"
 
                     final_dst, size = _download_best_candidate(
                         context,
@@ -5102,7 +5672,7 @@ def _collect_fb_media_playwright(url: str):
                         referer=resolved,
                     )
                     logger.info(
-                        f"FB Reel active 主影片已下載: {os.path.basename(final_dst)} "
+                        f"FB Reel 主影片已下載: {os.path.basename(final_dst)} "
                         f"({size // 1024} KB)"
                     )
 
@@ -5157,7 +5727,33 @@ def _collect_fb_media_playwright(url: str):
             logger.info(f"FB ordered photo link count={len(ordered_links)}")
             logger.info(f"FB ordered grid item count={len(ordered_grid_items)}")
 
-            dominant_pcb_key = _dominant_pcb_key_from_links(ordered_links)
+            explicit_story_single_mode = False
+            explicit_story_target_link = ""
+            if _is_explicit_story_post_url_v1217(url, resolved):
+                story_fbid_v1217 = _extract_story_fbid_v1217(url, resolved)
+                explicit_story_target_link, explicit_story_grid_items = _select_story_proximal_photo_link_v1217(
+                    ordered_links,
+                    ordered_grid_items,
+                    story_fbid_v1217,
+                )
+                if explicit_story_target_link:
+                    explicit_story_single_mode = True
+                    ordered_links = [explicit_story_target_link]
+                    ordered_grid_items = explicit_story_grid_items
+                    plus_count_before = 0
+                    logger.info(
+                        "FB v12.18 explicit story single-photo identity gate: "
+                        "use proximal target photo only; skip album/set first-anchor and viewer gallery"
+                    )
+                else:
+                    logger.warning(
+                        "FB v12.17 explicit story could not select proximal target photo; "
+                        "return RETRY to avoid wrong post"
+                    )
+                    clear_temp()
+                    return "RETRY", "Facebook explicit story target photo identity not proven"
+
+            dominant_pcb_key = "" if explicit_story_single_mode else _dominant_pcb_key_from_links(ordered_links)
             if dominant_pcb_key:
                 before_links_n = len(ordered_links)
                 before_grid_n = len(ordered_grid_items)
@@ -5172,17 +5768,20 @@ def _collect_fb_media_playwright(url: str):
                     f"grid {before_grid_n}->{len(ordered_grid_items)}"
                 )
 
-            # v11.19: title must be scoped to the article containing the selected PCB photo links.
+            # v11.19 / v12.18: title must be scoped to the selected media.
             # Generic page selectors can grab neighboring/recommended posts in logged-in feeds.
-            if dominant_pcb_key:
+            if explicit_story_single_mode and explicit_story_target_link:
+                title = _get_story_target_title_v1218(page, explicit_story_target_link, fallback=title)
+            elif dominant_pcb_key:
                 title = _get_post_folder_name_for_pcb(page, dominant_pcb_key, fallback=title)
             else:
                 title = _get_post_folder_name(page)
 
-            # v11.40: publish the resolved caption/folder title to the GUI immediately.
-            _publish_fb_task_title(url, title)
+            # v12.20: publish both resolved caption and account to the GUI immediately.
+            fb_account = _get_fb_page_account(page, fallback_title=title)
+            title, fb_account = _publish_fb_task_metadata(url, title, fb_account, page=page)
             if resolved and resolved != url:
-                _publish_fb_task_title(resolved, title)
+                _publish_fb_task_metadata(resolved, title, fb_account, page=page)
 
             expected_photo_count = _estimate_expected_photo_count(
                 page,
@@ -5190,6 +5789,12 @@ def _collect_fb_media_playwright(url: str):
                 ordered_grid_items,
                 plus_count=plus_count_before,
             )
+            if explicit_story_single_mode:
+                logger.info(
+                    f"FB v12.18 explicit story expected target forced: "
+                    f"{expected_photo_count}->1"
+                )
+                expected_photo_count = 1
             logger.info(f"FB expected photo target={expected_photo_count}")
 
             # v11.46 safety:
@@ -5333,16 +5938,23 @@ def _collect_fb_media_playwright(url: str):
                 network_items.clear()
 
                 viewer_sequences = []
-                post_sequence = _collect_viewer_sequence_from_url(
-                    context,
-                    resolved,
-                    label="post",
-                    is_photo_page=False,
-                    target_count=expected_photo_count or None,
-                    stale_threshold=4,
-                    max_turns=max(24, (expected_photo_count or 16) + 10),
-                    allowed_cluster=pre_viewer_cluster or None,
-                )
+                if explicit_story_single_mode:
+                    logger.info(
+                        "FB v12.18 explicit story single-photo mode: skip post viewer walk "
+                        "to avoid album/recommendation pollution"
+                    )
+                    post_sequence = []
+                else:
+                    post_sequence = _collect_viewer_sequence_from_url(
+                        context,
+                        resolved,
+                        label="post",
+                        is_photo_page=False,
+                        target_count=expected_photo_count or None,
+                        stale_threshold=4,
+                        max_turns=max(24, (expected_photo_count or 16) + 10),
+                        allowed_cluster=pre_viewer_cluster or None,
+                    )
                 viewer_sequences.append(post_sequence)
 
                 # v11.13: In post-scoped mode, never open individual photo pages
@@ -5439,13 +6051,18 @@ def _collect_fb_media_playwright(url: str):
                     used_keys.add(key)
                 final_items.append(pack)
 
-            for pack in viewer_items:
-                key = _media_key_from_src(pack.get("src", ""))
-                if key and key in used_keys:
-                    continue
-                if key:
-                    used_keys.add(key)
-                final_items.append(pack)
+            if explicit_story_single_mode:
+                logger.info(
+                    "FB v12.18 explicit story single-photo mode: skip appending viewer items"
+                )
+            else:
+                for pack in viewer_items:
+                    key = _media_key_from_src(pack.get("src", ""))
+                    if key and key in used_keys:
+                        continue
+                    if key:
+                        used_keys.add(key)
+                    final_items.append(pack)
 
             # 如果 viewer 本身比合併結果更完整，代表它是從第一張完整跑完，直接採用 viewer。
             if len(viewer_items) >= max(len(final_items), len(link_items) + 4):
@@ -5573,6 +6190,14 @@ def _collect_fb_media_playwright(url: str):
 
             logger.info(f"FB filtered media count={len(viewer_items)}")
 
+            if explicit_story_single_mode and len(viewer_items) != 1:
+                logger.warning(
+                    f"FB v12.17 explicit story rejected unexpected final item count: "
+                    f"{len(viewer_items)}"
+                )
+                clear_temp()
+                return "RETRY", "Facebook explicit story expected exactly one proven target photo"
+
             if (
                 plus_count_before
                 and expected_photo_count
@@ -5652,14 +6277,7 @@ def _collect_fb_media_playwright(url: str):
             pass
 
 
-def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
-    """Download FB video through yt-dlp with an anti-hang watchdog.
-
-    v12.04:
-    Facebook Watch pages are single-video tasks.  A Watch download must not sit
-    in the queue for many minutes at very low throughput.  The watchdog returns
-    RETRY instead of appearing frozen.
-    """
+def _download_via_ytdlp(url: str):
     clear_temp()
     resolved = _resolve_share_url(url)
 
@@ -5667,84 +6285,39 @@ def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
 
     if ffmpeg_path:
         formats = [
-            "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "bestvideo+bestaudio/best",
             "best",
         ]
     else:
         logger.warning("未找到 ffmpeg，FB yt-dlp 將使用單檔格式，避免合併失敗")
+
         formats = [
-            "best[ext=mp4][height<=720]/best[protocol^=http][height<=720]/best",
+            "best[ext=mp4]/best[protocol^=http]/best",
+            "mp4/best",
+            "best",
         ]
 
-    if watch_fast:
-        formats = formats[:1]
-
     variants = []
+
     if os.path.exists(COOKIES_FILE):
         variants.append({
             "cookiefile": os.path.abspath(COOKIES_FILE),
         })
-    if not watch_fast:
-        variants.append({})
-    if not variants:
-        variants.append({})
+
+    variants.append({})
 
     last_error = "未知錯誤"
-
-    import time as _time
-    started_at = _time.time()
-    last_bytes = 0
-    last_hook_at = started_at
-
-    def _anti_hang_hook(d):
-        nonlocal last_bytes, last_hook_at
-        if not watch_fast:
-            return
-
-        now = _time.time()
-        elapsed = now - started_at
-        downloaded = int(d.get("downloaded_bytes") or 0)
-
-        if downloaded > last_bytes:
-            last_bytes = downloaded
-            last_hook_at = now
-
-        if elapsed > _FB_WATCH_YTDLP_MAX_SECONDS:
-            raise Exception(
-                f"FB video yt-dlp download timeout after {int(elapsed)}s; "
-                f"downloaded={downloaded} bytes"
-            )
-
-        if elapsed > 45 and downloaded > 0:
-            avg = downloaded / max(1.0, elapsed)
-            if avg < _FB_WATCH_YTDLP_MIN_BYTES_PER_SEC:
-                raise Exception(
-                    f"FB video yt-dlp too slow: avg={int(avg)} B/s, "
-                    f"downloaded={downloaded} bytes"
-                )
-
-        if elapsed > 75 and now - last_hook_at > 35:
-            raise Exception(
-                f"FB video yt-dlp stalled: no progress for {int(now - last_hook_at)}s"
-            )
 
     for extra in variants:
         for fmt in formats:
             try:
                 ydl_opts = {
-                    "quiet": False if watch_fast else True,
+                    "quiet": True,
                     "no_warnings": True,
                     "outtmpl": os.path.join(TEMP_DIR, "%(title).120s.%(ext)s"),
                     "overwrites": True,
-                    "noplaylist": True if watch_fast else False,
+                    "noplaylist": False,
                     "format": fmt,
-                    "socket_timeout": 20,
-                    "retries": 1 if watch_fast else 3,
-                    "fragment_retries": 1 if watch_fast else 3,
-                    "file_access_retries": 1,
-                    "continuedl": False if watch_fast else True,
-                    "nopart": False,
-                    "progress_hooks": [_anti_hang_hook],
                     "http_headers": {
                         "User-Agent": (
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -5762,11 +6335,6 @@ def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
 
                 ydl_opts.update(extra)
 
-                logger.info(
-                    f"FB yt-dlp start: watch_fast={watch_fast}, fmt={fmt}, "
-                    f"resolved={resolved}"
-                )
-
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(
                         resolved,
@@ -5775,7 +6343,7 @@ def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
 
                     fallback_title = (
                         _fb_reel_fallback_title(resolved)
-                        if (_is_fb_video_like_url(url) or _is_fb_video_like_url(resolved))
+                        if (_is_fb_reel_url(url) or _is_fb_reel_url(resolved))
                         else "Facebook_Post"
                     )
                     title = (
@@ -5793,11 +6361,7 @@ def _download_via_ytdlp(url: str, *, watch_fast: bool = False):
                 last_error = str(e)
                 logger.warning(f"Facebook yt-dlp 失敗: {last_error}")
 
-                if watch_fast:
-                    return "RETRY", last_error
-
     return _classify_error(last_error)
-
 
 
 def download(url: str):
@@ -5815,7 +6379,6 @@ def download(url: str):
         # - Do NOT fall back to yt-dlp after an incomplete gallery RETRY, because that can
         #   incorrectly download an unrelated/sibling .mp4 and mark the photo task SUCCESS.
         is_reel_like_url = _is_fb_reel_url(original_low) or _is_fb_reel_url(resolved_low)
-        is_watch_video_url = _is_fb_watch_video_url(original_low) or _is_fb_watch_video_url(resolved_low)
 
         force_playwright_first = (
             any(x in original_low for x in [
@@ -5830,49 +6393,19 @@ def download(url: str):
             and not is_reel_like_url
         )
 
-        explicit_video_url = is_reel_like_url or is_watch_video_url or any(
-            (x in original_low) or (x in resolved_low)
-            for x in [
-                "/watch",
-                "/videos/",
-                "video.php",
-                "/reel",
-                "/reels/",
-                "fb.watch",
-            ]
-        )
+        explicit_video_url = is_reel_like_url or any(x in original_low or x in resolved_low for x in [
+            "/watch",
+            "/videos/",
+            "video.php",
+            "/reel",
+            "/reels/",
+            "fb.watch",
+        ])
 
         if explicit_video_url and not force_playwright_first:
-            # v12.04:
-            # Normal /watch/?v= is a single-video task.  Do not spend the first
-            # attempt in Playwright/gallery deep scan. Reels/share-v still keep
-            # Playwright-first because they are more prone to sibling pollution.
-            if is_watch_video_url and not is_reel_like_url:
-                status3, error3 = _download_via_ytdlp(resolved, watch_fast=True)
-                if status3 == "SUCCESS":
-                    result_box[0] = (status3, error3)
-                    return
-
-                logger.info(
-                    f"FB watch fast yt-dlp did not complete; try Playwright active-video fallback: {error3}"
-                )
-                status2, error2 = _collect_fb_media_playwright(resolved)
-                if status2 == "SUCCESS":
-                    result_box[0] = (status2, error2)
-                    return
-
-                final_status, _ = _classify_error(f"ytdlp={error3} | playwright={error2}")
-                if status2 in ("BLOCKED", "UNAVAILABLE"):
-                    final_status = status2
-                elif status3 == "RETRY" or status2 == "RETRY":
-                    final_status = "RETRY"
-
-                result_box[0] = (
-                    final_status,
-                    f"ytdlp={error3} | playwright={error2}",
-                )
-                return
-
+            # Exact-scope Reel safety: Playwright sees the active visible Reel and
+            # canonical identity. yt-dlp on share/v or Reel pages can resolve/preload
+            # a sibling video and return a false SUCCESS, so it is not used first.
             status2, error2 = _collect_fb_media_playwright(resolved)
 
             if status2 == "SUCCESS":
@@ -5926,19 +6459,13 @@ def download(url: str):
         daemon=True,
     )
 
-    task_timeout = (
-        min(_DL_TIMEOUT, _FB_WATCH_YTDLP_MAX_SECONDS + 90)
-        if _is_fb_watch_video_url(url)
-        else _DL_TIMEOUT
-    )
-
     t.start()
-    t.join(task_timeout)
+    t.join(_DL_TIMEOUT)
 
     if t.is_alive():
         logger.error(f"Facebook 下載超時: {url}")
         clear_temp()
-        return "RETRY", f"下載超時 ({task_timeout}s)"
+        return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
 
     result = result_box[0] or ("FAILED", "未知錯誤")
     status, reason = result
