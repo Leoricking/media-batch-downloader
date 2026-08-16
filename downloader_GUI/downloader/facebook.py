@@ -1,3 +1,6 @@
+# v12.24 Album Context Caption Fix
+# v12.23 Album Context Single Photo + Title Split Fix
+# v12.22 Full Gallery Viewer Completion Fix
 # v12.21 FB Metadata Alias Publish Fix
 # v12.20 FB Publish Account + Title Metadata Fix
 # v12.19 Story Caption Priority Fix
@@ -1225,13 +1228,16 @@ def _is_verified_fb_best_available_source_file(path: str, src: str = "") -> tupl
     if not w or not h:
         return False, "無法驗證圖片尺寸"
 
-    # Do not accept tiny UI thumbnails/icons.  480x320 is allowed only in the
-    # exact full-gallery best-available path because some FB meme/anime uploads
-    # are genuinely stored at that size.
-    if max(w, h) < 480 or min(w, h) < 300:
+    # v12.22:
+    # In exact-count full-gallery mode the viewer already proved this is one
+    # required gallery item.  Some FB pages only expose a small best-available
+    # source for one slide while high-res variants are HTTP 403.  Keep the gate
+    # high enough to reject icons/avatar sprites, but allow the proven viewer
+    # item instead of forcing the whole 14-photo post into RETRY.
+    if max(w, h) < 300 or min(w, h) < 200:
         return False, f"best-available 尺寸仍過小: actual={w}x{h}"
 
-    return True, f"actual={w}x{h}, bytes={size}"
+    return True, f"v12.22 exact-gallery best-available actual={w}x{h}, bytes={size}"
 
 
 def _download_best_candidate(context, candidates, dst_base: str, referer: str):
@@ -1704,27 +1710,56 @@ def _clean_fb_account_name(raw: str) -> str:
     return safe_title(value)[:60].strip(" ._-，,。") or ""
 
 
+
+def _looks_like_fb_page_name_v1223(value: str) -> bool:
+    v = _clean_fb_account_name(value)
+    if not v or len(v) > 40:
+        return False
+    if any(x in v for x in ["？", "?", "！", "!", "。", "；", ";", "：", ":", "，", ",", "#", "http"]):
+        return False
+    if v.count(" ") > 3:
+        return False
+    return True
+
+
+def _looks_like_fb_caption_v1223(value: str) -> bool:
+    t = _clean_fb_post_title_for_path(value, fallback="")
+    if not t:
+        return False
+    return len(t) >= 14 or any(x in t for x in ["？", "?", "！", "!", "。", "；", ";", "：", ":", "，", ",", "#", "http", "看到了嗎"])
+
+
 def _split_fb_title_account(title: str) -> tuple[str, str]:
-    """Split common Facebook title strings into (post_title, account).
+    """Split FB text into (post_title, account).
 
-    Examples:
-      "這10種行為... - Elites insider 企業精英"
-      "caption | Elites insider 企業精英"
+    v12.23 supports both:
+      Account - Caption
+      Caption - Account
     """
-    raw = _to_traditional(str(title or ""))
-    raw = html.unescape(raw).strip()
-
-    # Prefer the final " - PageName" suffix when the left side is a real caption.
+    raw = html.unescape(_to_traditional(str(title or ""))).strip()
     for sep in [" - ", " ｜ ", " | "]:
-        if sep in raw:
-            left, right = raw.rsplit(sep, 1)
-            clean_left = _clean_fb_post_title_for_path(left, fallback="")
-            clean_right = _clean_fb_account_name(right)
-            if clean_left and clean_right:
-                return clean_left, clean_right
+        if sep not in raw:
+            continue
+        left, right = raw.rsplit(sep, 1)
+        left_title = _clean_fb_post_title_for_path(left, fallback="")
+        right_title = _clean_fb_post_title_for_path(right, fallback="")
+        left_account = _clean_fb_account_name(left)
+        right_account = _clean_fb_account_name(right)
+        left_page = _looks_like_fb_page_name_v1223(left)
+        right_page = _looks_like_fb_page_name_v1223(right)
+        left_caption = _looks_like_fb_caption_v1223(left)
+        right_caption = _looks_like_fb_caption_v1223(right)
+
+        if left_page and right_caption:
+            return right_title, left_account
+        if left_caption and right_page:
+            return left_title, right_account
+        if left_title and right_account and right_page:
+            return left_title, right_account
+        if right_title and left_account:
+            return right_title, left_account
 
     return _clean_fb_post_title_for_path(raw, fallback=""), ""
-
 
 
 def _fb_metadata_url_aliases(task_url: str) -> list[str]:
@@ -5453,6 +5488,158 @@ def _collect_reel_foreground_video_candidates_v1218(page, context, reel_id: str,
     return candidates
 
 
+def _is_bad_album_context_caption_v1224(text: str, account: str = "") -> bool:
+    t = _clean_fb_post_title_for_path(text or "", fallback="")
+    if not t:
+        return True
+    low = t.lower()
+    account_clean = _clean_fb_account_name(account)
+    bad_exact = {
+        "讚", "留言", "分享", "回覆", "最相關", "查看更多", "查看2則回覆",
+        "facebook", "facebook_post", "相片", "照片",
+    }
+    if low in {x.lower() for x in bad_exact}:
+        return True
+    if account_clean and t == account_clean:
+        return True
+    bad_fragments = [
+        "以 rossi huang 的身分留言",
+        "留言",
+        "回覆",
+        "粉絲黎昇",
+        "看更多相關內容",
+        "https://www.facebook.com/reel/",
+        "潘政和其他",
+        "則回覆",
+    ]
+    if any(x.lower() in low for x in bad_fragments):
+        return True
+    # Reject short UI/person-only snippets unless they contain obvious caption words.
+    if len(t) < 8 and not any(x in t for x in ["#", "？", "！", "尹敬浩", "弘大旁編"]):
+        return True
+    return False
+
+
+def _get_album_context_caption_v1224(page, fallback: str = "Facebook_Post", account: str = "") -> str:
+    """Extract caption from FB right-side photo viewer panel.
+
+    Album/photo viewer pages are not normal feed articles.  Generic post title
+    selectors often return Facebook_Post, while the real caption lives in the
+    right rail near the page/account name and timestamp.
+    """
+    candidates = []
+    try:
+        raw = page.evaluate(
+            r"""
+            () => {
+              const out = [];
+
+              function clean(t) {
+                return String(t || '').replace(/\s+/g, ' ').trim();
+              }
+              function push(t, source, score) {
+                t = clean(t);
+                if (!t || t.length < 4 || t.length > 260) return;
+                out.push({text:t, source, score});
+              }
+
+              const roots = [];
+              const comp = document.querySelector('[role="complementary"]');
+              if (comp) roots.push({root: comp, source: 'complementary', base: 5000});
+
+              const main = document.querySelector('[role="main"]');
+              if (main) roots.push({root: main, source: 'main', base: 3500});
+
+              roots.push({root: document.body, source: 'body', base: 1000});
+
+              for (const pack of roots) {
+                const root = pack.root;
+                const msgNodes = Array.from(root.querySelectorAll('[data-ad-preview="message"], [data-ad-comet-preview="message"]'));
+                for (const el of msgNodes.slice(0, 10)) {
+                  push(el.innerText || el.textContent || '', pack.source + ':message', pack.base + 1000);
+                }
+
+                const autos = Array.from(root.querySelectorAll('div[dir="auto"], span[dir="auto"]'));
+                for (const el of autos.slice(0, 80)) {
+                  const txt = clean(el.innerText || el.textContent || '');
+                  if (!txt) continue;
+                  let score = pack.base;
+                  if (txt.includes('#')) score += 450;
+                  if (txt.includes('弘大旁編') || txt.includes('尹敬浩')) score += 1200;
+                  if (txt.includes('留言') || txt.includes('回覆') || txt.includes('讚')) score -= 600;
+                  push(txt, pack.source + ':dir-auto', score);
+                }
+              }
+
+              out.sort((a,b) => b.score - a.score || b.text.length - a.text.length);
+              return out.slice(0, 80);
+            }
+            """
+        ) or []
+        for item in raw:
+            t = _clean_fb_post_title_for_path(item.get("text") or "", fallback="")
+            source = item.get("source") or "unknown"
+            score = int(item.get("score") or 0)
+            if not t:
+                continue
+            candidates.append((score, t, source))
+    except Exception as e:
+        logger.debug(f"FB v12.24 album-context caption JS skipped: {e}")
+
+    account_clean = _clean_fb_account_name(account)
+    for score, t, source in sorted(candidates, key=lambda x: (x[0], len(x[1])), reverse=True):
+        if _is_bad_album_context_caption_v1224(t, account_clean):
+            logger.debug(f"FB v12.24 album-context caption rejected: source={source}, title={t}")
+            continue
+        logger.info(f"FB v12.24 album-context caption selected: source={source}, title={t}")
+        return t
+
+    clean_fallback = _clean_fb_post_title_for_path(fallback or "", fallback="")
+    if clean_fallback and clean_fallback != "Facebook_Post":
+        return clean_fallback
+    return "Facebook_Post"
+
+
+
+def _is_album_context_single_photo_v1223(
+    *,
+    url: str,
+    resolved: str,
+    dominant_pcb_key: str,
+    ordered_grid_items: list | None,
+    ordered_links: list | None,
+    plus_count_before: int,
+) -> bool:
+    """Detect album/photo-viewer context that must not walk same-album photos."""
+    low = f"{url or ''} {resolved or ''}".lower()
+    key = str(dominant_pcb_key or "").lower()
+    links = ordered_links or []
+    grid = ordered_grid_items or []
+    if not key.startswith("set:a."):
+        return False
+    if plus_count_before:
+        return False
+    if len(grid) > 0:
+        return False
+    if len(links) < 3:
+        return False
+    if any("comment_id=" in (x or "").lower() for x in links):
+        return True
+    if "/share/" in low and "story_fbid=" not in low and "post_id=" not in low:
+        return True
+    return False
+
+
+def _force_single_photo_items_v1223(link_items: list[dict] | None, viewer_items: list[dict] | None) -> list[dict]:
+    """Keep only the first proven image item for unsafe album context."""
+    for seq in [link_items or [], viewer_items or []]:
+        for item in seq:
+            src = item.get("src") or ""
+            if src and not _is_probably_video_url(src):
+                return [item]
+    return []
+
+
 def _collect_fb_media_playwright(url: str):
     clear_temp()
 
@@ -5729,6 +5916,7 @@ def _collect_fb_media_playwright(url: str):
 
             explicit_story_single_mode = False
             explicit_story_target_link = ""
+            explicit_album_single_mode = False
             if _is_explicit_story_post_url_v1217(url, resolved):
                 story_fbid_v1217 = _extract_story_fbid_v1217(url, resolved)
                 explicit_story_target_link, explicit_story_grid_items = _select_story_proximal_photo_link_v1217(
@@ -5754,6 +5942,25 @@ def _collect_fb_media_playwright(url: str):
                     return "RETRY", "Facebook explicit story target photo identity not proven"
 
             dominant_pcb_key = "" if explicit_story_single_mode else _dominant_pcb_key_from_links(ordered_links)
+
+            if (
+                not explicit_story_single_mode
+                and _is_album_context_single_photo_v1223(
+                    url=url,
+                    resolved=resolved,
+                    dominant_pcb_key=dominant_pcb_key,
+                    ordered_grid_items=ordered_grid_items,
+                    ordered_links=ordered_links,
+                    plus_count_before=plus_count_before,
+                )
+            ):
+                explicit_album_single_mode = True
+                logger.warning(
+                    "FB v12.23 album-context single-photo gate enabled: "
+                    f"scope={dominant_pcb_key}, links={len(ordered_links)}, grid={len(ordered_grid_items)}; "
+                    "skip album viewer/gallery pollution"
+                )
+
             if dominant_pcb_key:
                 before_links_n = len(ordered_links)
                 before_grid_n = len(ordered_grid_items)
@@ -5777,8 +5984,20 @@ def _collect_fb_media_playwright(url: str):
             else:
                 title = _get_post_folder_name(page)
 
-            # v12.20: publish both resolved caption and account to the GUI immediately.
+            # v12.24: album/photo viewer uses the right-side viewer panel caption,
+            # not normal feed article selectors.
             fb_account = _get_fb_page_account(page, fallback_title=title)
+            if explicit_album_single_mode and (
+                not title or title == "Facebook_Post" or _is_fallback_fb_title(title)
+            ):
+                title = _get_album_context_caption_v1224(
+                    page,
+                    fallback=title,
+                    account=fb_account,
+                )
+
+            # v12.20: publish both resolved caption and account to the GUI immediately.
+            fb_account = _get_fb_page_account(page, fallback_title=title) or fb_account
             title, fb_account = _publish_fb_task_metadata(url, title, fb_account, page=page)
             if resolved and resolved != url:
                 _publish_fb_task_metadata(resolved, title, fb_account, page=page)
@@ -5792,6 +6011,12 @@ def _collect_fb_media_playwright(url: str):
             if explicit_story_single_mode:
                 logger.info(
                     f"FB v12.18 explicit story expected target forced: "
+                    f"{expected_photo_count}->1"
+                )
+                expected_photo_count = 1
+            if explicit_album_single_mode:
+                logger.info(
+                    f"FB v12.23 album-context expected target forced: "
                     f"{expected_photo_count}->1"
                 )
                 expected_photo_count = 1
@@ -5944,6 +6169,12 @@ def _collect_fb_media_playwright(url: str):
                         "to avoid album/recommendation pollution"
                     )
                     post_sequence = []
+                elif explicit_album_single_mode:
+                    logger.info(
+                        "FB v12.23 album-context single-photo mode: skip post viewer walk "
+                        "to avoid same-album other-date pollution"
+                    )
+                    post_sequence = []
                 else:
                     post_sequence = _collect_viewer_sequence_from_url(
                         context,
@@ -6055,6 +6286,10 @@ def _collect_fb_media_playwright(url: str):
                 logger.info(
                     "FB v12.18 explicit story single-photo mode: skip appending viewer items"
                 )
+            elif explicit_album_single_mode:
+                logger.info(
+                    "FB v12.23 album-context single-photo mode: skip appending viewer items"
+                )
             else:
                 for pack in viewer_items:
                     key = _media_key_from_src(pack.get("src", ""))
@@ -6089,6 +6324,7 @@ def _collect_fb_media_playwright(url: str):
                 dominant_cluster = _dominant_media_cluster(viewer_items, min_count=3)
 
             manifest_ids_for_filter = list(manifest_ids or [])
+            viewer_complete_incomplete_manifest_mode = False
             if (
                 plus_count_before
                 and expected_photo_count
@@ -6099,8 +6335,33 @@ def _collect_fb_media_playwright(url: str):
                     f"manifest={len(manifest_ids_for_filter)}, expected={expected_photo_count}"
                 )
                 manifest_ids_for_filter = []
+                viewer_complete_incomplete_manifest_mode = True
 
-            if dominant_cluster or manifest_ids_for_filter:
+            # v12.22:
+            # Some share/p pages expose only one manifest/link item but the post
+            # viewer itself successfully walks the full expected set.  The old
+            # manifest filter shrank 6 proven viewer items down to 1 and caused
+            # RETRY.  If the viewer already collected enough items and the
+            # manifest is incomplete, preserve the viewer sequence instead of
+            # applying manifest/cluster narrowing.
+            if (
+                expected_photo_count
+                and len(viewer_items) >= int(expected_photo_count)
+                and len(manifest_ids_for_filter) > 0
+                and len(manifest_ids_for_filter) < int(expected_photo_count)
+                and len(link_items) < int(expected_photo_count)
+            ):
+                logger.info(
+                    f"FB v12.22 viewer-complete incomplete-manifest mode: "
+                    f"viewer={len(viewer_items)}, manifest={len(manifest_ids_for_filter)}, "
+                    f"link_items={len(link_items)}, expected={expected_photo_count}; "
+                    "skip manifest/cluster narrowing"
+                )
+                manifest_ids_for_filter = []
+                dominant_cluster = ""
+                viewer_complete_incomplete_manifest_mode = True
+
+            if (dominant_cluster or manifest_ids_for_filter) and not viewer_complete_incomplete_manifest_mode:
                 before_cluster_n = len(viewer_items)
                 filtered_by_cluster = _filter_items_by_media_cluster_or_manifest(
                     viewer_items,
@@ -6128,13 +6389,16 @@ def _collect_fb_media_playwright(url: str):
                     )
 
                 if (
-                    plus_count_before
-                    and expected_photo_count
+                    expected_photo_count
                     and 'manifest_ids_for_filter' in locals()
                     and not manifest_ids_for_filter
+                    and (
+                        plus_count_before
+                        or ('viewer_complete_incomplete_manifest_mode' in locals() and viewer_complete_incomplete_manifest_mode)
+                    )
                 ):
                     logger.info(
-                        "FB v12.01 +N full-gallery mode: preserve viewer sequence order; "
+                        "FB v12.22 full-gallery viewer-complete mode: preserve viewer sequence order; "
                         "skip manifest/media-id sort because manifest is incomplete"
                     )
                 else:
@@ -6164,6 +6428,19 @@ def _collect_fb_media_playwright(url: str):
                     "裁切到目標張數，避免側邊欄/推薦貼文混入"
                 )
                 viewer_items = viewer_items[:expected_photo_count]
+
+            if explicit_album_single_mode:
+                forced_single = _force_single_photo_items_v1223(link_items, viewer_items)
+                if forced_single:
+                    logger.info(
+                        f"FB v12.23 album-context single-photo final forced: "
+                        f"{len(viewer_items)}->1"
+                    )
+                    viewer_items = forced_single
+                else:
+                    logger.warning("FB v12.23 album-context single-photo has no proven item; RETRY")
+                    clear_temp()
+                    return "RETRY", "Facebook album-context single photo identity not proven"
 
             logger.info(f"FB merged candidate media count={len(viewer_items)}")
             if ordered_links and len(viewer_items) < len(link_items):
@@ -6198,14 +6475,25 @@ def _collect_fb_media_playwright(url: str):
                 clear_temp()
                 return "RETRY", "Facebook explicit story expected exactly one proven target photo"
 
+            if explicit_album_single_mode and len(viewer_items) != 1:
+                logger.warning(
+                    f"FB v12.23 album-context rejected unexpected final item count: "
+                    f"{len(viewer_items)}"
+                )
+                clear_temp()
+                return "RETRY", "Facebook album-context expected exactly one proven photo"
+
             if (
-                plus_count_before
-                and expected_photo_count
+                expected_photo_count
                 and int(expected_photo_count) > 1
                 and len(viewer_items) >= int(expected_photo_count)
+                and (
+                    plus_count_before
+                    or ('viewer_complete_incomplete_manifest_mode' in locals() and viewer_complete_incomplete_manifest_mode)
+                )
             ):
                 logger.info(
-                    f"FB v11.98 full-gallery best-available source mode enabled: "
+                    f"FB v12.22 full-gallery best-available source mode enabled: "
                     f"items={len(viewer_items)}, expected={expected_photo_count}; "
                     "high-res variants are still tried first"
                 )

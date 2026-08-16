@@ -1,3 +1,4 @@
+# v12.23 Profile Declared Count Tolerance Fix
 # v12.22 Direct img_index Function Name Fix
 # v12.21 Direct img_index Fill Missing Carousel Slides
 # v12.20 Carousel Dot Count Fix
@@ -4229,10 +4230,20 @@ def _scan_profile_post_urls_once(
                 declared_total = 0
 
             if declared_total and len(combined_urls) < declared_total:
-                return "RETRY", [], (
-                    f"IG 主頁 @{username} 掃描不完整：宣告 {declared_total} 筆，"
-                    f"只取得 {len(combined_urls)} 筆；未收齊前不加入下載佇列"
-                )
+                missing_n = int(declared_total) - len(combined_urls)
+                tolerance_n = max(2, int(round(int(declared_total) * 0.01)))
+                if missing_n <= tolerance_n and len(combined_urls) >= max(12, int(declared_total) - tolerance_n):
+                    logger.warning(
+                        f"IG v12.23 profile declared-count tolerance accepted: "
+                        f"@{username}, declared={declared_total}, collected={len(combined_urls)}, "
+                        f"missing={missing_n}, tolerance={tolerance_n}; "
+                        "treat header count as upper bound and expand verified collected URLs"
+                    )
+                else:
+                    return "RETRY", [], (
+                        f"IG 主頁 @{username} 掃描不完整：宣告 {declared_total} 筆，"
+                        f"只取得 {len(combined_urls)} 筆；未收齊前不加入下載佇列"
+                    )
 
             if declared_total and len(combined_urls) > declared_total:
                 return "RETRY", [], (
@@ -4245,6 +4256,7 @@ def _scan_profile_post_urls_once(
                 f"IG 主頁 @{username} 精確 Grid 掃描完成："
                 f"發現 {len(combined_urls)} 筆貼文 / Reel"
                 + (f"（header={declared_total}）" if declared_total else "")
+                + (f"；v12.23 容忍 header 差異 {declared_total - len(combined_urls)} 筆" if declared_total and len(combined_urls) < declared_total else "")
             )
             logger.info(msg)
             return "SUCCESS", combined_urls, msg

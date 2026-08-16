@@ -1,3 +1,4 @@
+# v12.15 Open download_link.txt + Preserve link.txt Actions
 # v12.14 Open link.txt + Preserve Copy URL Actions
 import json
 import math
@@ -513,6 +514,19 @@ class App:
             btn_row2,
             text="📝 link.txt",
             command=self._open_link_txt,
+            bg="#455A64",
+            fg="white",
+            padx=self._ui_px(5),
+            pady=self._button_pady,
+            font=("Microsoft JhengHei UI", self._small_font_size),
+            relief=tk.FLAT,
+            cursor="hand2",
+        ).pack(side=tk.LEFT, padx=(0, self._gap_x))
+
+        tk.Button(
+            btn_row2,
+            text="📄 download_link.txt",
+            command=self._open_download_link_txt,
             bg="#455A64",
             fg="white",
             padx=self._ui_px(5),
@@ -1632,6 +1646,30 @@ class App:
         except Exception as e:
             messagebox.showerror("錯誤", f"無法開啟 link.txt：{e}", parent=self.root)
             self.status_var.set(f"無法開啟 link.txt：{e}")
+
+    def _open_download_link_txt(self):
+        """Open pre-processing/output/download_link.txt; create it when missing."""
+        download_link_path = os.path.join(PREPROCESS_OUTPUT_DIR, "download_link.txt")
+        try:
+            os.makedirs(PREPROCESS_OUTPUT_DIR, exist_ok=True)
+            if not os.path.exists(download_link_path):
+                with open(download_link_path, "w", encoding="utf-8") as f:
+                    f.write("")
+
+            if sys.platform == "win32":
+                os.startfile(download_link_path)
+            else:
+                import subprocess
+                subprocess.Popen([
+                    "open" if sys.platform == "darwin" else "xdg-open",
+                    download_link_path,
+                ])
+
+            self.status_var.set(f"已開啟 download_link.txt：{download_link_path}")
+
+        except Exception as e:
+            messagebox.showerror("錯誤", f"無法開啟 download_link.txt：{e}", parent=self.root)
+            self.status_var.set(f"無法開啟 download_link.txt：{e}")
 
     def _pause_downloads(self):
         worker.pause()
