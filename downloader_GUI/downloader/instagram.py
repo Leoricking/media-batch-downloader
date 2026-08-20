@@ -1,3 +1,4 @@
+# v12.24 Exact Structured Small-Landscape Best Available Fix
 # v12.23 Profile Declared Count Tolerance Fix
 # v12.22 Direct img_index Function Name Fix
 # v12.21 Direct img_index Fill Missing Carousel Slides
@@ -118,7 +119,7 @@ _MIN_FILE_SIZE = 5 * 1024
 # CDN variants return 403.  Keep normal high-res rules for all other paths, but
 # allow this narrow exact-child best-available gate.
 _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE = 540
-_IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE = 360
+_IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE = 330
 
 _L = None
 _cookie_file = None
@@ -4524,7 +4525,11 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
         # - Instagram itself declares this as the largest explicit candidate;
         # - the URL is not an explicit 240/320/480/640 resize preview;
         # - actual bytes closely match the declared candidate dimensions;
-        # - long/short edges remain at least 640/480.
+        # - long/short edges remain at least a conservative best-available size.
+        # v12.24: some exact authenticated structured carousel images are served
+        # only as ~602x335/603x336 while every larger generated CDN variant 403s.
+        # Accept them only when declared dimensions match exactly and the item is
+        # from authenticated structured JSON.
         if max(w, h) < 720:
             best_available = bool(
                 item.get("_best_available_structured_image")
@@ -4566,8 +4571,30 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
             )
 
         if min(w, h) < 360:
-            return False, (
-                f"下載圖片短邊過小，疑似裁切縮圖：actual={w}x{h}"
+            best_available = bool(
+                item.get("_best_available_structured_image")
+                and item.get("from") == "authenticated-structured-json"
+            )
+            declared_w = int(item.get("sourceWidth") or 0)
+            declared_h = int(item.get("sourceHeight") or 0)
+            declared_match = bool(
+                declared_w > 0
+                and declared_h > 0
+                and abs(w - declared_w) <= max(4, int(declared_w * 0.03))
+                and abs(h - declared_h) <= max(4, int(declared_h * 0.03))
+            )
+            if not (
+                best_available
+                and declared_match
+                and max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
+                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+            ):
+                return False, (
+                    f"下載圖片短邊過小，疑似裁切縮圖：actual={w}x{h}"
+                )
+            logger.info(
+                f"IG v12.24 exact structured small-landscape best-available accepted: "
+                f"actual={w}x{h}, declared={declared_w}x{declared_h}"
             )
 
         if source_w > 0 and source_h > 0:

@@ -1,3 +1,4 @@
+# v12.16 Auto Reset Filter on Reload
 # v12.15 Open download_link.txt + Preserve link.txt Actions
 # v12.14 Open link.txt + Preserve Copy URL Actions
 import json
@@ -1438,6 +1439,11 @@ class App:
             messagebox.showwarning("提示", "未找到有效的 URL（需以 http/https 開頭）。", parent=self.root)
             return
 
+        # v12.16: starting a new/reloaded batch must show the full queue.
+        # Without this, a previous filter such as SUCCESS / RETRY / DOWNLOADING
+        # can remain active and make URL / Post Account / Post Title appear blank.
+        self._active_filter = "ALL"
+
         result = queue_manager.add_tasks(urls)
 
         snapshot = queue_manager.get_snapshot()
@@ -1603,7 +1609,12 @@ class App:
             self.text_input.delete("1.0", tk.END)
             self.text_input.insert("1.0", content if content else "")
             self.text_input.config(fg="#000000")
+            # v12.16: reloading download_link.txt is normally a new visible batch.
+            # Always return the task table to ALL, otherwise a previous SUCCESS /
+            # RETRY / DOWNLOADING filter can make the queue look empty.
+            self._active_filter = "ALL"
             self.status_var.set(f"已載入可下載清單：{PREPROCESS_DEFAULT_DOWNLOAD}")
+            self._schedule_refresh(0)
         except Exception as e:
             if not silent:
                 messagebox.showerror("錯誤", f"無法載入 download_link.txt：{e}", parent=self.root)
@@ -1909,6 +1920,7 @@ class App:
 
     def _set_filter(self, key: str):
         self._active_filter = key
+        self.status_var.set(f"目前篩選：{key}")
         self._schedule_refresh(0)
 
     def _schedule_refresh(self, delay: int = 1000):
@@ -2060,6 +2072,18 @@ class App:
         processed_count = queue_manager.get_processed_count()
 
         display = snapshot if self._active_filter == "ALL" else [t for t in snapshot if t.get("status") == self._active_filter]
+
+        # v12.16 safety:
+        # If the queue has tasks but the active filter returns nothing, the GUI
+        # looks like URL/Post Account/Post Title disappeared.  This happens after
+        # loading a new download_link.txt while an old SUCCESS/RETRY/DOWNLOADING
+        # filter is still active.  Auto-reset to ALL to keep the task list visible.
+        if snapshot and not display and self._active_filter != "ALL":
+            old_filter = self._active_filter
+            self._active_filter = "ALL"
+            display = snapshot
+            self.status_var.set(f"目前篩選 {old_filter} 無資料，已自動切回全部")
+
         display = self._apply_tree_sort(display)
 
         self._tree_url_by_iid.clear()

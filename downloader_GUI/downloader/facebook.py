@@ -1,3 +1,5 @@
+# v12.26 Share/P Gallery Title + Persisted Capture Download Fix
+# v12.25 Full Gallery Near-Complete Recovery
 # v12.24 Album Context Caption Fix
 # v12.23 Album Context Single Photo + Title Split Fix
 # v12.22 Full Gallery Viewer Completion Fix
@@ -12,6 +14,7 @@ import html
 import os
 import random
 import re
+import unicodedata
 import shutil
 import sqlite3
 import subprocess
@@ -1715,6 +1718,9 @@ def _looks_like_fb_page_name_v1223(value: str) -> bool:
     v = _clean_fb_account_name(value)
     if not v or len(v) > 40:
         return False
+    # Pure emoji/symbol snippets like "❤️" are captions/reactions, not page names.
+    if not any(ch.isalnum() or ("\u4e00" <= ch <= "\u9fff") for ch in v):
+        return False
     if any(x in v for x in ["？", "?", "！", "!", "。", "；", ";", "：", ":", "，", ",", "#", "http"]):
         return False
     if v.count(" ") > 3:
@@ -1726,7 +1732,7 @@ def _looks_like_fb_caption_v1223(value: str) -> bool:
     t = _clean_fb_post_title_for_path(value, fallback="")
     if not t:
         return False
-    return len(t) >= 14 or any(x in t for x in ["？", "?", "！", "!", "。", "；", ";", "：", ":", "，", ",", "#", "http", "看到了嗎"])
+    return len(t) >= 14 or any(x in t for x in ["？", "?", "！", "!", "。", "；", ";", "：", ":", "，", ",", "#", "http", "看到了嗎", "❤", "❤️"])
 
 
 def _split_fb_title_account(title: str) -> tuple[str, str]:
@@ -2544,6 +2550,16 @@ def _fb_media_numeric_id_str_from_src(src: str) -> str:
         return str(n) if n else ""
     except Exception:
         return ""
+
+def _fb_media_id_from_src(src: str) -> str:
+    """v12.26 compatibility alias for recovery code.
+
+    v12.25 called _fb_media_id_from_src() but the existing helper name in this
+    file is _fb_media_numeric_id_str_from_src().  The missing alias made the
+    near-complete recovery throw NameError before it could help 13/14 galleries.
+    """
+    return _fb_media_numeric_id_str_from_src(src)
+
 
 
 def _manifest_ids_from_packs(packs: list[dict]) -> list[str]:
@@ -3504,7 +3520,29 @@ def _capture_single_grid_tile_page(context, href, index, allowed_cluster=None):
                 if 0 < clen < _MIN_FILE_SIZE:
                     return
                 score = 1700000 + _media_quality_score(u) + min(clen, 800000)
-                bucket.append({"type": "image", "src": u, "score": score})
+                item = {"type": "image", "src": u, "score": score}
+                # v12.26: persist tile-page response immediately.  FB CDN URLs
+                # can become 403 by the final download stage even though the
+                # tile page just delivered the bytes.
+                try:
+                    body = resp.body()
+                    if body and len(body) >= _MIN_FILE_SIZE:
+                        h = hashlib.md5(body).hexdigest()[:16]
+                        ext = _ext_from_url(u, ".jpg")
+                        cap_dir = os.path.join(TEMP_DIR, "_fb_capture")
+                        os.makedirs(cap_dir, exist_ok=True)
+                        cap_path = os.path.join(cap_dir, f"tile_{index:04d}_{h}{ext}")
+                        if not os.path.exists(cap_path):
+                            with open(cap_path, "wb") as f:
+                                f.write(body)
+                        item["temp_path"] = cap_path
+                        item["persisted_path"] = cap_path
+                        item["body_size"] = len(body)
+                        item["content_length"] = max(clen, len(body))
+                        item["score"] += min(len(body), 1000000)
+                except Exception:
+                    pass
+                bucket.append(item)
             except Exception:
                 pass
 
@@ -5230,6 +5268,8 @@ def _story_title_from_page_v1217(page, fallback: str = "Facebook_Post") -> str:
 
 def _is_bad_story_local_caption_v1219(title: str) -> bool:
     """Reject local photo-node snippets that are comments/notes, not the post caption."""
+    if _is_noise_fb_story_title_v1226(title):
+        return True
     t = _clean_fb_post_title_for_path(title or "", fallback="")
     if not t:
         return True
@@ -5256,6 +5296,32 @@ def _is_bad_story_local_caption_v1219(title: str) -> bool:
 
     return False
 
+
+
+def _is_noise_fb_story_title_v1226(title: str) -> bool:
+    """Reject local-node garbage tokens / invisible-text tracking strings."""
+    t = _clean_fb_post_title_for_path(title or "", fallback="")
+    if not t:
+        return True
+    raw = str(title or "")
+    # FB sometimes exposes tracking strings with combining/invisible chars.  They
+    # look like random hashes or decomposed text and must not override caption.
+    combining = sum(1 for ch in raw if unicodedata.category(ch) in ("Mn", "Me", "Cf"))
+    if combining >= 3:
+        return True
+    alnum = sum(1 for ch in t if ch.isalnum())
+    spaces = t.count(" ")
+    cjk = sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
+    if len(t) >= 24 and spaces <= 1 and cjk == 0 and alnum / max(len(t), 1) > 0.70:
+        return True
+    if re.fullmatch(r"[A-Za-z0-9_\-]{20,}", t):
+        return True
+    bad_fragments = [
+        "建立貼文", "打個永字試試", "查看更多", "Iyacc si", "labblabb",
+    ]
+    if any(x.lower() in t.lower() for x in bad_fragments):
+        return True
+    return False
 
 def _prefer_story_caption_title_v1219(local_title: str, scoped_fallback_title: str, page_title: str = "") -> str:
     """Choose the actual post caption over nearby media/comment snippets."""
@@ -5640,6 +5706,124 @@ def _force_single_photo_items_v1223(link_items: list[dict] | None, viewer_items:
     return []
 
 
+def _recover_full_gallery_near_complete_v1225(
+    context,
+    page,
+    *,
+    ordered_links: list[str],
+    ordered_grid_items: list[dict],
+    link_items: list[dict],
+    viewer_items: list[dict],
+    expected_photo_count: int,
+    title: str,
+    url: str,
+    resolved: str,
+    dominant_pcb_key: str,
+) -> list[dict]:
+    """Recover the last missing photo when FB viewer stalls at target-1.
+
+    This is bounded and same-post scoped.  It does not mark success by itself;
+    it only supplies extra candidates.  Existing strict completeness guard still
+    decides SUCCESS vs RETRY.
+    """
+    try:
+        expected = int(expected_photo_count or 0)
+    except Exception:
+        expected = 0
+
+    current = _dedupe_items_by_media_id(_aggregate_unique_items(link_items or [], viewer_items or []))
+    if not expected or len(current) >= expected:
+        return viewer_items or []
+
+    if expected - len(current) > 1:
+        return viewer_items or []
+
+    if not dominant_pcb_key or not str(dominant_pcb_key).startswith("pcb:"):
+        return viewer_items or []
+
+    existing_keys = {_media_key_from_src(i.get("src", "")) for i in current if i.get("src")}
+    existing_ids = {_fb_media_id_from_src(i.get("src", "")) for i in current if i.get("src")}
+    existing_ids.discard("")
+
+    seeds = []
+    seen = set()
+
+    def add_seed(u: str):
+        u = str(u or "").strip()
+        if not u or u in seen:
+            return
+        if "facebook.com" not in u:
+            return
+        if dominant_pcb_key.replace("pcb:", "pcb.") not in u and "photo" not in u:
+            return
+        seen.add(u)
+        seeds.append(u)
+
+    for item in ordered_grid_items or []:
+        add_seed(item.get("href") or item.get("url") or "")
+    for href in ordered_links or []:
+        add_seed(href)
+
+    seeds = list(reversed(seeds))[:10]
+    if not seeds:
+        return viewer_items or []
+
+    logger.info(
+        f"FB v12.25 near-complete recovery start: "
+        f"current={len(current)}, expected={expected}, seeds={len(seeds)}, scope={dominant_pcb_key}"
+    )
+
+    recovered_viewer = list(viewer_items or [])
+    for idx, seed in enumerate(seeds, 1):
+        try:
+            seq = _collect_viewer_sequence_from_url(
+                context,
+                seed,
+                target_count=3,
+                title=title,
+                mode="post",
+                log_prefix=f"FB v12.25 recovery seed {idx}/{len(seeds)}",
+                original_url=url,
+                resolved_url=resolved,
+                max_turns=6,
+                stale_limit=3,
+                prefer_existing_page=page,
+            ) or []
+        except TypeError:
+            try:
+                seq = _collect_viewer_sequence_from_url(context, seed, 3, title, "post") or []
+            except Exception as e:
+                logger.debug(f"FB v12.25 recovery seed skipped: {e}")
+                continue
+        except Exception as e:
+            logger.debug(f"FB v12.25 recovery seed skipped: {e}")
+            continue
+
+        for pack in seq:
+            src = pack.get("src") or ""
+            if not src or _is_probably_video_url(src):
+                continue
+            key = _media_key_from_src(src)
+            mid = _fb_media_id_from_src(src)
+            if key in existing_keys or (mid and mid in existing_ids):
+                continue
+            existing_keys.add(key)
+            if mid:
+                existing_ids.add(mid)
+            recovered_viewer.append(pack)
+            current.append(pack)
+            logger.info(
+                f"FB v12.25 near-complete recovery accepted missing item: "
+                f"{len(current)}/{expected}, seed={idx}, media={_media_basename(src)}"
+            )
+            if len(current) >= expected:
+                logger.info(f"FB v12.25 near-complete recovery completed: {len(current)}/{expected}")
+                return recovered_viewer
+
+    logger.warning(f"FB v12.25 near-complete recovery incomplete: {len(current)}/{expected}; keep RETRY")
+    return recovered_viewer
+
+
 def _collect_fb_media_playwright(url: str):
     clear_temp()
 
@@ -5917,7 +6101,11 @@ def _collect_fb_media_playwright(url: str):
             explicit_story_single_mode = False
             explicit_story_target_link = ""
             explicit_album_single_mode = False
-            if _is_explicit_story_post_url_v1217(url, resolved):
+            share_p_gallery_like_v1226 = bool(
+                re.search(r"/share/p/", f"{url} {resolved}", flags=re.I)
+                and (plus_count_before or len(ordered_grid_items) >= 2 or len(ordered_links) >= 3)
+            )
+            if _is_explicit_story_post_url_v1217(url, resolved) and not share_p_gallery_like_v1226:
                 story_fbid_v1217 = _extract_story_fbid_v1217(url, resolved)
                 explicit_story_target_link, explicit_story_grid_items = _select_story_proximal_photo_link_v1217(
                     ordered_links,
@@ -5940,6 +6128,11 @@ def _collect_fb_media_playwright(url: str):
                     )
                     clear_temp()
                     return "RETRY", "Facebook explicit story target photo identity not proven"
+            elif share_p_gallery_like_v1226:
+                logger.info(
+                    "FB v12.26 share/p gallery mode: skip explicit story single-photo gate; "
+                    f"grid={len(ordered_grid_items)}, links={len(ordered_links)}, plus={plus_count_before}"
+                )
 
             dominant_pcb_key = "" if explicit_story_single_mode else _dominant_pcb_key_from_links(ordered_links)
 
@@ -6228,6 +6421,30 @@ def _collect_fb_media_playwright(url: str):
                         before_retry_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
                     except Exception:
                         before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
+
+                    if (
+                        plus_count_before
+                        and int(expected_photo_count) >= 8
+                        and before_retry_n == int(expected_photo_count) - 1
+                    ):
+                        viewer_items = _recover_full_gallery_near_complete_v1225(
+                            context,
+                            page,
+                            ordered_links=ordered_links,
+                            ordered_grid_items=ordered_grid_items,
+                            link_items=link_items,
+                            viewer_items=viewer_items,
+                            expected_photo_count=int(expected_photo_count),
+                            title=title,
+                            url=url,
+                            resolved=resolved,
+                            dominant_pcb_key=dominant_pcb_key,
+                        )
+                        try:
+                            before_retry_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
+                        except Exception:
+                            before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
+
                     if before_retry_n < expected_photo_count:
                         logger.info(
                             f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
