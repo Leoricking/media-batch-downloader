@@ -1,3 +1,4 @@
+# v12.17 Open Downloaded Item Context Menu
 # v12.16 Auto Reset Filter on Reload
 # v12.15 Open download_link.txt + Preserve link.txt Actions
 # v12.14 Open link.txt + Preserve Copy URL Actions
@@ -994,6 +995,15 @@ class App:
         )
         self._tree_context_menu.add_separator()
         self._tree_context_menu.add_command(
+            label="開啟該連結下載位置",
+            command=self._open_context_download_location,
+        )
+        self._tree_context_menu.add_command(
+            label="在檔案總管顯示下載檔",
+            command=self._reveal_context_download_item,
+        )
+        self._tree_context_menu.add_separator()
+        self._tree_context_menu.add_command(
             label="複製目前篩選 URL",
             command=self._copy_current_filtered_urls,
         )
@@ -1097,6 +1107,245 @@ class App:
                     vals = self.tree.item(iid, "values")
                     url = vals[0] if vals else ""
         messagebox.showinfo("完整連結", url or "沒有可顯示的連結", parent=self.root)
+
+    def _get_context_task_snapshot(self) -> dict:
+        """Return full task metadata for the right-clicked row."""
+        iid = self._tree_context_iid or self._get_selected_tree_iid()
+        task_map = getattr(self, "_tree_task_by_iid", {}) or {}
+        if iid and iid in task_map:
+            return dict(task_map.get(iid) or {})
+
+        url = self._tree_context_url_snapshot or ""
+        if not url and iid:
+            url = self._tree_url_by_iid.get(iid, "")
+
+        if url:
+            for task in queue_manager.get_snapshot():
+                if str(task.get("url", "") or "") == url:
+                    return dict(task)
+
+        vals = self.tree.item(iid, "values") if iid else ()
+        return {
+            "url": url,
+            "account": vals[1] if len(vals) > 1 else "",
+            "title": vals[2] if len(vals) > 2 else "",
+            "status": vals[3] if len(vals) > 3 else "",
+        }
+
+    @staticmethod
+    def _download_lookup_norm(value: str) -> str:
+        """Normalize text for matching output file/folder names."""
+        s = str(value or "").lower()
+        s = re.sub(r"https?://", " ", s)
+        s = re.sub(r"[\\/:*?\"<>|#%&=+~`!@#$^()[\]{};,，。！？：；、\s]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    @staticmethod
+    def _shortcode_from_url(url: str) -> str:
+        m = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)/?", str(url or ""), re.I)
+        if m:
+            return m.group(1)
+        # Facebook share IDs are not normally in output names, but keep as weak hint.
+        m = re.search(r"facebook\.com/(?:share/(?:p|r)?/|reel/|watch/\?v=)([^/?#&]+)", str(url or ""), re.I)
+        return m.group(1) if m else ""
+
+    def _score_download_candidate(self, path: str, task: dict) -> tuple[int, float]:
+        name = os.path.basename(path)
+        parent = os.path.basename(os.path.dirname(path))
+        hay = self._download_lookup_norm(f"{name} {parent}")
+        title = self._download_lookup_norm(task.get("title", ""))
+        account = self._download_lookup_norm(str(task.get("account", "") or "").lstrip("@"))
+        shortcode = self._download_lookup_norm(self._shortcode_from_url(task.get("url", "")))
+
+        score = 0
+        if title and len(title) >= 3:
+            if title in hay:
+                score += 120
+            elif hay in title and len(hay) >= 5:
+                score += 80
+            else:
+                # partial token overlap for long captions truncated by path length
+                title_words = [w for w in title.split() if len(w) >= 2]
+                if title_words:
+                    overlap = sum(1 for w in title_words[:12] if w in hay)
+                    score += min(50, overlap * 8)
+
+        if account and len(account) >= 2:
+            if account in hay:
+                score += 45
+            elif any(w in hay for w in account.split() if len(w) >= 2):
+                score += 20
+
+        if shortcode and shortcode in hay:
+            score += 80
+
+        status = str(task.get("status", "") or "").upper()
+        if status == "SUCCESS":
+            score += 10
+
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = 0.0
+
+        # Prefer real media files over manifest/txt.
+        if os.path.isfile(path):
+            ext = os.path.splitext(path)[1].lower()
+            if ext in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}:
+                score += 25
+        elif os.path.isdir(path):
+            try:
+                has_media = any(
+                    os.path.splitext(x)[1].lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}
+                    for x in os.listdir(path)[:80]
+                )
+                if has_media:
+                    score += 30
+            except Exception:
+                pass
+
+        return score, mtime
+
+    def _find_downloaded_item_for_task(self, task: dict) -> str:
+        """Find the downloaded file/folder for a queue task.
+
+        The downloader historically did not store output_path in queue metadata,
+        so v12.17 resolves it by title/account/URL hints under DOWNLOAD_DIR.
+        """
+        explicit_keys = (
+            "output_path", "download_path", "file_path", "folder_path",
+            "output_file", "output_dir", "saved_path",
+        )
+        for key in explicit_keys:
+            p = str(task.get(key, "") or "").strip()
+            if p and os.path.exists(p):
+                return p
+
+        title = str(task.get("title", "") or "").strip()
+        account = str(task.get("account", "") or "").strip().lstrip("@")
+        url = str(task.get("url", "") or "").strip()
+
+        if not os.path.isdir(DOWNLOAD_DIR):
+            return ""
+
+        candidates = []
+        max_items = 3000
+        scanned = 0
+
+        try:
+            # Top-level folders/files first.
+            top_entries = [os.path.join(DOWNLOAD_DIR, x) for x in os.listdir(DOWNLOAD_DIR)]
+        except Exception:
+            top_entries = []
+
+        for p in top_entries:
+            if os.path.exists(p):
+                score, mtime = self._score_download_candidate(p, task)
+                if score >= 45:
+                    candidates.append((score + 20, mtime, p))
+
+        # Search one to two levels deep for actual media file matches.
+        for root, dirs, files in os.walk(DOWNLOAD_DIR):
+            scanned += 1
+            if scanned > max_items:
+                break
+
+            # Avoid heavy recursion into cache-like dirs.
+            dirs[:] = [
+                d for d in dirs
+                if d.lower() not in {"__pycache__", ".git", "_fb_capture", "data", "pre-processing"}
+            ][:120]
+
+            for name in files[:250]:
+                ext = os.path.splitext(name)[1].lower()
+                if ext not in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}:
+                    continue
+                p = os.path.join(root, name)
+                score, mtime = self._score_download_candidate(p, task)
+                if score >= 55:
+                    candidates.append((score, mtime, p))
+
+        if not candidates and (title or account):
+            # Last-resort: exact folder name prefix / account folder.
+            norm_title = self._download_lookup_norm(title)
+            norm_account = self._download_lookup_norm(account)
+            for p in top_entries:
+                name_norm = self._download_lookup_norm(os.path.basename(p))
+                if (
+                    (norm_title and (name_norm.startswith(norm_title[:20]) or norm_title[:20] in name_norm))
+                    or (norm_account and norm_account == name_norm)
+                ):
+                    try:
+                        candidates.append((40, os.path.getmtime(p), p))
+                    except Exception:
+                        candidates.append((40, 0.0, p))
+
+        if not candidates:
+            return ""
+
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best = candidates[0][2]
+
+        # If the best item is a file inside a matched title folder, reveal file;
+        # if it is a multi-file folder, open folder.
+        return best
+
+    def _open_path_in_explorer(self, path: str, reveal: bool = False):
+        if not path or not os.path.exists(path):
+            messagebox.showwarning("找不到檔案", "目前找不到此連結對應的下載檔案或資料夾。", parent=self.root)
+            return
+
+        try:
+            if os.name == "nt":
+                if reveal and os.path.isfile(path):
+                    subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+                else:
+                    target = path if os.path.isdir(path) else os.path.dirname(path)
+                    os.startfile(os.path.normpath(target))
+            elif sys.platform == "darwin":
+                if reveal and os.path.isfile(path):
+                    subprocess.Popen(["open", "-R", path])
+                else:
+                    subprocess.Popen(["open", path if os.path.isdir(path) else os.path.dirname(path)])
+            else:
+                subprocess.Popen(["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)])
+        except Exception as e:
+            messagebox.showerror("開啟失敗", f"無法開啟下載位置：{e}", parent=self.root)
+
+    def _open_context_download_location(self):
+        """Right-click: open folder that contains the selected task output."""
+        task = self._get_context_task_snapshot()
+        path = self._find_downloaded_item_for_task(task)
+        if not path:
+            self.status_var.set("找不到此連結對應的下載位置")
+            messagebox.showwarning(
+                "找不到下載位置",
+                "找不到此連結對應的下載檔案或資料夾。\n\n"
+                "可能原因：任務尚未 SUCCESS、檔名被手動改過、或下載輸出已被移動。",
+                parent=self.root,
+            )
+            return
+
+        self.status_var.set(f"已開啟下載位置：{os.path.basename(path)}")
+        self._open_path_in_explorer(path, reveal=False)
+
+    def _reveal_context_download_item(self):
+        """Right-click: reveal/select the downloaded file in Explorer."""
+        task = self._get_context_task_snapshot()
+        path = self._find_downloaded_item_for_task(task)
+        if not path:
+            self.status_var.set("找不到此連結對應的下載檔")
+            messagebox.showwarning(
+                "找不到下載檔",
+                "找不到此連結對應的下載檔案。\n\n"
+                "多圖貼文會開啟資料夾；單檔貼文會在檔案總管中選取該檔。",
+                parent=self.root,
+            )
+            return
+
+        self.status_var.set(f"已顯示下載檔：{os.path.basename(path)}")
+        self._open_path_in_explorer(path, reveal=True)
 
     def _copy_selected_url(self, _event=None):
         """Ctrl+C / 雙擊：複製目前選取列完整 URL。"""
@@ -2087,6 +2336,8 @@ class App:
         display = self._apply_tree_sort(display)
 
         self._tree_url_by_iid.clear()
+        # v12.17: keep full task metadata for context-menu download lookup.
+        self._tree_task_by_iid = {}
 
         for row in self.tree.get_children():
             self.tree.delete(row)
@@ -2102,6 +2353,7 @@ class App:
             tag = status if status in _STATUS_COLORS else "PENDING"
             iid = self.tree.insert("", tk.END, values=(url_short, account_short, title_short, status, t["retry"]), tags=(tag,))
             self._tree_url_by_iid[iid] = full_url
+            self._tree_task_by_iid[iid] = dict(t)
 
         total = runtime.get("total", 0)
         done = runtime.get("done", 0)

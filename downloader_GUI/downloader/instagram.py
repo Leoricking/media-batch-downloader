@@ -1,3 +1,11 @@
+# v12.32 Profile Verified Tolerance Fix
+# v12.31 Rate-Limit Terminal BLOCKED Fix
+# v12.30 Rate-Limit Zero-Media Classification Fix
+# v12.29 Restricted Reel NameError Fix
+# v12.28 Retry Classification + Restricted Reel Fix
+# v12.27 Structured Best-Available Marker Fix
+# v12.26 Exact Structured Portrait Best Available Fix
+# v12.25 Exact Structured Square Best Available Fix
 # v12.24 Exact Structured Small-Landscape Best Available Fix
 # v12.23 Profile Declared Count Tolerance Fix
 # v12.22 Direct img_index Function Name Fix
@@ -120,6 +128,14 @@ _MIN_FILE_SIZE = 5 * 1024
 # allow this narrow exact-child best-available gate.
 _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE = 540
 _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE = 330
+# v12.25: some exact authenticated structured single images are only available
+# as ~526x526 while larger CDN variants all return 403.  This is allowed only
+# when the item is authenticated-structured-json and declared dimensions match.
+_IG_EXACT_STRUCTURED_BEST_AVAILABLE_SQUARE_EDGE = 520
+# v12.26: exact authenticated structured portrait fallback.
+# Used for cases like 360x430 where all larger exact structured candidates 403.
+_IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_LONG_EDGE = 420
+_IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_SHORT_EDGE = 350
 
 _L = None
 _cookie_file = None
@@ -422,6 +438,72 @@ def _clean_error_text(err: str) -> str:
     return text
 
 
+def _is_ig_rate_limited_error(err: str) -> bool:
+    """Detect Instagram explicit API/session rate-limit messages."""
+    e = _clean_error_text(err or "").lower()
+    return any(k in e for k in [
+        "please wait a few minutes before you try again",
+        "please wait a few minutes",
+        "401 unauthorized",
+        "rate limit",
+        "rate-limit",
+        "too many requests",
+        "try again later",
+        "temporarily blocked",
+        "429",
+    ])
+
+
+def _is_ig_zero_media_proof_error(err: str) -> bool:
+    """True when Playwright opened target but no exact media could be proven."""
+    e = _clean_error_text(err or "").lower()
+    return any(k in e for k in [
+        "normal headless collection returned 0",
+        "未抓到有效貼文主媒體",
+        "no exact structured media",
+        "no exact visual media",
+        "neither structured media nor exact visual media",
+        "keep retry to avoid false success",
+        "carousel first media unavailable",
+        "network harvest=0",
+        "authenticated browser opened the target post",
+        "persistent-profile collection did not complete",
+    ])
+
+
+def _rate_limited_zero_media_result(instaloader_error: str, playwright_error: str):
+    """Return BLOCKED for current-session IG rate limit + zero media proof.
+
+    This is not a SUCCESS fix because no media URL was proven.  It prevents the
+    worker from retrying the same impossible session twice and keeps the task in
+    a clear terminal state until the IG parser session/cookies recover.
+
+    v12.31:
+    The common failing shape is:
+      - Instaloader GraphQL: 401 Unauthorized / Please wait a few minutes
+      - Headless Playwright: normal headless collection returned 0
+      - Persistent IG_Parser: no exact structured/visual media was proven
+
+    That should be terminal BLOCKED for this run, not RETRY.
+    """
+    instaloader_rate_limited = _is_ig_rate_limited_error(instaloader_error)
+    zero_media_or_empty = (
+        not playwright_error
+        or _is_ig_zero_media_proof_error(playwright_error)
+        or "normal headless collection returned 0" in _clean_error_text(playwright_error).lower()
+    )
+
+    if instaloader_rate_limited and zero_media_or_empty:
+        return (
+            "BLOCKED",
+            "Instagram API/session is rate-limited (401 / Please wait a few minutes) "
+            "and IG_Parser did not expose any exact media for this shortcode. "
+            "This task is blocked for the current session, not downloadable yet; "
+            "retry later after IG_Parser can open the target post media."
+        )
+    return None
+
+
 def _is_soft_retry_ig_error(err: str) -> bool:
     """
     Errors that are usually transient IG anti-bot / lazy-load / empty-media cases.
@@ -444,6 +526,34 @@ def _is_soft_retry_ig_error(err: str) -> bool:
     ])
 
 
+def _ig_v1229_is_probably_video_url(url: str) -> bool:
+    """Small local video URL detector for restricted Reel poster guard."""
+    u = str(url or "").lower()
+    return any(x in u for x in [
+        ".mp4", ".m4v", ".mov",
+        "video", "dash", "fbcdn.net/v/",
+        "cdninstagram.com/v/",
+    ])
+
+
+def _is_hard_ig_restricted_error(err: str) -> bool:
+    """Return True for confirmed permanent/region restricted media."""
+    e = _clean_error_text(err or "").lower()
+    return any(k in e for k in [
+        "限制的影片",
+        "你所在的國家",
+        "所在的國家",
+        "國家／地區無法顯示",
+        "country/region",
+        "not available in your country",
+        "not available in your region",
+        "video is not available",
+        "geo-restricted",
+        "georestricted",
+        "copyright",
+    ])
+
+
 def _prefer_final_status(*pairs):
     """
     多引擎結果合併規則：
@@ -463,6 +573,20 @@ def _prefer_final_status(*pairs):
     for st, err in statuses:
         if st == "MISSING":
             return "MISSING", err
+
+    # v12.28: confirmed country/region restricted videos must not be converted
+    # back into RETRY by a later Playwright thumbnail/visual fallback failure.
+    for st, err in statuses:
+        if _is_hard_ig_restricted_error(err):
+            return "BLOCKED", err or "Instagram 影片受國家/地區限制，無法下載"
+
+    # v12.30: when one engine proves API/session rate-limit and another proves
+    # zero media/no exact media, stop retrying this session.
+    rate_limited_err = next((err for st, err in statuses if _is_ig_rate_limited_error(err)), "")
+    zero_media_err = next((err for st, err in statuses if _is_ig_zero_media_proof_error(err)), "")
+    terminal_rate_limit = _rate_limited_zero_media_result(rate_limited_err, zero_media_err)
+    if terminal_rate_limit:
+        return terminal_rate_limit
 
     for st, err in statuses:
         if st == "RETRY":
@@ -489,6 +613,11 @@ def _prefer_final_status(*pairs):
 def _classify_error(err: str):
     raw = _clean_error_text(err)
     e = raw.lower()
+
+    # v12.28: confirmed country/region restricted video is a hard BLOCKED case,
+    # not a retryable thumbnail/visual fallback failure.
+    if _is_hard_ig_restricted_error(raw):
+        return "BLOCKED", raw or "Instagram 影片受國家/地區限制，無法下載"
 
     # yt-dlp / Instaloader frequently report generic cookie/login guidance when IG
     # returns an empty media body.  That is not a confirmed permission BLOCKED case.
@@ -4232,10 +4361,17 @@ def _scan_profile_post_urls_once(
 
             if declared_total and len(combined_urls) < declared_total:
                 missing_n = int(declared_total) - len(combined_urls)
-                tolerance_n = max(2, int(round(int(declared_total) * 0.01)))
-                if missing_n <= tolerance_n and len(combined_urls) >= max(12, int(declared_total) - tolerance_n):
+                # v12.32:
+                # Profile header counts are often upper bounds including hidden,
+                # archived, removed, pinned/duplicated, or non-grid items.  When
+                # every collected URL is verified to belong to the target owner
+                # and both profile/reels entries are stable with no new tiles,
+                # accept a small missing gap instead of retrying forever.
+                tolerance_n = max(6, int(round(int(declared_total) * 0.10)))
+                enough_verified = len(combined_urls) >= max(12, int(declared_total) - tolerance_n)
+                if missing_n <= tolerance_n and enough_verified:
                     logger.warning(
-                        f"IG v12.23 profile declared-count tolerance accepted: "
+                        f"IG v12.32 profile verified-count tolerance accepted: "
                         f"@{username}, declared={declared_total}, collected={len(combined_urls)}, "
                         f"missing={missing_n}, tolerance={tolerance_n}; "
                         "treat header count as upper bound and expand verified collected URLs"
@@ -4257,7 +4393,7 @@ def _scan_profile_post_urls_once(
                 f"IG 主頁 @{username} 精確 Grid 掃描完成："
                 f"發現 {len(combined_urls)} 筆貼文 / Reel"
                 + (f"（header={declared_total}）" if declared_total else "")
-                + (f"；v12.23 容忍 header 差異 {declared_total - len(combined_urls)} 筆" if declared_total and len(combined_urls) < declared_total else "")
+                + (f"；v12.32 容忍 header 差異 {declared_total - len(combined_urls)} 筆" if declared_total and len(combined_urls) < declared_total else "")
             )
             logger.info(msg)
             return "SUCCESS", combined_urls, msg
@@ -4551,12 +4687,33 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                 or "s100x100" in url_low
                 or "s64x64" in url_low
             )
+            square_best_available_v1225 = bool(
+                best_available
+                and declared_match
+                and not explicit_tiny_transform
+                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SQUARE_EDGE
+                and abs((w / max(h, 1)) - 1.0) <= 0.08
+            )
+            portrait_best_available_v1226 = bool(
+                best_available
+                and declared_match
+                and not explicit_tiny_transform
+                and max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_LONG_EDGE
+                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_SHORT_EDGE
+                and (max(w, h) / max(min(w, h), 1)) <= 1.35
+            )
             acceptable_best_available = bool(
                 best_available
                 and declared_match
                 and not explicit_tiny_transform
-                and max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
-                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+                and (
+                    (
+                        max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
+                        and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+                    )
+                    or square_best_available_v1225
+                    or portrait_best_available_v1226
+                )
             )
 
             if not acceptable_best_available:
@@ -4565,7 +4722,7 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                 )
 
             logger.info(
-                f"IG exact structured best-available image accepted: "
+                f"IG v12.27 exact structured best-available accepted: "
                 f"actual={w}x{h}, declared={declared_w}x{declared_h}, "
                 f"normal_highres_unavailable=True"
             )
@@ -4583,17 +4740,36 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                 and abs(w - declared_w) <= max(4, int(declared_w * 0.03))
                 and abs(h - declared_h) <= max(4, int(declared_h * 0.03))
             )
+            square_best_available_v1225 = bool(
+                best_available
+                and declared_match
+                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SQUARE_EDGE
+                and abs((w / max(h, 1)) - 1.0) <= 0.08
+            )
+            portrait_best_available_v1226 = bool(
+                best_available
+                and declared_match
+                and max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_LONG_EDGE
+                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_SHORT_EDGE
+                and (max(w, h) / max(min(w, h), 1)) <= 1.35
+            )
             if not (
                 best_available
                 and declared_match
-                and max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
-                and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+                and (
+                    (
+                        max(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
+                        and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+                    )
+                    or square_best_available_v1225
+                    or portrait_best_available_v1226
+                )
             ):
                 return False, (
                     f"下載圖片短邊過小，疑似裁切縮圖：actual={w}x{h}"
                 )
             logger.info(
-                f"IG v12.24 exact structured small-landscape best-available accepted: "
+                f"IG v12.27 exact structured best-available accepted: "
                 f"actual={w}x{h}, declared={declared_w}x{declared_h}"
             )
 
@@ -7095,12 +7271,40 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
         or "s64x64" in primary_url_low
     )
 
+    primary_w = int(primary.get("width") or 0)
+    primary_h = int(primary.get("height") or 0)
+    primary_long = max(primary_w, primary_h)
+    primary_short = min(primary_w, primary_h)
+    primary_ratio = primary_long / max(primary_short, 1)
+
+    # v12.27:
+    # v12.25/v12.26 added validation support for exact structured square and
+    # portrait best-available images, but the structured node marker still only
+    # became true at the old 540/330 threshold.  That made 526x526 and 360x430
+    # continue to be rejected before the new validation branch could apply.
+    structured_landscape_ok = bool(
+        primary_long >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
+        and primary_short >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+    )
+    structured_square_ok = bool(
+        primary_short >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SQUARE_EDGE
+        and abs((primary_w / max(primary_h, 1)) - 1.0) <= 0.08
+    )
+    structured_portrait_ok = bool(
+        primary_long >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_LONG_EDGE
+        and primary_short >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_SHORT_EDGE
+        and primary_ratio <= 1.35
+    )
+
     best_available_structured = bool(
-        primary.get("width")
-        and primary.get("height")
-        and max(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_LONG_EDGE
-        and min(int(primary.get("width") or 0), int(primary.get("height") or 0)) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_SHORT_EDGE
+        primary_w
+        and primary_h
         and not has_explicit_tiny_resize
+        and (
+            structured_landscape_ok
+            or structured_square_ok
+            or structured_portrait_ok
+        )
     )
 
     deduped_alternates = []
@@ -7666,11 +7870,25 @@ def _collect_ig_media_playwright_persistent_impl(
                     f"IG exact visual carousel fallback accepted: "
                     f"count={len(filtered)}, target={shortcode}"
                 )
+
+                # v12.28: For Reels, visual fallback with a single image after
+                # structured media returned 0 usually means the actual video is
+                # restricted and only a poster frame is visible.  Do not keep
+                # retrying the poster as a failed download.
+                if _is_ig_reel_url(url) and len(filtered) == 1:
+                    only_type = str((filtered[0] or {}).get("type") or "").lower()
+                    only_src = str((filtered[0] or {}).get("src") or "").lower()
+                    if only_type in {"image", "photo", ""} and not _ig_v1229_is_probably_video_url(only_src):
+                        return "BLOCKED", (
+                            "Instagram Reel restricted or video unavailable; "
+                            "only a poster/thumbnail image was visible in the "
+                            "authenticated browser profile."
+                        )
             else:
                 return "RETRY", (
-                    "IG authenticated browser opened the post and metadata was "
-                    "available, but neither structured media nor exact visual "
-                    "carousel fallback could prove the complete media list."
+                    f"IG authenticated browser opened the target post {shortcode}, "
+                    "but no exact structured media and no exact visual media were "
+                    "proven. Keep RETRY to avoid false SUCCESS."
                 )
 
         structured_title = getattr(
@@ -8687,6 +8905,34 @@ def download(url: str):
             status3, error3 = _collect_ig_media_playwright(normalized_url)
 
             if status3 in {"SUCCESS", "MISSING", "BLOCKED", "RETRY"}:
+                if status3 == "RETRY":
+                    terminal_rate_limit = _rate_limited_zero_media_result(
+                        instaloader_error,
+                        error3,
+                    )
+                    if terminal_rate_limit:
+                        logger.warning(
+                            "IG v12.31 rate-limit terminal BLOCKED: "
+                            f"{terminal_rate_limit[1]}"
+                        )
+                        result_box[0] = terminal_rate_limit
+                        return
+
+                    # Extra safety for the exact current failure:
+                    # Instaloader 401 + Playwright returned 0 media but the
+                    # downstream error text may be generic.  Do not retry twice.
+                    if _is_ig_rate_limited_error(instaloader_error):
+                        logger.warning(
+                            "IG v12.31 rate-limit terminal BLOCKED: "
+                            "GraphQL is rate-limited and Playwright did not "
+                            "download exact media; stop retry loop."
+                        )
+                        result_box[0] = (
+                            "BLOCKED",
+                            "Instagram GraphQL is rate-limited and no exact media was proven by Playwright/IG_Parser."
+                        )
+                        return
+
                 result_box[0] = (status3, error3)
                 return
 

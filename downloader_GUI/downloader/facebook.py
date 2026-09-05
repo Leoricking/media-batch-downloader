@@ -1,3 +1,13 @@
+# v12.36 Exact Gallery Best-Available Download Fix
+# v12.35 Download Candidate Type Guard Fix
+# v12.34 Global Media Pack Guard Fix
+# v12.33 Full Media Pack Type Guard Fix
+# v12.32 Capture Item Type Guard Fix
+# v12.31 Capture Dir Recovery Fix
+# v12.30 Verified Capture Recovery + Account UI Fix
+# v12.29 Fast Retry Capture Recovery
+# v12.28 Viewer Capture Completion Fix
+# v12.27 Share/P Gallery Cluster + Account UI Filter Fix
 # v12.26 Share/P Gallery Title + Persisted Capture Download Fix
 # v12.25 Full Gallery Near-Complete Recovery
 # v12.24 Album Context Caption Fix
@@ -1244,15 +1254,21 @@ def _is_verified_fb_best_available_source_file(path: str, src: str = "") -> tupl
 
 
 def _download_best_candidate(context, candidates, dst_base: str, referer: str):
+    # v12.36: final safety net.  High-res expansion can reintroduce raw URL
+    # strings, so normalize before and after expansion.  This prevents the final
+    # downloader from crashing with: 'str' object has no attribute 'get'.
+    candidates = _fb_v1235_normalize_candidates(candidates)
     candidates = _expand_fb_candidate_highres_variants(candidates)
+    candidates = _fb_v1235_normalize_candidates(candidates)
     candidates = _dedupe_ordered(candidates)
+    candidates = _fb_v1235_normalize_candidates(candidates)
 
     if not candidates:
         raise Exception("沒有候選媒體 URL")
 
     candidates = sorted(
         candidates,
-        key=lambda x: x.get("score", 0),
+        key=lambda x: int(x.get("score", 0) or 0) if isinstance(x, dict) else 0,
         reverse=True,
     )
 
@@ -1262,6 +1278,9 @@ def _download_best_candidate(context, candidates, dst_base: str, referer: str):
     errors = []
 
     for idx, item in enumerate(candidates[:18], 1):
+        if not isinstance(item, dict):
+            logger.debug(f"FB v12.36 drop non-dict final candidate: {type(item).__name__}")
+            continue
         src = item.get("src", "")
 
         if not src:
@@ -1702,6 +1721,10 @@ def _clean_fb_account_name(raw: str) -> str:
     bad = {
         "", "facebook", "facebook_post", "facebook reel", "reel", "watch",
         "讚", "留言", "分享", "查看更多", "public", "所有人",
+        # v12.27: FB right rail / composer UI labels are not account names.
+        "建立貼文", "建立帖子", "建立", "發佈", "發布", "相片", "照片",
+        "限時動態", "建立限時動態", "建立限時动态", "新增限時動態",
+        "限时动态", "建立限时动态", "動態消息", "首頁", "通知", "朋友", "社團", "Marketplace",
     }
     if value.lower() in bad:
         return ""
@@ -2570,10 +2593,14 @@ def _manifest_ids_from_packs(packs: list[dict]) -> list[str]:
     """
     out = []
     seen = set()
-    for pack in packs or []:
-        candidates = [pack.get("src", "")] + [
-            (c.get("src") or "") for c in (pack.get("candidates") or [])
-        ]
+    for pack in _fb_v1232_pack_dicts(packs):
+        raw_candidates = []
+        for c in (pack.get("candidates") or []):
+            if isinstance(c, dict):
+                raw_candidates.append(c.get("src") or "")
+            elif isinstance(c, str):
+                raw_candidates.append(c)
+        candidates = [pack.get("src", "")] + raw_candidates
         for src in candidates:
             mid = _fb_media_numeric_id_str_from_src(src)
             if mid and mid not in seen:
@@ -2612,7 +2639,7 @@ def _filter_items_by_media_cluster_or_manifest(
     out = []
     seen_primary = set()
 
-    for pack in packs or []:
+    for pack in _fb_v1232_pack_dicts(packs):
         src = pack.get("src") or ""
         if pack.get("type") == "video" or _is_probably_video_url(src):
             continue
@@ -2847,11 +2874,41 @@ def _get_post_folder_name_for_pcb(page, pcb_key: str, fallback: str = "Facebook_
     logger.info(f"FB post title folder scoped fallback={fallback_clean}")
     return fallback_clean
 
+def _fb_v1232_pack_dicts(seq) -> list[dict]:
+    """Return only dict media packs.
+
+    v12.31 can append response-capture candidates into the same sequence used by
+    older gallery/link logic.  Some legacy helpers can also leak raw href strings
+    into the merged item list.  Older functions assumed every element has .get()
+    and crashed with: "'str' object has no attribute 'get'".  This guard keeps
+    the strict completeness checks but prevents a type error from converting a
+    recoverable gallery into FAILED.
+    """
+    out = []
+    for item in seq or []:
+        if isinstance(item, dict):
+            out.append(item)
+        elif item:
+            try:
+                logger.debug(f"FB v12.32 drop non-dict media item: {type(item).__name__}")
+            except Exception:
+                pass
+    return out
+
+
 def _pack_best_media_id_str(pack: dict) -> str:
     """Return stable CDN media id from a pack or its candidates."""
-    if not pack:
+    if not isinstance(pack, dict) or not pack:
         return ""
-    for src in [pack.get("src", "")] + [(c.get("src") or "") for c in (pack.get("candidates") or [])]:
+
+    candidates = []
+    for c in (pack.get("candidates") or []):
+        if isinstance(c, dict):
+            candidates.append(c.get("src") or "")
+        elif isinstance(c, str):
+            candidates.append(c)
+
+    for src in [pack.get("src", "")] + candidates:
         mid = _fb_media_numeric_id_str_from_src(src)
         if mid:
             return mid
@@ -2867,7 +2924,7 @@ def _dedupe_items_by_media_id(packs: list[dict]) -> list[dict]:
     """
     out = []
     seen = set()
-    for pack in packs or []:
+    for pack in _fb_v1232_pack_dicts(packs):
         mid = _pack_best_media_id_str(pack)
         if mid:
             if mid in seen:
@@ -2880,7 +2937,7 @@ def _dedupe_items_by_media_id(packs: list[dict]) -> list[dict]:
 def _drop_video_packs_for_photo_post(packs: list[dict]) -> list[dict]:
     """In a photo post target, never let video/ad/reel responses count as missing photos."""
     out = []
-    for pack in packs or []:
+    for pack in _fb_v1232_pack_dicts(packs):
         src = pack.get("src") or ""
         if pack.get("type") == "video" or _is_probably_video_url(src):
             logger.info(f"FB v11.16 drop video/non-photo candidate: {os.path.basename(urlparse(str(src).split('?')[0]).path)}")
@@ -2891,7 +2948,7 @@ def _drop_video_packs_for_photo_post(packs: list[dict]) -> list[dict]:
 def _dominant_media_cluster(packs: list[dict] | None, *, min_count: int = 3) -> str:
     counts = {}
     order = []
-    for pack in packs or []:
+    for pack in _fb_v1232_pack_dicts(packs):
         key = _pack_media_cluster_key(pack)
         if not key:
             continue
@@ -2910,7 +2967,7 @@ def _filter_items_by_media_cluster(packs: list[dict], cluster_key: str) -> list[
         return packs or []
     out = []
     seen_primary = set()
-    for pack in packs or []:
+    for pack in _fb_v1232_pack_dicts(packs):
         src = pack.get("src") or ""
         key = _media_cluster_key_from_src(src)
         if key != cluster_key:
@@ -2922,9 +2979,16 @@ def _filter_items_by_media_cluster(packs: list[dict], cluster_key: str) -> list[
         # still win in download stage or force duplicate hashes.
         clean_candidates = []
         for cand in pack.get("candidates") or []:
-            csrc = cand.get("src") or ""
+            if isinstance(cand, dict):
+                csrc = cand.get("src") or ""
+                cand_pack = cand
+            elif isinstance(cand, str):
+                csrc = cand
+                cand_pack = {"src": cand, "type": _media_type_from_url(cand)}
+            else:
+                continue
             if _media_cluster_key_from_src(csrc) == cluster_key and not _is_probably_video_url(csrc):
-                clean_candidates.append(cand)
+                clean_candidates.append(cand_pack)
 
         if not clean_candidates and src:
             clean_candidates = [{
@@ -3851,7 +3915,7 @@ def _aggregate_unique_items(*seqs: list[dict]) -> list[dict]:
     out = []
     seen = set()
     for seq in seqs:
-        for pack in seq or []:
+        for pack in _fb_v1232_pack_dicts(seq):
             key = _media_key_from_src(pack.get("src", ""))
             if not key or key in seen:
                 continue
@@ -4794,7 +4858,7 @@ def _merge_unique_candidates(primary: list[dict], fallback: list[dict]) -> list[
     merged = []
     seen = set()
 
-    for item in (primary or []) + (fallback or []):
+    for item in _fb_v1232_pack_dicts((primary or []) + (fallback or [])):
         src = (item.get("src") or "").strip()
 
         if not src:
@@ -5799,7 +5863,7 @@ def _recover_full_gallery_near_complete_v1225(
             logger.debug(f"FB v12.25 recovery seed skipped: {e}")
             continue
 
-        for pack in seq:
+        for pack in _fb_v1232_pack_dicts(seq):
             src = pack.get("src") or ""
             if not src or _is_probably_video_url(src):
                 continue
@@ -5822,6 +5886,733 @@ def _recover_full_gallery_near_complete_v1225(
 
     logger.warning(f"FB v12.25 near-complete recovery incomplete: {len(current)}/{expected}; keep RETRY")
     return recovered_viewer
+
+
+
+def _fb_v1228_capture_files_from_temp() -> list[str]:
+    """Return already-captured cap_* response files in stable capture order.
+
+    v12.31:
+    The response listener persists files under TEMP_DIR/_fb_capture, not directly
+    under TEMP_DIR.  v12.30 scanned only TEMP_DIR, so logs showed many
+    "FB response 實體落盤: cap_..." lines but recovery reported captures=0.
+    """
+    candidate_dirs = [
+        os.path.join(TEMP_DIR, "_fb_capture"),
+        TEMP_DIR,
+    ]
+    paths = []
+    seen = set()
+
+    for base in candidate_dirs:
+        try:
+            if not os.path.isdir(base):
+                continue
+            for name in os.listdir(base):
+                low = name.lower()
+                if not name.startswith("cap_"):
+                    continue
+                if not low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    continue
+                path = os.path.join(base, name)
+                if path in seen:
+                    continue
+                if not os.path.isfile(path):
+                    continue
+                if os.path.getsize(path) < 12 * 1024:
+                    continue
+                seen.add(path)
+                paths.append(path)
+        except Exception:
+            continue
+
+    try:
+        paths.sort(key=lambda p: os.path.getmtime(p))
+    except Exception:
+        pass
+
+    if paths:
+        logger.info(
+            f"FB v12.31 response-capture file pool: {len(paths)} "
+            f"(scan=_fb_capture+TEMP_DIR)"
+        )
+    return paths
+
+
+def _fb_v1228_fill_outputs_from_captures(
+    ordered_output_files: list[str],
+    *,
+    success_count: int,
+    expected_photo_count: int,
+) -> tuple[int, list[str]]:
+    """Fill missing gallery outputs from captured cap_* files.
+
+    Used only after exact-count/full-gallery scope is already proven.  This
+    avoids RETRY when the viewer captured the target image but the later direct
+    CDN candidate degrades to 240x240 during final download.
+    """
+    try:
+        expected = int(expected_photo_count or 0)
+    except Exception:
+        expected = 0
+
+    if not expected or success_count >= expected:
+        return success_count, ordered_output_files
+
+    existing_sizes = set()
+    existing_names = set()
+    for p in ordered_output_files or []:
+        try:
+            existing_names.add(os.path.basename(p))
+            existing_sizes.add(os.path.getsize(p))
+        except Exception:
+            pass
+
+    for cap in _fb_v1228_capture_files_from_temp():
+        if success_count >= expected:
+            break
+        try:
+            if os.path.basename(cap) in existing_names:
+                continue
+            size = os.path.getsize(cap)
+            if size in existing_sizes and size < 40 * 1024:
+                # avoid repeatedly copying the same low-size capture pool item
+                continue
+            ext = os.path.splitext(cap)[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+                ext = ".jpg"
+            out_path = os.path.join(TEMP_DIR, f"fb_{success_count + 1:04d}{ext}")
+            shutil.copy2(cap, out_path)
+            ordered_output_files.append(out_path)
+            existing_names.add(os.path.basename(cap))
+            existing_sizes.add(size)
+            success_count += 1
+            logger.info(
+                f"FB v12.36 response-capture output filled: "
+                f"{success_count}/{expected}, source={os.path.basename(cap)}, bytes={size}"
+            )
+        except Exception as e:
+            logger.debug(f"FB v12.31 response-capture fill skipped: {e}")
+
+    return success_count, ordered_output_files
+
+
+def _fb_v1229_capture_items_from_temp(expected_photo_count: int = 0) -> list[dict]:
+    """Return captured cap_* files as viewer items for pre-download completeness.
+
+    v12.28 filled missing output files after download, but long galleries such
+    as expected=18 could still return RETRY earlier at the fast retry guard
+    before download starts.  v12.29 uses the same response captures as candidate
+    viewer items before that guard, then the normal expected-count guard decides
+    success vs retry.
+    """
+    items = []
+    for cap in _fb_v1228_capture_files_from_temp():
+        try:
+            src = f"file://{cap}"
+            items.append({
+                "type": "image",
+                "src": src,
+                "candidates": [src],
+                "temp_path": cap,
+                "source": "v12.29-response-capture-pre-guard",
+                "media_id": os.path.splitext(os.path.basename(cap))[0],
+                "score": 1,
+                "_allow_fb_best_available_source": True,
+            })
+            if expected_photo_count and len(items) >= int(expected_photo_count):
+                break
+        except Exception:
+            continue
+    if items:
+        logger.info(f"FB v12.29 pre-guard response-capture items: {len(items)}")
+    return items
+
+
+
+def _fb_v1230_capture_item_key(path: str) -> str:
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+    name = os.path.basename(path or "")
+    # The cap_* filename is a response-content hash in current pipeline and is
+    # stable enough to avoid duplicates. Keep size as a secondary hint for older
+    # sessions where cap filenames may be reused.
+    return f"{name}:{size}"
+
+
+def _fb_v1229_append_capture_items_before_guard(
+    viewer_items: list[dict],
+    *,
+    expected_photo_count: int,
+) -> list[dict]:
+    """Append captured response files until viewer_items can satisfy expected count.
+
+    v12.30:
+    Always log the attempt and use cap filename+size identity.  The previous
+    version could be hard to verify because it only logged when accepted items
+    existed.  This makes it obvious whether the running file is current.
+    """
+    current = list(viewer_items or [])
+    try:
+        expected = int(expected_photo_count or 0)
+    except Exception:
+        expected = 0
+    if not expected or len(current) >= expected:
+        return current
+
+    captures = _fb_v1228_capture_files_from_temp()
+    logger.info(
+        f"FB v12.31 pre-guard response-capture recovery attempt: "
+        f"current={len(current)}, expected={expected}, captures={len(captures)}"
+    )
+
+    seen = set()
+    for item in _fb_v1232_pack_dicts(current):
+        src = item.get("src") or ""
+        if src:
+            seen.add(_media_key_from_src(src))
+        tp = item.get("temp_path") or ""
+        if tp:
+            seen.add(_fb_v1230_capture_item_key(tp))
+            seen.add(os.path.basename(tp))
+
+    for cap_path in captures:
+        key = _fb_v1230_capture_item_key(cap_path)
+        name = os.path.basename(cap_path)
+        if key in seen or name in seen:
+            continue
+
+        # Avoid tiny placeholders.  17KB+ can still be a valid FB best-available
+        # exact gallery image; below 12KB is usually UI/avatar/placeholder.
+        try:
+            cap_size = os.path.getsize(cap_path)
+        except Exception:
+            cap_size = 0
+        if cap_size < 12 * 1024:
+            continue
+
+        src = f"file://{cap_path}"
+        seen.add(key)
+        seen.add(name)
+        seen.add(_media_key_from_src(src))
+        current.append({
+            "type": "image",
+            "src": src,
+            "candidates": [src],
+            "temp_path": cap_path,
+            "source": "v12.30-response-capture-pre-guard",
+            "media_id": os.path.splitext(name)[0],
+            "score": 1,
+            "_allow_fb_best_available_source": True,
+        })
+        logger.info(
+            f"FB v12.31 pre-guard response-capture appended: "
+            f"{len(current)}/{expected}, source={name}, bytes={cap_size}"
+        )
+        if len(current) >= expected:
+            break
+
+    return current
+
+
+# v12.34 ---------------------------------------------------------------------
+# Last defensive layer before the main FB pipeline:
+# legacy helpers below this point are used by multiple gallery branches.  Some
+# of them historically assumed all media packs and candidates were dictionaries.
+# FB response-capture recovery can mix legacy raw URL strings with dict packs, so
+# redefine the global helper names here with strict normalization before the main
+# pipeline starts.  Python resolves these names at call time, so these definitions
+# override the earlier legacy implementations without changing unrelated logic.
+
+def _fb_v1234_candidate_src_list(pack) -> list[str]:
+    if isinstance(pack, str):
+        return [pack]
+    if not isinstance(pack, dict):
+        return []
+    out = []
+    src = pack.get("src") or ""
+    if src:
+        out.append(src)
+    for cand in pack.get("candidates") or []:
+        if isinstance(cand, dict):
+            csrc = cand.get("src") or ""
+        elif isinstance(cand, str):
+            csrc = cand
+        else:
+            csrc = ""
+        if csrc:
+            out.append(csrc)
+    return out
+
+
+def _fb_v1234_candidate_pack_list(pack) -> list[dict]:
+    out = []
+    if isinstance(pack, dict):
+        out.append(pack)
+        for cand in pack.get("candidates") or []:
+            if isinstance(cand, dict):
+                out.append(cand)
+            elif isinstance(cand, str):
+                out.append({"src": cand, "type": _media_type_from_url(cand), "score": 0})
+    elif isinstance(pack, str):
+        out.append({"src": pack, "type": _media_type_from_url(pack), "score": 0})
+    return out
+
+
+def _pack_media_cluster_key(pack: dict | str) -> str:
+    for src in _fb_v1234_candidate_src_list(pack):
+        key = _media_cluster_key_from_src(src)
+        if key:
+            return key
+    return ""
+
+
+def _pack_best_media_id_str(pack: dict | str) -> str:
+    for src in _fb_v1234_candidate_src_list(pack):
+        mid = _fb_media_numeric_id_str_from_src(src)
+        if mid:
+            return mid
+    return ""
+
+
+def _manifest_ids_from_packs(packs: list[dict]) -> list[str]:
+    out = []
+    seen = set()
+    for pack in _fb_v1232_pack_dicts(packs):
+        for src in _fb_v1234_candidate_src_list(pack):
+            mid = _fb_media_numeric_id_str_from_src(src)
+            if mid and mid not in seen:
+                seen.add(mid)
+                out.append(mid)
+                break
+    return out
+
+
+def _pack_has_manifest_id(pack: dict | str, manifest_ids: set[str]) -> bool:
+    if not manifest_ids:
+        return False
+    for src in _fb_v1234_candidate_src_list(pack):
+        mid = _fb_media_numeric_id_str_from_src(src)
+        if mid and mid in manifest_ids:
+            return True
+    return False
+
+
+def _dedupe_items_by_media_id(packs: list[dict]) -> list[dict]:
+    out = []
+    seen = set()
+    for pack in _fb_v1232_pack_dicts(packs):
+        mid = _pack_best_media_id_str(pack)
+        if mid:
+            if mid in seen:
+                logger.info(f"FB v12.34 duplicate media id skipped={mid}")
+                continue
+            seen.add(mid)
+        out.append(pack)
+    return out
+
+
+def _aggregate_unique_items(*seqs: list[dict]) -> list[dict]:
+    out = []
+    seen = set()
+    for seq in seqs:
+        for pack in _fb_v1232_pack_dicts(seq):
+            srcs = _fb_v1234_candidate_src_list(pack)
+            key = _media_key_from_src(srcs[0]) if srcs else ""
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(pack)
+    return out
+
+
+def _drop_video_items(packs: list[dict]) -> list[dict]:
+    out = []
+    for pack in _fb_v1232_pack_dicts(packs):
+        srcs = _fb_v1234_candidate_src_list(pack)
+        src = srcs[0] if srcs else ""
+        if pack.get("type") == "video" or _is_probably_video_url(src):
+            logger.info(f"FB v12.34 drop video/non-photo candidate: {os.path.basename(urlparse(str(src).split('?')[0]).path)}")
+            continue
+        out.append(pack)
+    return out
+
+
+def _dominant_media_cluster(packs: list[dict] | None, *, min_count: int = 3) -> str:
+    counts = {}
+    order = []
+    for pack in _fb_v1232_pack_dicts(packs):
+        key = _pack_media_cluster_key(pack)
+        if not key:
+            continue
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+    if not counts:
+        return ""
+    best = sorted(order, key=lambda k: (-counts[k], order.index(k)))[0]
+    return best if counts.get(best, 0) >= min_count else ""
+
+
+def _filter_items_by_media_cluster(packs: list[dict], cluster_key: str) -> list[dict]:
+    if not cluster_key:
+        return _fb_v1232_pack_dicts(packs)
+    out = []
+    seen_primary = set()
+    for pack in _fb_v1232_pack_dicts(packs):
+        srcs = _fb_v1234_candidate_src_list(pack)
+        src = srcs[0] if srcs else ""
+        key = _media_cluster_key_from_src(src)
+        if key != cluster_key:
+            continue
+        if pack.get("type") == "video" or _is_probably_video_url(src):
+            continue
+
+        clean_candidates = []
+        for cand_pack in _fb_v1234_candidate_pack_list(pack):
+            csrcs = _fb_v1234_candidate_src_list(cand_pack)
+            csrc = csrcs[0] if csrcs else ""
+            if _media_cluster_key_from_src(csrc) == cluster_key and not _is_probably_video_url(csrc):
+                clean_candidates.append(cand_pack)
+
+        clone = dict(pack)
+        if clean_candidates:
+            clone["candidates"] = clean_candidates
+        primary = _normalized_exact_fb_media_url(src)
+        if primary and primary in seen_primary:
+            continue
+        if primary:
+            seen_primary.add(primary)
+        out.append(clone)
+    return out
+
+
+def _filter_items_by_media_cluster_or_manifest(
+    packs: list[dict],
+    cluster_key: str,
+    manifest_ids: list[str] | None = None,
+) -> list[dict]:
+    manifest_set = set(manifest_ids or [])
+    out = []
+    seen_primary = set()
+    for pack in _fb_v1232_pack_dicts(packs):
+        srcs = _fb_v1234_candidate_src_list(pack)
+        src = srcs[0] if srcs else ""
+        if pack.get("type") == "video" or _is_probably_video_url(src):
+            continue
+
+        key = _media_cluster_key_from_src(src)
+        in_cluster = bool(cluster_key and key == cluster_key)
+        in_manifest = _pack_has_manifest_id(pack, manifest_set)
+
+        if cluster_key or manifest_set:
+            if not (in_cluster or in_manifest):
+                continue
+
+        clean_candidates = []
+        for cand_pack in _fb_v1234_candidate_pack_list(pack):
+            csrcs = _fb_v1234_candidate_src_list(cand_pack)
+            csrc = csrcs[0] if csrcs else ""
+            if _is_probably_video_url(csrc):
+                continue
+            ckey = _media_cluster_key_from_src(csrc)
+            cmid = _fb_media_numeric_id_str_from_src(csrc)
+            if (
+                (cluster_key and ckey == cluster_key)
+                or (manifest_set and cmid in manifest_set)
+                or (not cluster_key and not manifest_set)
+            ):
+                clean_candidates.append(cand_pack)
+
+        clone = dict(pack)
+        if clean_candidates:
+            clone["candidates"] = clean_candidates
+        primary = _normalized_exact_fb_media_url(src)
+        if primary and primary in seen_primary:
+            continue
+        if primary:
+            seen_primary.add(primary)
+        out.append(clone)
+    return out
+
+
+def _merge_unique_candidates(primary: list[dict], fallback: list[dict]) -> list[dict]:
+    seen = set()
+    merged = []
+    for item in _fb_v1232_pack_dicts((primary or []) + (fallback or [])):
+        srcs = _fb_v1234_candidate_src_list(item)
+        src = srcs[0].strip() if srcs else ""
+        if not src:
+            continue
+        key = _media_key_from_src(src)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return _dedupe_ordered(merged)
+
+
+def _force_single_photo_items_v1223(link_items: list[dict] | None, viewer_items: list[dict] | None) -> list[dict]:
+    for seq in [link_items or [], viewer_items or []]:
+        for item in _fb_v1232_pack_dicts(seq):
+            srcs = _fb_v1234_candidate_src_list(item)
+            src = srcs[0] if srcs else ""
+            if src and not _is_probably_video_url(src):
+                return [item]
+    return []
+
+# ---------------------------------------------------------------------------
+
+
+# v12.35 ---------------------------------------------------------------------
+# Final defensive download-layer guard:
+# v12.34 normalized merge/manifest/cluster helpers, but the final downloader
+# still had legacy assumptions that pack["candidates"] contains dictionaries.
+# Some response-capture/full-gallery candidates contain raw URL strings or
+# file:// persisted capture paths.  Normalize right before download so 18/18
+# collected galleries cannot fail with "'str' object has no attribute 'get'".
+
+def _fb_v1235_candidate_from_raw(raw, *, fallback_type: str = "image", inherited: dict | None = None) -> dict | None:
+    inherited = inherited or {}
+    if isinstance(raw, dict):
+        src = (raw.get("src") or "").strip()
+        item = dict(raw)
+    elif isinstance(raw, str):
+        src = raw.strip()
+        item = {"src": src, "type": _media_type_from_url(src), "score": 0}
+    else:
+        return None
+
+    temp_path = item.get("temp_path") or item.get("persisted_path") or inherited.get("temp_path") or inherited.get("persisted_path")
+    if not src and temp_path:
+        src = f"file://{temp_path}"
+        item["src"] = src
+
+    if not src:
+        return None
+
+    if temp_path and os.path.exists(str(temp_path)):
+        item["temp_path"] = str(temp_path)
+        item.setdefault("persisted_path", str(temp_path))
+        item.setdefault("_allow_fb_best_available_source", True)
+
+    if not item.get("type"):
+        item["type"] = fallback_type or _media_type_from_url(src)
+
+    try:
+        item["score"] = int(item.get("score") or 0)
+    except Exception:
+        item["score"] = 0
+
+    return item
+
+
+def _fb_v1235_normalize_candidates(candidates, *, inherited: dict | None = None) -> list[dict]:
+    out = []
+    seen = set()
+    inherited = inherited or {}
+    for raw in candidates or []:
+        item = _fb_v1235_candidate_from_raw(raw, inherited=inherited)
+        if not item:
+            continue
+
+        src = (item.get("src") or "").strip()
+        temp_path = item.get("temp_path") or item.get("persisted_path") or ""
+
+        if temp_path and os.path.exists(str(temp_path)):
+            try:
+                key = f"persisted:{os.path.basename(str(temp_path))}:{os.path.getsize(str(temp_path))}"
+            except Exception:
+                key = f"persisted:{os.path.basename(str(temp_path))}"
+        elif src.startswith("file://"):
+            key = src
+        elif item.get("type") == "video" or any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]):
+            key = os.path.basename(urlparse(src.split("?")[0]).path) or src[:180]
+        else:
+            if not _looks_like_real_fb_media_url(src):
+                continue
+            key = _normalized_exact_fb_media_url(src)
+
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _dedupe_ordered(items):
+    out = []
+    seen = set()
+    for item in _fb_v1235_normalize_candidates(items):
+        src = (item.get("src") or "").strip()
+        temp_path = item.get("temp_path") or item.get("persisted_path") or ""
+
+        if temp_path and os.path.exists(str(temp_path)):
+            try:
+                key = f"persisted:{os.path.basename(str(temp_path))}:{os.path.getsize(str(temp_path))}"
+            except Exception:
+                key = f"persisted:{os.path.basename(str(temp_path))}"
+        elif src.startswith("file://"):
+            key = src
+        elif item.get("type") == "video" or any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]):
+            key = os.path.basename(urlparse(src.split("?")[0]).path) or src[:180]
+        else:
+            key = _normalized_exact_fb_media_url(src)
+
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        if not src.startswith("file://"):
+            try:
+                src = html.unescape(unquote(src))
+                item["src"] = src
+                item["score"] = int(item.get("score") or 0) + _media_quality_score(src)
+            except Exception:
+                pass
+        out.append(item)
+    return out
+
+
+def _pack_primary_candidates(pack: dict) -> list[dict]:
+    pack_list = _fb_v1234_candidate_pack_list(pack)
+    if not pack_list:
+        return []
+
+    # Use the first normalized pack as primary.
+    primary_pack = pack_list[0]
+    primary_src = (primary_pack.get("src") or "").strip()
+    primary_key = _media_key_from_src(primary_src)
+    inherited = primary_pack if isinstance(primary_pack, dict) else {}
+
+    raw_candidates = []
+    if isinstance(pack, dict):
+        raw_candidates.extend(pack.get("candidates") or [])
+    raw_candidates.extend(pack_list)
+
+    candidates = _fb_v1235_normalize_candidates(raw_candidates, inherited=inherited)
+
+    if not candidates and primary_src:
+        cand = _fb_v1235_candidate_from_raw(primary_pack, inherited=inherited)
+        return [cand] if cand else []
+
+    if not primary_key or primary_src.startswith("file://"):
+        return candidates[:4]
+
+    pinned = []
+    seen = set()
+    for cand in candidates:
+        src = (cand.get("src") or "").strip()
+        if not src:
+            continue
+
+        # Persisted capture candidates are exact viewer captures; keep them as
+        # fallback even if the file:// key does not match CDN basename.
+        if cand.get("temp_path") and os.path.exists(str(cand.get("temp_path"))):
+            dedupe_key = f"persisted:{os.path.basename(str(cand.get('temp_path')))}"
+        else:
+            key = _media_key_from_src(src)
+            if key != primary_key:
+                continue
+            if cand.get("type") == "video" or any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]):
+                dedupe_key = src.split("?")[0]
+            else:
+                dedupe_key = _normalized_exact_fb_media_url(src)
+
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        pinned.append(cand)
+
+    if pinned:
+        return pinned[:4]
+
+    fallback = _fb_v1235_candidate_from_raw(primary_pack, inherited=inherited)
+    return [fallback] if fallback else []
+
+
+def _download_viewer_items(context, viewer_items, referer: str):
+    success_count = 0
+    ordered_output_files = []
+    seen_hashes = set()
+    seen_media_keys = set()
+
+    normalized_items = []
+    for raw in viewer_items or []:
+        packs = _fb_v1234_candidate_pack_list(raw)
+        normalized_items.extend(packs)
+    normalized_items = _fb_v1232_pack_dicts(normalized_items)
+
+    for attempt_i, pack in enumerate(normalized_items, 1):
+        if not isinstance(pack, dict):
+            logger.debug(f"FB v12.35 skip non-dict download pack: {type(pack).__name__}")
+            continue
+
+        primary_src = pack.get("src") or ""
+        primary_key = _media_key_from_src(primary_src)
+
+        if primary_key and primary_key in seen_media_keys:
+            logger.warning(
+                f"FB 候選第 {attempt_i} 張 primary media key 已重複，略過: {primary_key}"
+            )
+            continue
+
+        candidates = _pack_primary_candidates(pack)
+        candidates = _fb_v1235_normalize_candidates(candidates, inherited=pack)
+
+        if not candidates:
+            logger.warning(f"FB 候選第 {attempt_i} 張沒有有效候選，略過")
+            continue
+
+        dst_base = os.path.join(TEMP_DIR, f"fb_{success_count + 1:04d}")
+
+        try:
+            final_dst, size = _download_best_candidate(
+                context,
+                candidates,
+                dst_base,
+                referer=referer,
+            )
+
+            digest = _file_md5(final_dst)
+            if digest in seen_hashes:
+                logger.warning(
+                    f"FB 候選第 {attempt_i} 張下載後判定重複，刪除暫存: "
+                    f"{os.path.basename(final_dst)} ({size} bytes) primary={primary_key}"
+                )
+                try:
+                    os.remove(final_dst)
+                except Exception:
+                    pass
+                continue
+
+            seen_hashes.add(digest)
+            if primary_key:
+                seen_media_keys.add(primary_key)
+
+            if size < 80 * 1024 and len(normalized_items) >= 8:
+                logger.warning(
+                    f"FB 輸出第 {success_count + 1} 張檔案偏小，可能是縮圖/placeholder: "
+                    f"{os.path.basename(final_dst)} ({size} bytes)"
+                )
+
+            success_count += 1
+            ordered_output_files.append(final_dst)
+            logger.info(
+                f"FB 已下載輸出第 {success_count} 張: {os.path.basename(final_dst)} "
+                f"({size} bytes) primary={primary_key}"
+            )
+
+        except Exception as e:
+            logger.warning(f"FB 候選第 {attempt_i} 張下載失敗: {e}")
+
+    logger.info(f"FB unique output media count={success_count}")
+    return success_count, ordered_output_files
+
+# ---------------------------------------------------------------------------
 
 
 def _collect_fb_media_playwright(url: str):
@@ -6345,7 +7136,22 @@ def _collect_fb_media_playwright(url: str):
             # v11.15: Determine post media cluster BEFORE opening the viewer, so off-post
             # recommendations never count toward expected_photo_count during harvesting.
             pre_viewer_cluster = _dominant_media_cluster(link_items, min_count=2)
-            if pre_viewer_cluster:
+            # v12.27:
+            # For share/p gallery posts, FB media IDs in the same pcb post can
+            # legitimately span neighboring numeric clusters such as 15159826 /
+            # 15159827 / 15159828.  The old cluster guard treated those as
+            # off-post pollution and skipped valid slides, causing 5/7 RETRY.
+            # Keep the cluster guard for generic contexts, but disable it for
+            # already-scoped share/p + pcb gallery mode; final expected-count and
+            # manifest/order guards still prevent false SUCCESS.
+            if share_p_gallery_like_v1226 and dominant_pcb_key.startswith("pcb:"):
+                if pre_viewer_cluster:
+                    logger.info(
+                        f"FB v12.27 share/p gallery disables numeric media-cluster guard: "
+                        f"scope={pre_viewer_cluster}, pcb={dominant_pcb_key}"
+                    )
+                pre_viewer_cluster = ""
+            elif pre_viewer_cluster:
                 logger.info(f"FB v11.15 pre-viewer media cluster scope={pre_viewer_cluster}")
 
             # 多圖完整性補強 v9：
@@ -6446,11 +7252,22 @@ def _collect_fb_media_playwright(url: str):
                             before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
 
                     if before_retry_n < expected_photo_count:
-                        logger.info(
-                            f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
-                            "skip slow recovery and retry fresh context"
-                        )
-                        return "RETRY", f"Facebook viewer incomplete {before_retry_n}/{expected_photo_count}; retry fresh context"
+                        if plus_count_before and int(expected_photo_count) >= 6:
+                            viewer_items = _fb_v1232_pack_dicts(_fb_v1229_append_capture_items_before_guard(
+                                viewer_items,
+                                expected_photo_count=int(expected_photo_count),
+                            ))
+                            try:
+                                before_retry_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
+                            except Exception:
+                                before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
+
+                        if before_retry_n < expected_photo_count:
+                            logger.info(
+                                f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
+                                "skip slow recovery and retry fresh context"
+                            )
+                            return "RETRY", f"Facebook viewer incomplete {before_retry_n}/{expected_photo_count}; retry fresh context"
 
             except Exception as e:
                 logger.warning(f"FB viewer fallback 失敗: {e}")
@@ -6491,7 +7308,7 @@ def _collect_fb_media_playwright(url: str):
             final_items = []
             used_keys = set()
 
-            for pack in link_items:
+            for pack in _fb_v1232_pack_dicts(link_items):
                 key = _media_key_from_src(pack.get("src", ""))
                 if key and key in used_keys:
                     continue
@@ -6508,7 +7325,7 @@ def _collect_fb_media_playwright(url: str):
                     "FB v12.23 album-context single-photo mode: skip appending viewer items"
                 )
             else:
-                for pack in viewer_items:
+                for pack in _fb_v1232_pack_dicts(viewer_items):
                     key = _media_key_from_src(pack.get("src", ""))
                     if key and key in used_keys:
                         continue
@@ -6517,6 +7334,8 @@ def _collect_fb_media_playwright(url: str):
                     final_items.append(pack)
 
             # 如果 viewer 本身比合併結果更完整，代表它是從第一張完整跑完，直接採用 viewer。
+            viewer_items = _fb_v1232_pack_dicts(viewer_items)
+            link_items = _fb_v1232_pack_dicts(link_items)
             if len(viewer_items) >= max(len(final_items), len(link_items) + 4):
                 final_items = viewer_items
 
@@ -6707,19 +7526,29 @@ def _collect_fb_media_playwright(url: str):
                 and (
                     plus_count_before
                     or ('viewer_complete_incomplete_manifest_mode' in locals() and viewer_complete_incomplete_manifest_mode)
+                    or (
+                        str(dominant_pcb_key or "").startswith("pcb:")
+                        and len(_fb_v1232_pack_dicts(link_items or [])) >= int(expected_photo_count)
+                    )
+                    or (
+                        str(dominant_pcb_key or "").startswith("pcb:")
+                        and len(_fb_v1232_pack_dicts(viewer_items or [])) >= int(expected_photo_count)
+                    )
                 )
             ):
                 logger.info(
-                    f"FB v12.22 full-gallery best-available source mode enabled: "
+                    f"FB v12.36 exact-gallery best-available source mode enabled: "
                     f"items={len(viewer_items)}, expected={expected_photo_count}; "
                     "high-res variants are still tried first"
                 )
-                for _pack in viewer_items:
+                for _pack in _fb_v1232_pack_dicts(viewer_items):
                     try:
                         _pack["_allow_fb_best_available_source"] = True
                         for _cand in (_pack.get("candidates") or []):
                             if isinstance(_cand, dict):
                                 _cand["_allow_fb_best_available_source"] = True
+                            elif isinstance(_cand, str):
+                                pass
                     except Exception:
                         pass
 
@@ -6731,6 +7560,22 @@ def _collect_fb_media_playwright(url: str):
                 viewer_items,
                 referer=resolved,
             )
+
+            if (
+                expected_photo_count
+                and success_count < int(expected_photo_count)
+                and int(expected_photo_count) > 1
+                and (
+                    plus_count_before
+                    or str(dominant_pcb_key or "").startswith("pcb:")
+                    or len(viewer_items or []) >= int(expected_photo_count)
+                )
+            ):
+                success_count, ordered_output_files = _fb_v1228_fill_outputs_from_captures(
+                    ordered_output_files,
+                    success_count=success_count,
+                    expected_photo_count=int(expected_photo_count),
+                )
 
             if success_count <= 0:
                 if expected_photo_count and expected_photo_count > 1:
