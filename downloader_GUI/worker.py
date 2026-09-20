@@ -305,7 +305,16 @@ def _worker_loop():
                 _cooldown_sleep(sleep_sec, url)
 
         elif status == "RETRY":
-            sleep_sec = 60
+            # v13.1 bounded retry cooldown: the downloader already performs its
+            # immediate in-task retry above.  A 60s queue cooldown made unrelated
+            # following tasks appear PENDING for minutes after an integrity RETRY.
+            # Keep a small anti-burst gap without blocking the batch.
+            if "facebook.com" in url or "fb.watch" in url:
+                sleep_sec = 8
+            elif "instagram.com" in url:
+                sleep_sec = 15
+            else:
+                sleep_sec = 10
             logger.info(f"RETRY 冷卻 {sleep_sec}s...")
             _cooldown_sleep(sleep_sec, url)
 

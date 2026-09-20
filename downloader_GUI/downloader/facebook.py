@@ -1,3 +1,31 @@
+# v14.2 Complete Runtime Signature Fix
+# Keeps v14.1 immutable GalleryPlan; restores legacy helper keyword API names.
+# Rebuilt from v13.6 known-working baseline; no broken v14.0 code carried forward.
+# Gallery target is finalized once before harvest/recovery and is immutable afterward.
+# v13.6 Integrated Authoritative Gallery Target Fix
+# One authoritative +N count contract end-to-end; legacy downstream
+# target re-raise paths cannot override the corrected gallery plan.
+# v13.1 Integrated Pipeline Refactor
+# Architecture: single effective definition per helper + centralized contracts + fixed regression suite
+# v13.4: deterministic exact-PCB identity walker + v13.3 late reconciliation + strict no-false-success guard
+# v13.3: late structured-payload reconciliation + exact-photo identity-bound candidates + bounded RETRY flow
+# v13.2: exact-photo fallback recovery + group-container identity hardening + bounded RETRY flow
+# exact-post recovery remains strict same-post only; never widens into recommendations
+# v12.51 Exact Gallery Tail Recovery + Group Account Fix
+# v12.50 Exact Gallery Identity + Pending-Budget Fix
+# v12.49 Exact Short-Video + Primary Account + Hidden PCB Recovery Fix
+# v12.48 Share/P Multi-Entry Viewer Recovery Fix
+# v12.47 Candidate Exhaustive Gallery Guard
+# v12.46 Grid Recovery Before Retry Fix
+# v12.45 Duplicate Content Guard Fix
+# v12.44 share/v Exact yt-dlp Fallback Fix
+# v12.43 share/v Strict Video + Plus Count Fix
+# v12.42 PCB Manifest Target + Account Fix
+# v12.41 Dialog Header Account Fix
+# v12.40 Keep Best Resolution Per Photo Fix
+# v12.39 Explicit Story Single-Media Gate
+# v12.38 Large Gallery Fast Mode
+# v12.37 No Outer Timeout + Browser Launch Recovery
 # v12.36 Exact Gallery Best-Available Download Fix
 # v12.35 Download Candidate Type Guard Fix
 # v12.34 Global Media Pack Guard Fix
@@ -62,6 +90,24 @@ except Exception:
 
 from utils.filename import safe_title
 from utils.logger import get_logger
+try:
+    from .fb_contracts import (
+        audit_gallery_completion as _contract_audit_gallery_completion,
+        parse_facebook_target as _contract_parse_facebook_target,
+        derive_gallery_plan as _contract_derive_gallery_plan,
+        finalize_gallery_plan as _contract_finalize_gallery_plan,
+        choose_post_account as _contract_choose_post_account,
+        extract_exact_pcb_photo_ids as _contract_extract_exact_pcb_photo_ids,
+    )
+except Exception:
+    from fb_contracts import (
+        audit_gallery_completion as _contract_audit_gallery_completion,
+        parse_facebook_target as _contract_parse_facebook_target,
+        derive_gallery_plan as _contract_derive_gallery_plan,
+        finalize_gallery_plan as _contract_finalize_gallery_plan,
+        choose_post_account as _contract_choose_post_account,
+        extract_exact_pcb_photo_ids as _contract_extract_exact_pcb_photo_ids,
+    )
 
 try:
     from PIL import Image
@@ -91,7 +137,9 @@ except Exception:
 _cc = OpenCC("s2t") if OpenCC else None
 
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
-_DL_TIMEOUT = 900
+_DL_TIMEOUT = 3600  # v12.37: avoid killing large FB galleries while viewer is still harvesting
+_FB_DOWNLOAD_LOCK = threading.RLock()
+
 _MAX_FB_ITEMS = 40
 _MIN_FILE_SIZE = 20 * 1024
 # v11.94:
@@ -957,51 +1005,6 @@ def _expand_fb_candidate_highres_variants(items: list[dict]) -> list[dict]:
     return expanded
 
 
-def _dedupe_ordered(items):
-    out = []
-    seen = set()
-
-    for item in items:
-        if isinstance(item, str):
-            src = item.strip()
-            media_type = "video" if any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]) else "image"
-            item = {
-                "src": src,
-                "type": media_type,
-                "score": 0,
-            }
-
-        src = (item.get("src") or "").strip()
-
-        if not src:
-            continue
-
-        src = html.unescape(unquote(src))
-
-        if not _looks_like_real_fb_media_url(src):
-            continue
-
-        is_video = item.get("type") == "video" or any(
-            x in src.lower() for x in [".mp4", ".m4v", ".mov"]
-        )
-        if is_video:
-            path = urlparse(src.split("?")[0]).path
-            basename = os.path.basename(path)
-            key = basename or src[:180]
-        else:
-            key = _normalized_exact_fb_media_url(src)
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        item["src"] = src
-        item["score"] = item.get("score", 0) + _media_quality_score(src)
-
-        out.append(item)
-
-    return out
 
 
 def _natural_key(path: str):
@@ -1853,12 +1856,440 @@ def _fb_metadata_url_aliases(task_url: str) -> list[str]:
     return aliases
 
 
+
+def _get_fb_active_post_primary_account_v1249(page) -> str:
+    """Return the primary publisher/group/page name from the active post card.
+
+    v12.49 fixes group posts where the persistent FB page also contains unrelated
+    background cards.  The previous generic account fallback could pick a nearby
+    page (for example, "作夥帕電動") even though the active post header clearly
+    showed another publisher/group (for example, "BubuDudu lover").
+
+    Scope is intentionally narrow: active dialog -> visible article -> top header
+    area only.  It never searches the whole feed as the first choice.
+    """
+    try:
+        raw = page.evaluate(
+            r"""
+            () => {
+              const badText = (t) => {
+                t = String(t || '').replace(/\s+/g, ' ').trim();
+                if (!t || t.length < 2 || t.length > 90) return true;
+                const low = t.toLowerCase();
+                const bad = [
+                  'facebook','查看更多','查看貼文','留言','分享','追蹤','已追蹤',
+                  '讚','最相關','所有留言','寫留言','建立貼文','建立帖子',
+                  'photo','video','reel','reels','首頁','通知','messenger'
+                ];
+                return bad.some(x => low === x || low.startsWith(x + ' '));
+              };
+
+              const candidates = [];
+              const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))
+                .filter(el => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 240 && r.height > 180 && r.bottom > 0 && r.right > 0;
+                });
+              const roots = dialogs.length ? dialogs : [document.querySelector('[role="main"]') || document.body];
+
+              for (const root of roots) {
+                const articles = Array.from(root.querySelectorAll('[role="article"], article')).filter(el => {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 200 && r.height > 120 && r.bottom > 0 && r.right > 0;
+                });
+                const article = articles.sort((a,b) => {
+                  const ar=a.getBoundingClientRect(), br=b.getBoundingClientRect();
+                  return (br.width*br.height) - (ar.width*ar.height);
+                })[0] || root;
+
+                const ar = article.getBoundingClientRect();
+                const nodes = Array.from(article.querySelectorAll('a[role="link"], a[href], strong, h2, h3'));
+                let domIndex = 0;
+                for (const el of nodes.slice(0, 180)) {
+                  domIndex += 1;
+                  const r = el.getBoundingClientRect();
+                  if (r.width <= 0 || r.height <= 0 || r.bottom <= 0 || r.right <= 0) continue;
+                  // Publisher/author rows are in the upper portion of the post card.
+                  if (r.top > ar.top + Math.min(260, Math.max(150, ar.height * 0.28))) continue;
+                  const text = String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                  if (badText(text)) continue;
+                  const href = (el.href || el.getAttribute('href') || '');
+                  const lowHref = href.toLowerCase();
+                  if (lowHref.includes('/hashtag/') || lowHref.includes('/photo') || lowHref.includes('/watch') || lowHref.includes('/reel')) continue;
+                  const score =
+                    (el.tagName === 'A' ? 60 : 0) +
+                    (lowHref.includes('/groups/') ? 160 : 0) +
+                    (lowHref.includes('facebook.com/') ? 40 : 0) +
+                    Math.max(0, 100 - domIndex) +
+                    Math.max(0, 100 - Math.abs(r.top - ar.top));
+                  candidates.push({text, href, score, top:r.top, index:domIndex});
+                }
+              }
+              candidates.sort((a,b) => b.score - a.score || a.top - b.top || a.index - b.index);
+              return candidates.slice(0, 30);
+            }
+            """
+        ) or []
+    except Exception:
+        raw = []
+
+    for item in raw:
+        text = _clean_fb_account_name((item or {}).get('text') if isinstance(item, dict) else str(item or ''))
+        if not text:
+            continue
+        if _looks_like_fb_page_name_v1223(text):
+            logger.info(f"FB v12.49 active post primary account selected: {text}")
+            return text
+    return ""
+
+
+def _get_fb_dialog_header_account_v1241(page) -> str:
+    """Extract author from the active Facebook viewer/dialog/header title.
+
+    v12.42 makes this more aggressive: scan document title, visible headings,
+    aria labels and body lines for "<account> 的貼文/的帖子".  This avoids using
+    background feed cards as Post Account when the active viewer belongs to a
+    different page such as "story halaman tv".
+    """
+    try:
+        raw = page.evaluate(
+            r"""
+            () => {
+              const out = [];
+              const push = (v) => {
+                const t = String(v || '').replace(/\s+/g, ' ').trim();
+                if (!t) return;
+                if (t.length > 160) return;
+                if (t.includes('的貼文') || t.includes('的帖子') || t.includes("'s post")) out.push(t);
+              };
+
+              push(document.title);
+
+              const roots = [];
+              for (const d of Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))) roots.push(d);
+              const main = document.querySelector('[role="main"]');
+              if (main) roots.push(main);
+              roots.push(document.body || document);
+
+              for (const root of roots) {
+                const nodes = Array.from(root.querySelectorAll('h1, h2, h3, [aria-label], [role="heading"], a[role="link"], span, div'));
+                for (const el of nodes.slice(0, 1800)) {
+                  const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                  if (rect && (rect.width <= 0 || rect.height <= 0)) continue;
+                  push(el.getAttribute && el.getAttribute('aria-label'));
+                  push(el.innerText || el.textContent || '');
+                }
+
+                const bodyText = (root.innerText || root.textContent || '').split(/\n+/).slice(0, 260);
+                for (const line of bodyText) push(line);
+              }
+
+              return Array.from(new Set(out)).slice(0, 120);
+            }
+            """
+        ) or []
+    except Exception:
+        raw = []
+
+    blacklist = {
+        "facebook", "首頁", "通知", "建立貼文", "建立帖子", "留言", "分享",
+        "讚", "最相關", "查看更多", "你的貼文", "你的帖子",
+    }
+
+    for cand in raw:
+        s = _to_traditional(html.unescape(str(cand or ""))).strip()
+        # title can be "story halaman tv 的貼文 | Facebook"
+        s = re.sub(r"\s*[|｜]\s*Facebook\s*$", "", s, flags=re.I).strip()
+        m = re.search(r"^(.{2,60}?)\s*的(?:貼文|帖子)\s*$", s)
+        if not m:
+            m = re.search(r"^(.{2,60}?)\s*'s post\s*$", s, flags=re.I)
+        if not m:
+            continue
+        account = _clean_fb_account_name(m.group(1))
+        if not account or account in blacklist:
+            continue
+        if account and _looks_like_fb_page_name_v1223(account):
+            logger.info(f"FB v12.42 dialog/header account selected: {account}")
+            return account
+
+    return ""
+
+
+
+
+def _fb_v132_bad_account_label(text: str) -> bool:
+    t = _clean_fb_account_name(text or "")
+    if not t:
+        return True
+    low = t.lower()
+    bad_exact = {
+        "在線上", "上線狀態指標 在線上", "online", "active now",
+        "查看貼文", "查看更多", "追蹤", "已追蹤", "建立貼文",
+    }
+    if low in bad_exact:
+        return True
+    if "上線狀態" in t or "active status" in low:
+        return True
+    return False
+
+
+def _fb_v131_get_group_container_account(page, dominant_pcb_key: str = "") -> str:
+    """Return the group/container identity for an exact-PCB group post.
+
+    Post Account in the GUI represents the shared post's container.  For group
+    posts this is the group name, not the member/author shown underneath it.
+    The lookup is exact-post scoped when the pcb id is available.
+    """
+    pcb = str(dominant_pcb_key or "")
+    if pcb.startswith("pcb:"):
+        pcb = pcb.split(":", 1)[1]
+    pcb = re.sub(r"\D", "", pcb)
+    try:
+        rows = page.evaluate(
+            r"""
+            (pcb) => {
+              const visible = el => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+              };
+              const clean = t => String(t || '').replace(/\s+/g,' ').trim();
+              const roots = [];
+              if (pcb) {
+                for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+                  const h = String(a.href || a.getAttribute('href') || '');
+                  if (!(h.includes('set=pcb.' + pcb) || h.includes('set=pcb%2E' + pcb))) continue;
+                  const art = a.closest('[role="article"], article');
+                  if (art && !roots.includes(art)) roots.push(art);
+                }
+              }
+              if (!roots.length) {
+                const art = document.querySelector('[role="article"], article');
+                if (art) roots.push(art);
+              }
+              if (!roots.length) roots.push(document.querySelector('[role="main"]') || document.body);
+
+              const out = [];
+              for (const root of roots.slice(0, 4)) {
+                const rr = root.getBoundingClientRect();
+                for (const a of Array.from(root.querySelectorAll('a[href]')).slice(0, 320)) {
+                  if (!visible(a)) continue;
+                  const href = String(a.href || a.getAttribute('href') || '');
+                  let u;
+                  try { u = new URL(href, location.href); } catch(e) { continue; }
+                  const seg = u.pathname.split('/').filter(Boolean);
+                  if (seg.length !== 2 || seg[0].toLowerCase() !== 'groups' || !seg[1]) continue;
+                  const text = clean(a.innerText || a.textContent || a.getAttribute('aria-label'));
+                  if (!text || text.length > 120) continue;
+                  const r = a.getBoundingClientRect();
+                  let score = 5000;
+                  if (r.top <= rr.top + Math.min(420, Math.max(220, rr.height * 0.42))) score += 1500;
+                  score -= Math.max(0, r.top - rr.top) * 0.2;
+                  out.push({text, href:u.href, score, top:r.top});
+                }
+              }
+              // v13.2: some group shares expose no clickable group-root anchor in the
+              // virtualized dialog.  Use only the exact post/dialog heading as a
+              // same-container fallback; never scan arbitrary feed text.
+              for (const root of roots.slice(0, 4)) {
+                const heads = Array.from(root.querySelectorAll('h1,h2,h3,[role="heading"]')).filter(visible);
+                for (const h of heads.slice(0, 20)) {
+                  const text = clean(h.innerText || h.textContent || h.getAttribute('aria-label'));
+                  if (!text || text.length > 140) continue;
+                  const m = text.match(/^(.{2,100}?)\s*(?:的貼文|的帖子|\'s post)$/i);
+                  if (m && m[1]) out.push({text: clean(m[1]), href:'', score:4800, top:h.getBoundingClientRect().top});
+                }
+              }
+              out.sort((a,b) => b.score - a.score || a.top - b.top);
+              return out.slice(0, 30);
+            }
+            """,
+            pcb,
+        ) or []
+    except Exception:
+        rows = []
+
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        text = _clean_fb_account_name(item.get("text") or "")
+        if text and not _fb_v132_bad_account_label(text) and _looks_like_fb_page_name_v1223(text):
+            logger.info(f"FB v13.2 group-container account selected: {text}")
+            return text
+    return ""
+
+
+def _get_fb_exact_pcb_account_v1250(page, dominant_pcb_key: str = "") -> str:
+    """Resolve the account/group from the exact active pcb post only.
+
+    v12.51:
+    - Group posts must publish the group/page identity, not the individual author.
+    - Prefer the shallow /groups/<id-or-slug>/ anchor in the exact active post header.
+    - Deeper /groups/<id>/user/... or /groups/<id>/posts/... links are treated as
+      author/post links and cannot override the group root.
+    """
+    pcb = str(dominant_pcb_key or "")
+    if pcb.startswith("pcb:"):
+        pcb = pcb.split(":", 1)[1]
+    pcb = re.sub(r"\D", "", pcb)
+
+    try:
+        rows = page.evaluate(
+            r"""
+            (pcb) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0;
+              };
+              const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+              const bad = (t) => {
+                const low = clean(t).toLowerCase();
+                if (!low || low.length < 2 || low.length > 90) return true;
+                return [
+                  'facebook','查看貼文','查看更多','留言','分享','讚','追蹤','已追蹤',
+                  '最相關','所有留言','寫留言','建立貼文','通知','messenger'
+                ].some(x => low === x || low.startsWith(x + ' '));
+              };
+              const groupDepth = (href) => {
+                try {
+                  const u = new URL(href, location.href);
+                  const seg = u.pathname.split('/').filter(Boolean);
+                  const i = seg.indexOf('groups');
+                  if (i < 0) return 99;
+                  return Math.max(0, seg.length - (i + 2));
+                } catch (_) {
+                  return 99;
+                }
+              };
+
+              const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')).filter(visible);
+              const roots = dialogs.length ? dialogs : [document.querySelector('[role="main"]') || document.body];
+              const scored = [];
+
+              for (const root0 of roots) {
+                let roots2 = [root0];
+                if (pcb) {
+                  const exact = Array.from(root0.querySelectorAll('a[href]')).filter(a => {
+                    const h = String(a.href || a.getAttribute('href') || '');
+                    return h.includes('set=pcb.' + pcb) || h.includes('set=pcb%2E' + pcb);
+                  });
+                  for (const a of exact) {
+                    const art = a.closest('[role="article"], article');
+                    if (art && !roots2.includes(art)) roots2.unshift(art);
+                  }
+                }
+
+                for (const root of roots2) {
+                  const rr = root.getBoundingClientRect();
+                  const links = Array.from(root.querySelectorAll('a[href]')).filter(visible);
+                  let idx = 0;
+                  for (const a of links.slice(0, 260)) {
+                    idx += 1;
+                    const text = clean(a.innerText || a.textContent || a.getAttribute('aria-label'));
+                    if (bad(text)) continue;
+                    const href = String(a.href || a.getAttribute('href') || '');
+                    const lowHref = href.toLowerCase();
+                    if (!lowHref.includes('facebook.com') && !lowHref.startsWith('/')) continue;
+                    if (lowHref.includes('/photo') || lowHref.includes('/reel') || lowHref.includes('/watch') || lowHref.includes('/hashtag/')) continue;
+
+                    const r = a.getBoundingClientRect();
+                    const gd = groupDepth(href);
+                    let score = Math.max(0, 260 - idx);
+
+                    if (lowHref.includes('/groups/')) {
+                      score += 1500;
+                      if (gd === 0) score += 4200;       // exact group root: strongest identity
+                      else if (gd === 1) score += 300;  // tolerate one harmless segment
+                      else score -= 1800;               // author/post/member links inside group
+                    }
+                    if (lowHref.includes('/profile.php')) score -= 500;
+                    if (/facebook\.com\/[A-Za-z0-9._-]+\/?(?:\?|$)/.test(lowHref)) score += 240;
+                    if (r.top <= rr.top + Math.min(360, Math.max(180, rr.height * 0.35))) score += 650;
+                    if (pcb && (href.includes('pcb.' + pcb) || href.includes('pcb%2E' + pcb))) score += 350;
+
+                    scored.push({text, href, score, top:r.top, groupDepth:gd});
+                  }
+                }
+              }
+              scored.sort((a,b) => b.score - a.score || a.top - b.top);
+              return scored.slice(0, 60);
+            }
+            """,
+            pcb,
+        ) or []
+    except Exception:
+        rows = []
+
+    # v12.51: first pass only accepts the shallow group-root identity.
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        href = str(item.get("href") or "")
+        text = _clean_fb_account_name(item.get("text") or "")
+        try:
+            gd = int(item.get("groupDepth", 99))
+        except Exception:
+            gd = 99
+        if (
+            "/groups/" in href.lower()
+            and gd == 0
+            and text
+            and not _fb_v132_bad_account_label(text)
+            and _looks_like_fb_page_name_v1223(text)
+        ):
+            logger.info(f"FB v12.51 exact-pcb group root account selected: {text}")
+            return text
+
+    # Second pass: accept only high-scored group links that are not deep member/post links.
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        href = str(item.get("href") or "")
+        text = _clean_fb_account_name(item.get("text") or "")
+        try:
+            gd = int(item.get("groupDepth", 99))
+            score = int(item.get("score", 0))
+        except Exception:
+            gd, score = 99, 0
+        if (
+            "/groups/" in href.lower()
+            and gd <= 1
+            and score >= 1800
+            and text
+            and not _fb_v132_bad_account_label(text)
+            and _looks_like_fb_page_name_v1223(text)
+        ):
+            logger.info(f"FB v12.51 exact-pcb group account selected: {text}")
+            return text
+
+    # Non-group page posts keep the previous conservative fallback.
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        href = str(item.get("href") or "")
+        if "/groups/" in href.lower():
+            continue
+        text = _clean_fb_account_name(item.get("text") or "")
+        if text and not _fb_v132_bad_account_label(text) and _looks_like_fb_page_name_v1223(text):
+            logger.info(f"FB v13.2 exact-pcb account selected: {text}")
+            return text
+    return ""
+
+
 def _get_fb_page_account(page, fallback_title: str = "") -> str:
     """Best-effort FB page/account extraction for GUI metadata.
 
     This is deliberately conservative: it only returns short page-like names and
     never returns a long caption.  The download identity gates remain unchanged.
     """
+    # v12.41: For FB viewer/share dialogs, the visible header "<account> 的貼文"
+    # is more reliable than background feed/article links.
+    dialog_account = _get_fb_dialog_header_account_v1241(page)
+    if dialog_account:
+        return dialog_account
+
     title_part, account_from_title = _split_fb_title_account(fallback_title)
     if account_from_title:
         return account_from_title
@@ -1934,7 +2365,7 @@ def _publish_fb_task_account(task_url: str, account: str) -> str:
     return clean
 
 
-def _publish_fb_task_metadata(task_url: str, title: str, account: str = "", page=None) -> tuple[str, str]:
+def _publish_fb_task_metadata(task_url: str, title: str, account: str = "", page=None, account_locked: bool = False) -> tuple[str, str]:
     """Publish both Post Title and Post Account to the queue/UI.
 
     v12.21:
@@ -1946,8 +2377,17 @@ def _publish_fb_task_metadata(task_url: str, title: str, account: str = "", page
     final_title = split_title or _clean_fb_post_title_for_path(title, fallback="")
     final_account = _clean_fb_account_name(account or split_account)
 
-    if not final_account and page is not None:
-        final_account = _get_fb_page_account(page, fallback_title=title)
+    if page is not None:
+        primary_account_v1249 = _get_fb_active_post_primary_account_v1249(page)
+        dialog_account = _get_fb_dialog_header_account_v1241(page)
+        if account_locked and final_account:
+            logger.info(f"FB v12.50 metadata account lock preserved: {final_account}")
+        elif primary_account_v1249:
+            final_account = primary_account_v1249
+        elif dialog_account:
+            final_account = dialog_account
+        elif not final_account:
+            final_account = _get_fb_page_account(page, fallback_title=title)
 
     title_ok = False
     account_ok = False
@@ -2506,18 +2946,6 @@ def _media_cluster_key_from_src(src: str) -> str:
     return ""
 
 
-def _pack_media_cluster_key(pack: dict) -> str:
-    if not pack:
-        return ""
-    src = pack.get("src") or ""
-    key = _media_cluster_key_from_src(src)
-    if key:
-        return key
-    for cand in pack.get("candidates") or []:
-        key = _media_cluster_key_from_src(cand.get("src") or "")
-        if key:
-            return key
-    return ""
 
 
 
@@ -2585,100 +3013,10 @@ def _fb_media_id_from_src(src: str) -> str:
 
 
 
-def _manifest_ids_from_packs(packs: list[dict]) -> list[str]:
-    """
-    Build a whitelist / order manifest from post-scoped link_items.
-    This is safer than a single cluster gate: if FB shards one image to a different
-    CDN numeric family, the post manifest can still let it pass.
-    """
-    out = []
-    seen = set()
-    for pack in _fb_v1232_pack_dicts(packs):
-        raw_candidates = []
-        for c in (pack.get("candidates") or []):
-            if isinstance(c, dict):
-                raw_candidates.append(c.get("src") or "")
-            elif isinstance(c, str):
-                raw_candidates.append(c)
-        candidates = [pack.get("src", "")] + raw_candidates
-        for src in candidates:
-            mid = _fb_media_numeric_id_str_from_src(src)
-            if mid and mid not in seen:
-                seen.add(mid)
-                out.append(mid)
-                break
-    return out
 
 
-def _pack_has_manifest_id(pack: dict, manifest_ids: set[str]) -> bool:
-    if not pack or not manifest_ids:
-        return False
-    srcs = [pack.get("src", "")] + [(c.get("src") or "") for c in (pack.get("candidates") or [])]
-    for src in srcs:
-        mid = _fb_media_numeric_id_str_from_src(src)
-        if mid and mid in manifest_ids:
-            return True
-    return False
 
 
-def _filter_items_by_media_cluster_or_manifest(
-    packs: list[dict],
-    cluster_key: str,
-    manifest_ids: list[str] | None = None,
-) -> list[dict]:
-    """
-    v11.17 Manifest Whitelist:
-    Keep an item if it matches the dominant cluster OR an explicit post manifest id.
-    This prevents over-clean filtering from dropping a legitimate image if Facebook
-    serves it from a sharded CDN id, while still rejecting recommendations/videos.
-    """
-    if not packs:
-        return []
-
-    manifest_set = set(manifest_ids or [])
-    out = []
-    seen_primary = set()
-
-    for pack in _fb_v1232_pack_dicts(packs):
-        src = pack.get("src") or ""
-        if pack.get("type") == "video" or _is_probably_video_url(src):
-            continue
-
-        key = _media_cluster_key_from_src(src)
-        in_cluster = bool(cluster_key and key == cluster_key)
-        in_manifest = _pack_has_manifest_id(pack, manifest_set)
-
-        if cluster_key or manifest_set:
-            if not (in_cluster or in_manifest):
-                continue
-
-        clean_candidates = []
-        for cand in pack.get("candidates") or []:
-            csrc = cand.get("src") or ""
-            if _is_probably_video_url(csrc):
-                continue
-            ckey = _media_cluster_key_from_src(csrc)
-            cmid = _fb_media_numeric_id_str_from_src(csrc)
-            if (cluster_key and ckey == cluster_key) or (manifest_set and cmid in manifest_set) or (not cluster_key and not manifest_set):
-                clean_candidates.append(cand)
-
-        if not clean_candidates and src:
-            clean_candidates = [{
-                "type": pack.get("type") or _media_type_from_url(src),
-                "src": src,
-                "score": pack.get("score", 0),
-            }]
-
-        p2 = dict(pack)
-        p2["candidates"] = clean_candidates
-        primary = _media_key_from_src(src)
-        if primary and primary in seen_primary:
-            continue
-        if primary:
-            seen_primary.add(primary)
-        out.append(p2)
-
-    return out
 
 
 def _sort_items_by_manifest_then_media_id(packs: list[dict], manifest_ids: list[str] | None = None) -> list[dict]:
@@ -2896,43 +3234,8 @@ def _fb_v1232_pack_dicts(seq) -> list[dict]:
     return out
 
 
-def _pack_best_media_id_str(pack: dict) -> str:
-    """Return stable CDN media id from a pack or its candidates."""
-    if not isinstance(pack, dict) or not pack:
-        return ""
-
-    candidates = []
-    for c in (pack.get("candidates") or []):
-        if isinstance(c, dict):
-            candidates.append(c.get("src") or "")
-        elif isinstance(c, str):
-            candidates.append(c)
-
-    for src in [pack.get("src", "")] + candidates:
-        mid = _fb_media_numeric_id_str_from_src(src)
-        if mid:
-            return mid
-    return ""
 
 
-def _dedupe_items_by_media_id(packs: list[dict]) -> list[dict]:
-    """
-    v11.19 pre-boundary dedupe:
-    FB often serves the same image with different oh= URLs. If we crop to expected_count
-    before removing these duplicate media IDs, later real photos are pushed out and the
-    final output becomes 12/16. Deduplicate by the stable CDN media id before bounding.
-    """
-    out = []
-    seen = set()
-    for pack in _fb_v1232_pack_dicts(packs):
-        mid = _pack_best_media_id_str(pack)
-        if mid:
-            if mid in seen:
-                logger.info(f"FB v11.19 pre-boundary duplicate media id skipped={mid}")
-                continue
-            seen.add(mid)
-        out.append(pack)
-    return out
 
 def _drop_video_packs_for_photo_post(packs: list[dict]) -> list[dict]:
     """In a photo post target, never let video/ad/reel responses count as missing photos."""
@@ -2945,67 +3248,8 @@ def _drop_video_packs_for_photo_post(packs: list[dict]) -> list[dict]:
         out.append(pack)
     return out
 
-def _dominant_media_cluster(packs: list[dict] | None, *, min_count: int = 3) -> str:
-    counts = {}
-    order = []
-    for pack in _fb_v1232_pack_dicts(packs):
-        key = _pack_media_cluster_key(pack)
-        if not key:
-            continue
-        if key not in counts:
-            counts[key] = 0
-            order.append(key)
-        counts[key] += 1
-    if not counts:
-        return ""
-    best = sorted(order, key=lambda k: (-counts[k], order.index(k)))[0]
-    return best if counts.get(best, 0) >= min_count else ""
 
 
-def _filter_items_by_media_cluster(packs: list[dict], cluster_key: str) -> list[dict]:
-    if not cluster_key:
-        return packs or []
-    out = []
-    seen_primary = set()
-    for pack in _fb_v1232_pack_dicts(packs):
-        src = pack.get("src") or ""
-        key = _media_cluster_key_from_src(src)
-        if key != cluster_key:
-            continue
-        if pack.get("type") == "video" or _is_probably_video_url(src):
-            continue
-
-        # v11.15: also sanitize candidate list, otherwise stale/off-cluster candidates can
-        # still win in download stage or force duplicate hashes.
-        clean_candidates = []
-        for cand in pack.get("candidates") or []:
-            if isinstance(cand, dict):
-                csrc = cand.get("src") or ""
-                cand_pack = cand
-            elif isinstance(cand, str):
-                csrc = cand
-                cand_pack = {"src": cand, "type": _media_type_from_url(cand)}
-            else:
-                continue
-            if _media_cluster_key_from_src(csrc) == cluster_key and not _is_probably_video_url(csrc):
-                clean_candidates.append(cand_pack)
-
-        if not clean_candidates and src:
-            clean_candidates = [{
-                "type": pack.get("type") or _media_type_from_url(src),
-                "src": src,
-                "score": pack.get("score", 0),
-            }]
-
-        p2 = dict(pack)
-        p2["candidates"] = clean_candidates
-        primary = _media_key_from_src(src)
-        if primary and primary in seen_primary:
-            continue
-        if primary:
-            seen_primary.add(primary)
-        out.append(p2)
-    return out
 
 def _estimate_expected_photo_count(page, ordered_links: list[str] | None, ordered_grid_items: list[dict] | None, plus_count: int = 0) -> int:
     """
@@ -3137,6 +3381,370 @@ def _is_single_viewer_open(page) -> bool:
         return best_area > area * 0.20
     except Exception:
         return False
+
+
+
+def _fb_v1249_collect_hidden_pcb_photo_links(page, dominant_pcb_key: str) -> list[str]:
+    """Recover hidden +N photo permalinks from the exact set=pcb post payload.
+
+    Only URLs that explicitly carry the already-proven pcb id are accepted, so
+    this cannot widen into recommendations or another album/post.
+    """
+    pcb = str(dominant_pcb_key or '')
+    if pcb.startswith('pcb:'):
+        pcb = pcb.split(':', 1)[1]
+    pcb = re.sub(r'\D', '', pcb)
+    if not pcb:
+        return []
+    try:
+        text = page.content() or ''
+    except Exception:
+        return []
+
+    variants = [text, html.unescape(text)]
+    out = []
+    seen = set()
+    for raw in variants:
+        dec = str(raw or '')
+        dec = dec.replace('\\/', '/').replace('\\u002F', '/').replace('\\u002f', '/')
+        dec = dec.replace('\\u0026', '&').replace('\\u003D', '=').replace('\\u003d', '=')
+        dec = dec.replace('\\u002E', '.').replace('\\u002e', '.')
+
+        # Explicit photo URLs carrying the exact pcb id.
+        pats = [
+            rf'(?:https?:)?//(?:www\.)?facebook\.com/photo/\?[^\"\'<>\s]{{0,500}}?fbid=(\d{{8,}})[^\"\'<>\s]{{0,500}}?set=pcb\.{pcb}',
+            rf'(?:https?:)?//(?:www\.)?facebook\.com/photo/\?[^\"\'<>\s]{{0,500}}?set=pcb\.{pcb}[^\"\'<>\s]{{0,500}}?fbid=(\d{{8,}})',
+            rf'/photo/\?[^\"\'<>\s]{{0,500}}?fbid=(\d{{8,}})[^\"\'<>\s]{{0,500}}?set=pcb\.{pcb}',
+            rf'/photo/\?[^\"\'<>\s]{{0,500}}?set=pcb\.{pcb}[^\"\'<>\s]{{0,500}}?fbid=(\d{{8,}})',
+        ]
+        for pat in pats:
+            for m in re.finditer(pat, dec, flags=re.I):
+                fbid = m.group(1)
+                if fbid in seen:
+                    continue
+                seen.add(fbid)
+                out.append(f'https://www.facebook.com/photo/?fbid={fbid}&set=pcb.{pcb}')
+
+        # Encoded query fields in serialized JSON.  Keep the relation tight.
+        for m in re.finditer(rf'fbid(?:=|%3D|\\u003D)(\d{{8,}}).{{0,650}}?set(?:=|%3D|\\u003D)pcb(?:\.|%2E|\\u002E){pcb}', dec, flags=re.I|re.S):
+            fbid = m.group(1)
+            if fbid not in seen:
+                seen.add(fbid)
+                out.append(f'https://www.facebook.com/photo/?fbid={fbid}&set=pcb.{pcb}')
+        for m in re.finditer(rf'set(?:=|%3D|\\u003D)pcb(?:\.|%2E|\\u002E){pcb}.{{0,650}}?fbid(?:=|%3D|\\u003D)(\d{{8,}})', dec, flags=re.I|re.S):
+            fbid = m.group(1)
+            if fbid not in seen:
+                seen.add(fbid)
+                out.append(f'https://www.facebook.com/photo/?fbid={fbid}&set=pcb.{pcb}')
+
+    logger.info(f'FB v12.49 hidden exact-pcb photo links={len(out)} pcb=pcb:{pcb}')
+    return out
+
+
+
+
+def _fb_v131_collect_exact_pcb_links_from_payloads(payload_texts, dominant_pcb_key: str) -> list[str]:
+    """Recover same-post photo permalinks from captured GraphQL/JSON payloads.
+
+    Only IDs explicitly tied to the already-proven set=pcb id are accepted.
+    This closes the common 7/8 gap without scanning neighboring/recommended
+    posts and without relaxing the final completeness guard.
+    """
+    pcb = str(dominant_pcb_key or "")
+    if pcb.startswith("pcb:"):
+        pcb = pcb.split(":", 1)[1]
+    pcb = re.sub(r"\D", "", pcb)
+    if not pcb:
+        return []
+    try:
+        ids = _contract_extract_exact_pcb_photo_ids(payload_texts or [], pcb)
+    except Exception as e:
+        logger.debug(f"FB v13.2 exact-pcb payload parser skipped: {e}")
+        return []
+    out = [f"https://www.facebook.com/photo/?fbid={fbid}&set=pcb.{pcb}" for fbid in ids]
+    if out:
+        logger.info(f"FB v13.2 exact-pcb structured payload links={len(out)} pcb=pcb:{pcb}")
+    return out
+
+
+def _fb_v1250_discover_exact_pcb_links_from_viewer(
+    context,
+    start_links: list[str],
+    dominant_pcb_key: str,
+    expected_count: int | None = None,
+) -> list[str]:
+    """Deterministically enumerate exact-pcb photo identities from Facebook viewer.
+
+    v13.4 replaces the old short 6-12 turn probe with an identity walker:
+    - same proven set=pcb.<id> only
+    - records live anchors, current URL, serialized HTML and navigation hrefs
+    - keeps walking through temporary stale turns instead of stopping after 3
+    - scales to large galleries (e.g. 81 photos) with a bounded target+margin budget
+    - never widens into recommendations or changes the expected count
+    """
+    pcb = str(dominant_pcb_key or "")
+    if pcb.startswith("pcb:"):
+        pcb = pcb.split(":", 1)[1]
+    pcb = re.sub(r"\D", "", pcb)
+    if not pcb:
+        return []
+
+    try:
+        target = max(1, int(expected_count or 0))
+    except Exception:
+        target = 1
+
+    seeds: list[str] = []
+    for u in start_links or []:
+        su = html.unescape(str(u or "")).replace("\\/", "/")
+        if not _is_true_photo_link(su):
+            continue
+        if f"set=pcb.{pcb}" not in su and f"set=pcb%2E{pcb}" not in su:
+            continue
+        if su not in seeds:
+            seeds.append(su)
+    if not seeds:
+        return []
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add_urls(urls) -> int:
+        before = len(found)
+        for u in urls or []:
+            su = html.unescape(str(u or "")).replace("\\/", "/")
+            su = su.replace("\\u0026", "&").replace("\\u003D", "=").replace("\\u003d", "=")
+            su = su.replace("\\u002E", ".").replace("\\u002e", ".")
+            if not _is_true_photo_link(su):
+                continue
+            if f"set=pcb.{pcb}" not in su and f"set=pcb%2E{pcb}" not in su:
+                continue
+            m = re.search(r"[?&]fbid=(\d{8,})", su, flags=re.I)
+            if not m:
+                continue
+            fbid = m.group(1)
+            if fbid in seen:
+                continue
+            seen.add(fbid)
+            found.append(f"https://www.facebook.com/photo/?fbid={fbid}&set=pcb.{pcb}")
+        return len(found) - before
+
+    def add_from_serialized_text(raw: str) -> int:
+        if not raw:
+            return 0
+        dec = html.unescape(str(raw)).replace("\\/", "/")
+        dec = dec.replace("\\u002F", "/").replace("\\u002f", "/")
+        dec = dec.replace("\\u0026", "&").replace("\\u003D", "=").replace("\\u003d", "=")
+        dec = dec.replace("\\u002E", ".").replace("\\u002e", ".")
+        urls = []
+        patterns = [
+            rf'(?:https?:)?//(?:www\.)?facebook\.com/photo/\?[^"\'<>\s]{{0,900}}?fbid=(\d{{8,}})[^"\'<>\s]{{0,900}}?set=pcb\.{pcb}',
+            rf'(?:https?:)?//(?:www\.)?facebook\.com/photo/\?[^"\'<>\s]{{0,900}}?set=pcb\.{pcb}[^"\'<>\s]{{0,900}}?fbid=(\d{{8,}})',
+            rf'fbid(?:=|%3D|\\u003D)(\d{{8,}}).{{0,1200}}?set(?:=|%3D|\\u003D)pcb(?:\.|%2E|\\u002E){pcb}',
+            rf'set(?:=|%3D|\\u003D)pcb(?:\.|%2E|\\u002E){pcb}.{{0,1200}}?fbid(?:=|%3D|\\u003D)(\d{{8,}})',
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, dec, flags=re.I | re.S):
+                urls.append(f"https://www.facebook.com/photo/?fbid={m.group(1)}&set=pcb.{pcb}")
+        return add_urls(urls)
+
+    add_urls(seeds)
+
+    # For small galleries, one seed is usually enough. For large/virtualized
+    # galleries use up to three distinct entry points so Facebook cannot trap us
+    # in one preloaded segment.
+    seed_budget = min(3, len(seeds))
+    per_seed_turns = min(120, max(14, target + 14))
+    stale_limit = 12 if target <= 20 else 24
+
+    for seed_idx, seed in enumerate(seeds[:seed_budget], 1):
+        if target and len(found) >= target:
+            break
+        p = None
+        try:
+            p = context.new_page()
+            p.goto(seed, wait_until="domcontentloaded", timeout=45000)
+            p.wait_for_timeout(900)
+            try:
+                _open_viewer_from_photo_page(p)
+            except Exception:
+                pass
+            _focus_viewer(p)
+
+            stale = 0
+            last_url = ""
+            for turn in range(per_seed_turns):
+                before = len(found)
+
+                # 1) live exact-pcb anchors, including virtualized neighbors
+                try:
+                    hrefs = p.evaluate(
+                        r"""
+                        (pcb) => Array.from(document.querySelectorAll('a[href]'))
+                          .map(a => a.href || a.getAttribute('href') || '')
+                          .filter(h => h && (
+                              h.includes('set=pcb.' + pcb) ||
+                              h.includes('set=pcb%2E' + pcb)
+                          ))
+                        """,
+                        pcb,
+                    ) or []
+                    add_urls(hrefs)
+                except Exception:
+                    pass
+
+                # 2) current URL may become the new exact photo permalink even
+                # when Facebook does not materialize it as an anchor.
+                try:
+                    now_url = str(p.url or "")
+                    if now_url != last_url:
+                        add_urls([now_url])
+                        last_url = now_url
+                except Exception:
+                    pass
+
+                # 3) serialized Relay/Comet state often contains previous/next
+                # exact photo ids that are not live DOM anchors yet.
+                try:
+                    add_from_serialized_text(p.content() or "")
+                except Exception:
+                    pass
+
+                if target and len(found) >= target:
+                    logger.info(
+                        f"FB v13.6 exact-pcb identity walker complete: "
+                        f"found={len(found)}/{target}, seed={seed_idx}, turn={turn}"
+                    )
+                    break
+
+                if len(found) == before:
+                    stale += 1
+                else:
+                    stale = 0
+
+                # Never stop on the old 3-stale rule. Facebook can spend several
+                # turns reusing the same physical image while its identity state
+                # advances asynchronously.
+                if stale >= stale_limit:
+                    logger.info(
+                        f"FB v13.6 exact-pcb identity walker stale stop: "
+                        f"found={len(found)}/{target}, seed={seed_idx}, stale={stale}"
+                    )
+                    break
+
+                # Strong deterministic navigation: DOM next first, then keyboard,
+                # then physical fallback only if the URL/identity did not advance.
+                try:
+                    advanced = _click_dom_next_strong(p)
+                except Exception:
+                    advanced = False
+                if not advanced:
+                    try:
+                        _focus_viewer(p)
+                        p.keyboard.press("ArrowRight")
+                    except Exception:
+                        pass
+                p.wait_for_timeout(360)
+                if len(found) == before:
+                    try:
+                        _force_viewer_next(p, turn % 5)
+                    except Exception:
+                        pass
+                    p.wait_for_timeout(420)
+
+        except Exception as e:
+            logger.debug(
+                f"FB v13.6 exact-pcb identity walker seed={seed_idx} skipped: {e}"
+            )
+        finally:
+            try:
+                if p:
+                    p.close()
+            except Exception:
+                pass
+
+    logger.info(
+        f"FB v13.6 exact-pcb identity walker result: "
+        f"found={len(found)}, target={target or '-'}, pcb=pcb:{pcb}"
+    )
+    return found
+
+def _fb_v1251_near_complete_tail_recovery(
+    context,
+    exact_links: list[str],
+    current_items: list[dict],
+    expected_count: int,
+    dominant_pcb_key: str,
+) -> list[dict]:
+    """One bounded high-effort pass for exact-pcb galleries missing exactly one item.
+
+    This runs only for the narrow N-1 case.  It starts from the last exact-pcb
+    permalink, keeps the normal duplicate/content guards, and gives the viewer
+    more stale budget than the normal fast path.  It does not change the expected
+    count and never turns an incomplete gallery into SUCCESS.
+    """
+    try:
+        expected = int(expected_count or 0)
+    except Exception:
+        expected = 0
+    if expected <= 1:
+        return list(current_items or [])
+
+    current = _dedupe_items_by_media_id(list(current_items or []))
+    if len(current) != expected - 1:
+        return current
+
+    pcb = str(dominant_pcb_key or "")
+    if pcb.startswith("pcb:"):
+        pcb = pcb.split(":", 1)[1]
+    pcb = re.sub(r"\\D", "", pcb)
+    if not pcb:
+        return current
+
+    seeds = []
+    for u in exact_links or []:
+        su = str(u or "")
+        if not _is_true_photo_link(su):
+            continue
+        if f"set=pcb.{pcb}" not in su and f"set=pcb%2E{pcb}" not in su:
+            continue
+        if su not in seeds:
+            seeds.append(su)
+    if not seeds:
+        return current
+
+    # Start from the tail first; FB's virtualized next control often exposes the
+    # missing final slide from this position while the first seed loops early.
+    chosen = [seeds[-1]]
+    if len(seeds) > 1:
+        chosen.append(seeds[0])
+
+    merged = list(current)
+    logger.info(
+        f"FB v13.2 bounded near-complete recovery start: current={len(current)}/{expected}, "
+        f"seeds={len(chosen)}, pcb=pcb:{pcb}"
+    )
+    for idx, seed in enumerate(chosen[:1], 1):
+        seq = _collect_viewer_sequence_from_url(
+            context,
+            seed,
+            label=f"v12.51-tail{idx}",
+            is_photo_page=True,
+            target_count=expected,
+            stale_threshold=6,
+            max_turns=max(16, min(28, expected + 12)),
+            allowed_cluster=None,
+            fast_mode=False,
+        )
+        merged = _dedupe_items_by_media_id(_aggregate_unique_items(merged, seq))
+        logger.info(
+            f"FB v13.2 bounded near-complete recovery progress: seed={idx}, "
+            f"unique={len(merged)}/{expected}"
+        )
+        if len(merged) >= expected:
+            break
+
+    return merged
 
 
 def _collect_fb_photo_links(page):
@@ -3911,17 +4519,6 @@ def _open_viewer_from_photo_page(page) -> bool:
     return False
 
 
-def _aggregate_unique_items(*seqs: list[dict]) -> list[dict]:
-    out = []
-    seen = set()
-    for seq in seqs:
-        for pack in _fb_v1232_pack_dicts(seq):
-            key = _media_key_from_src(pack.get("src", ""))
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            out.append(pack)
-    return out
 
 
 
@@ -4237,7 +4834,7 @@ def _force_viewer_next(page, attempt: int) -> None:
     except Exception:
         pass
 
-def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None) -> list[dict]:
+def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None, fast_mode: bool = False) -> list[dict]:
     """
     v11：Viewer 物理翻頁 + response 快速收割模式。
 
@@ -4493,16 +5090,48 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
         stale = 0
         return True
 
+    max_turns = int(max_turns or _MAX_FB_ITEMS)
+    hard_stale_stop = (max(3, int(stale_threshold) + 1) if fast_mode else max(5, int(stale_threshold) + 2))
+
+    # v12.38/v12.42:
+    # Configure timing before the first probe.  Previous code assigned
+    # first_probe_rounds after using it, so viewer warmup failed with:
+    # "cannot access local variable 'first_probe_rounds'".
+    large_gallery_fast_mode = bool(target_count and int(target_count or 0) >= 30)
+    bounded_fast_mode = bool(fast_mode and not large_gallery_fast_mode)
+    first_probe_rounds = 3 if large_gallery_fast_mode else (4 if bounded_fast_mode else 8)
+    first_probe_wait_ms = 260 if large_gallery_fast_mode else (320 if bounded_fast_mode else 520)
+
     _focus_viewer(page)
 
     # 第一張：warmup 後先快速收割一次，不再等 key 變化。
-    for _ in range(8):
-        page.wait_for_timeout(520)
+    for _ in range(first_probe_rounds):
+        page.wait_for_timeout(first_probe_wait_ms)
         if harvest_once("initial"):
             break
 
-    max_turns = int(max_turns or _MAX_FB_ITEMS)
-    hard_stale_stop = max(5, int(stale_threshold) + 2)
+    # v12.38:
+    # Large share/p galleries such as "+76" can legitimately mean ~80 photos.
+    # The old viewer loop used conservative waits for every slide; this is safe
+    # but makes 50+ photo albums look stuck for 40+ minutes.  For large proven
+    # gallery targets, keep the same identity/completeness gates but reduce
+    # per-slide wait/attempt budgets.  Small posts keep the legacy timing.
+    max_attempts_per_turn = 3 if large_gallery_fast_mode else (3 if bounded_fast_mode else 6)
+    waits_per_attempt = 3 if large_gallery_fast_mode else (3 if bounded_fast_mode else 8)
+    jitter_base_ms = 180 if large_gallery_fast_mode else (180 if bounded_fast_mode else 420)
+    jitter_var_ms = 120 if large_gallery_fast_mode else (120 if bounded_fast_mode else 280)
+    change_timeout_ms = 650 if large_gallery_fast_mode else (700 if bounded_fast_mode else 1200)
+    changed_waits = 2 if large_gallery_fast_mode else (2 if bounded_fast_mode else 5)
+    changed_wait_ms = 220 if large_gallery_fast_mode else (220 if bounded_fast_mode else 350)
+    stale_primary_waits = 3 if large_gallery_fast_mode else (3 if bounded_fast_mode else 6)
+    stale_secondary_waits = 3 if large_gallery_fast_mode else (3 if bounded_fast_mode else 7)
+    stale_wait_ms = 220 if large_gallery_fast_mode else (220 if bounded_fast_mode else 360)
+
+    if large_gallery_fast_mode:
+        logger.info(
+            f"FB v12.38 large-gallery fast mode enabled: target={target_count}, "
+            f"max_turns={max_turns}, attempts={max_attempts_per_turn}, waits={waits_per_attempt}"
+        )
 
     for turn in range(max_turns):
         if target_count and len(collected) >= target_count:
@@ -4514,12 +5143,12 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
         # 翻頁前先聚焦；先用 ArrowRight，再配合熱區/按鈕。不要把 wait_viewer_change 當唯一成功條件。
         _focus_viewer(page)
         moved = False
-        for attempt in range(6):
+        for attempt in range(max_attempts_per_turn):
             _force_viewer_next(page, attempt)
 
             # 快速收割：只要 bucket 或 DOM 產生新圖就收，不要求 URL/key 一定變化後才收。
-            for wait_i in range(8):
-                _fb_jitter_wait(page, 420, 280)
+            for wait_i in range(waits_per_attempt):
+                _fb_jitter_wait(page, jitter_base_ms, jitter_var_ms)
                 if harvest_once(f"turn={turn},attempt={attempt},wait={wait_i}"):
                     moved = True
                     break
@@ -4527,9 +5156,9 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
                 break
 
             # 沒收割到才檢查視覺 key 是否變化；若有變化，再補抓目前可見圖。
-            if _wait_viewer_change(page, before_key, timeout_ms=1200):
-                for wait_i in range(5):
-                    page.wait_for_timeout(350)
+            if _wait_viewer_change(page, before_key, timeout_ms=change_timeout_ms):
+                for wait_i in range(changed_waits):
+                    page.wait_for_timeout(changed_wait_ms)
                     if harvest_once(f"changed turn={turn},attempt={attempt},wait={wait_i}"):
                         moved = True
                         break
@@ -4544,15 +5173,15 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
             # 先點 viewer 主圖右緣，再 ArrowRight；避免鍵盤焦點被留言區吃掉。
             try:
                 _physical_drive_next(page, reason=f"stale{stale}-turn{turn}-primary")
-                for wait_i in range(6):
-                    page.wait_for_timeout(360)
+                for wait_i in range(stale_primary_waits):
+                    page.wait_for_timeout(stale_wait_ms)
                     if harvest_once(f"stale-physical turn={turn},wait={wait_i}"):
                         break
 
                 if len(collected) == before_count and stale >= 2:
                     _physical_drive_next(page, reason=f"stale{stale}-turn{turn}-secondary")
-                    for wait_i in range(7):
-                        page.wait_for_timeout(360)
+                    for wait_i in range(stale_secondary_waits):
+                        page.wait_for_timeout(stale_wait_ms)
                         if harvest_once(f"stale-physical2 turn={turn},wait={wait_i}"):
                             break
             except Exception:
@@ -4594,7 +5223,7 @@ def _collect_viewer_sequence_intercept(page, *, label: str = "viewer", target_co
     logger.info(f"FB viewer-intercept {label}: collected={len(collected)}")
     return collected
 
-def _collect_viewer_sequence_from_url(context, start_url: str, *, label: str, is_photo_page: bool = False, target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None) -> list[dict]:
+def _collect_viewer_sequence_from_url(context, start_url: str, *, label: str, is_photo_page: bool = False, target_count: int | None = None, stale_threshold: int = 3, max_turns: int | None = None, allowed_cluster: str | None = None, fast_mode: bool = False) -> list[dict]:
     p = None
     try:
         p = context.new_page()
@@ -4618,6 +5247,7 @@ def _collect_viewer_sequence_from_url(context, start_url: str, *, label: str, is
             stale_threshold=stale_threshold,
             max_turns=max_turns,
             allowed_cluster=allowed_cluster,
+            fast_mode=fast_mode,
         )
         logger.info(f"FB viewer start {label}: collected={len(seq)}")
         return seq
@@ -4709,133 +5339,8 @@ def _file_md5(path: str) -> str:
     return h.hexdigest()
 
 
-def _pack_primary_candidates(pack: dict) -> list[dict]:
-    """
-    v11.14 Candidate Pinning:
-    A viewer pack already has a decided primary media in pack["src"].  Older builds kept
-    stale high-score network candidates in the same pack; _download_best_candidate then
-    sorted by score and could download the previous image again.  This helper pins each
-    pack to candidates that match the primary src media key.  If none match, it keeps only
-    the first candidate as a safe fallback.
-    """
-    candidates = pack.get("candidates") or []
-    primary_src = (pack.get("src") or "").strip()
-    primary_key = _media_key_from_src(primary_src)
-
-    if not candidates:
-        if primary_src:
-            return [{
-                "type": pack.get("type") or _media_type_from_url(primary_src),
-                "src": primary_src,
-                "score": int(pack.get("score") or 0),
-                "_allow_fb_best_available_source": bool(pack.get("_allow_fb_best_available_source")),
-            }]
-        return []
-
-    if not primary_key:
-        return candidates[:1]
-
-    pinned = []
-    seen = set()
-    for cand in candidates:
-        src = (cand.get("src") or "").strip()
-        if not src:
-            continue
-        key = _media_key_from_src(src)
-        if key != primary_key:
-            continue
-        if cand.get("type") == "video" or any(x in src.lower() for x in [".mp4", ".m4v", ".mov"]):
-            dedupe_key = src.split("?")[0]
-        else:
-            dedupe_key = _normalized_exact_fb_media_url(src)
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-        pinned.append(cand)
-
-    if pinned:
-        # Keep the primary candidate order.  Do not bring unrelated stale candidates back.
-        return pinned[:4]
-
-    # Fallback: if the packed candidates were polluted, synthesize one candidate from pack src.
-    if primary_src:
-        return [{
-            "type": pack.get("type") or _media_type_from_url(primary_src),
-            "src": primary_src,
-            "score": int(pack.get("score") or 0),
-            "_allow_fb_best_available_source": bool(pack.get("_allow_fb_best_available_source")),
-        }]
-
-    return candidates[:1]
 
 
-def _download_viewer_items(context, viewer_items, referer: str):
-    """
-    v11.14 stable:
-    - final file numbers are based on accepted unique images, not candidate index.
-    - each collected pack is pinned to its own primary media key before download.
-    - this prevents stale high-score network responses from making many packs download
-      the same fb_0008/fb_0011 image again.
-    """
-    success_count = 0
-    ordered_output_files = []
-    seen_hashes = set()
-    seen_media_keys = set()
-
-    for attempt_i, pack in enumerate(viewer_items, 1):
-        primary_key = _media_key_from_src(pack.get("src", ""))
-
-        if primary_key and primary_key in seen_media_keys:
-            logger.warning(
-                f"FB 候選第 {attempt_i} 張 primary media key 已重複，略過: {primary_key}"
-            )
-            continue
-
-        candidates = _pack_primary_candidates(pack)
-        dst_base = os.path.join(TEMP_DIR, f"fb_{success_count + 1:04d}")
-
-        try:
-            final_dst, size = _download_best_candidate(
-                context,
-                candidates,
-                dst_base,
-                referer=referer,
-            )
-
-            digest = _file_md5(final_dst)
-            if digest in seen_hashes:
-                logger.warning(
-                    f"FB 候選第 {attempt_i} 張下載後判定重複，刪除暫存: "
-                    f"{os.path.basename(final_dst)} ({size} bytes) primary={primary_key}"
-                )
-                try:
-                    os.remove(final_dst)
-                except Exception:
-                    pass
-                continue
-
-            seen_hashes.add(digest)
-            if primary_key:
-                seen_media_keys.add(primary_key)
-
-            if size < 80 * 1024 and len(viewer_items) >= 8:
-                logger.warning(
-                    f"FB 輸出第 {success_count + 1} 張檔案偏小，可能是縮圖/placeholder: "
-                    f"{os.path.basename(final_dst)} ({size} bytes)"
-                )
-
-            success_count += 1
-            ordered_output_files.append(final_dst)
-            logger.info(
-                f"FB 已下載輸出第 {success_count} 張: {os.path.basename(final_dst)} "
-                f"({size} bytes) primary={primary_key}"
-            )
-
-        except Exception as e:
-            logger.warning(f"FB 候選第 {attempt_i} 張下載失敗: {e}")
-
-    logger.info(f"FB unique output media count={success_count}")
-    return success_count, ordered_output_files
 
 def _media_key_from_src(src: str) -> str:
     if not src:
@@ -4854,25 +5359,6 @@ def _media_key_from_src(src: str) -> str:
     return basename
 
 
-def _merge_unique_candidates(primary: list[dict], fallback: list[dict]) -> list[dict]:
-    merged = []
-    seen = set()
-
-    for item in _fb_v1232_pack_dicts((primary or []) + (fallback or [])):
-        src = (item.get("src") or "").strip()
-
-        if not src:
-            continue
-
-        key = _media_key_from_src(src)
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        merged.append(item)
-
-    return _dedupe_ordered(merged)
 
 
 
@@ -4954,16 +5440,64 @@ def _strict_visible_photo_candidates(page, *, prefer_dialog: bool = True) -> lis
 
 
 def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict]:
-    """
-    每個 photo link 用新分頁開，避免同一 page 的 DOM/network cache 把上一張圖混進來。
+    """Open one exact photo permalink and collect only that foreground photo.
+
+    v13.2 adds an exact-photo response fallback for the 7/8 class of failures:
+    Facebook can expose a proven set=pcb photo permalink but render no usable
+    <img> candidate for that slide.  We capture image responses only while the
+    exact photo page is loading and use them *only* when DOM extraction is empty.
+    The requested fbid must still be present in the loaded page URL or serialized
+    page HTML, so this fallback cannot silently widen into recommendations.
     """
     p = None
+    response_candidates = []
+    target_fbid = ""
+    try:
+        m = re.search(r"[?&]fbid=(\d{8,})", html.unescape(str(link or "")), flags=re.I)
+        target_fbid = m.group(1) if m else ""
+    except Exception:
+        target_fbid = ""
+
+    def _on_response(resp):
+        try:
+            u = str(resp.url or "")
+            low = u.lower()
+            if not _looks_like_real_fb_media_url(u):
+                return
+            if _is_probably_video_url(u) or _is_bad_fb_media_url(low):
+                return
+            headers = resp.headers or {}
+            ctype = str(headers.get("content-type") or headers.get("Content-Type") or "").lower()
+            if ctype and "image" not in ctype:
+                return
+            clen = 0
+            try:
+                clen = int(headers.get("content-length") or headers.get("Content-Length") or 0)
+            except Exception:
+                clen = 0
+            # Skip obvious tiny UI assets; the exact target photo is normally much larger.
+            if clen and clen < 12000:
+                return
+            response_candidates.append({
+                "src": u,
+                "type": "image",
+                "score": max(650000, clen * 8),
+                "content_length": clen,
+                "reason": "v13.2-exact-photo-response",
+            })
+        except Exception:
+            return
+
     try:
         p = context.new_page()
-        p.goto(link, wait_until="domcontentloaded", timeout=60000)
-        p.wait_for_timeout(2300)
         try:
-            p.wait_for_load_state("networkidle", timeout=8000)
+            p.on("response", _on_response)
+        except Exception:
+            pass
+        p.goto(link, wait_until="domcontentloaded", timeout=60000)
+        p.wait_for_timeout(1800)
+        try:
+            p.wait_for_load_state("networkidle", timeout=4500)
         except Exception:
             pass
 
@@ -4971,24 +5505,82 @@ def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict
         if not candidates:
             candidates = _strict_visible_photo_candidates(p, prefer_dialog=False)
 
-        # 有些 photo page 仍是貼文頁，點一下最大圖進 viewer 再抓一次。
         if not candidates or candidates[0].get("score", 0) < 500000:
             try:
                 _click_plus_overlay_or_first_photo(p)
-                p.wait_for_timeout(2300)
+                p.wait_for_timeout(1500)
                 candidates2 = _strict_visible_photo_candidates(p, prefer_dialog=True)
                 if candidates2:
                     candidates = candidates2
             except Exception:
                 pass
 
-        return candidates
+        # Exact-photo identity proof.  A non-empty DOM candidate list is not enough:
+        # logged-in photo permalinks can render a neighboring/preloaded slide while
+        # the requested fbid is still the canonical target.  Bind response candidates
+        # back to the exact page serialization before adding them as alternates.
+        exact_page = False
+        body = ""
+        try:
+            now = html.unescape(str(p.url or ""))
+            exact_page = bool(target_fbid and target_fbid in now)
+        except Exception:
+            exact_page = False
+        if target_fbid:
+            try:
+                body = html.unescape(p.content() or "")
+                if not exact_page:
+                    exact_page = target_fbid in body
+            except Exception:
+                body = ""
+
+        tied_response = []
+        if exact_page and response_candidates:
+            body_norm = str(body or "").replace("\\/", "/")
+            for cand in response_candidates:
+                try:
+                    src = html.unescape(str(cand.get("src") or ""))
+                    base = os.path.basename(urlparse(src.split("?", 1)[0]).path)
+                    src_escaped = src.replace("/", "\\/")
+                    if (src and (src in body_norm or src_escaped in body)) or (base and len(base) >= 16 and base in body_norm):
+                        tied_response.append(cand)
+                except Exception:
+                    continue
+
+        if tied_response:
+            merged = _merge_unique_candidates(candidates or [], tied_response)
+            logger.info(
+                f"FB v13.3 exact-photo identity-bound response merge: idx={idx}, fbid={target_fbid}, "
+                f"dom={len(candidates or [])}, tied={len(tied_response)}, merged={len(merged)}"
+            )
+            return merged[:12]
+
+        if candidates:
+            return candidates
+
+        # Last bounded fallback: only when the exact fbid is proven and DOM has no
+        # usable image at all.  Keep the historical response-only behavior, but do
+        # not use it when a visible DOM candidate exists.
+        if exact_page and response_candidates:
+            merged = _merge_unique_candidates(response_candidates, [])
+            merged.sort(key=lambda c: (int(c.get("content_length") or 0), int(c.get("score") or 0)), reverse=True)
+            logger.info(
+                f"FB v13.3 exact-photo response-only fallback: idx={idx}, fbid={target_fbid}, "
+                f"candidates={len(merged)}"
+            )
+            return merged[:8]
+
+        return []
     except Exception as e:
         logger.warning(f"FB fresh photo page 第 {idx} 張開啟失敗: {e}")
         return []
     finally:
         try:
             if p:
+                try:
+                    p.remove_listener("response", _on_response)
+                except Exception:
+                    pass
                 p.close()
         except Exception:
             pass
@@ -5249,6 +5841,85 @@ def _is_bad_story_candidate_href_v1217(href: str) -> bool:
         "reply_comment_id=",
     ]
     return any(x in low for x in bad)
+
+
+
+def _is_exact_story_entry_v1239(url: str, resolved: str = "") -> bool:
+    """True when the task/resolved URL is an exact FB story.php/permalink entry.
+
+    v12.39:
+    A share/p short link can resolve to story.php?story_fbid=...&post_id=...
+    while the rendered page still exposes album/set=a links and +N controls from
+    the surrounding viewer.  For exact story entries, never treat those album
+    controls as the target post.  The target is the single foreground media on
+    the resolved story page.
+    """
+    raw = f"{url or ''} {resolved or ''}".lower()
+    if "story_fbid=" in raw or "post_id=" in raw:
+        return True
+    if "story.php" in raw and "id=" in raw:
+        return True
+    return False
+
+
+def _build_explicit_story_visible_pack_v1239(page, network_items=None) -> dict | None:
+    """Build one media pack from the currently visible story media only.
+
+    Do not use meta/html/network as primary source here; those are exactly where
+    album/recommendation pollution comes from on logged-in Facebook pages.
+    """
+    candidates = []
+    try:
+        candidates = _strict_visible_photo_candidates(page, prefer_dialog=True) or []
+    except Exception:
+        candidates = []
+    if not candidates:
+        try:
+            candidates = _strict_visible_photo_candidates(page, prefer_dialog=False) or []
+        except Exception:
+            candidates = []
+    clean = []
+    for c in candidates or []:
+        if not isinstance(c, dict):
+            continue
+        src = c.get("src") or ""
+        if not src:
+            continue
+        low = src.lower()
+        if "profile_pic" in low or "safe_image" in low or "static.xx.fbcdn.net" in low:
+            continue
+        # Reject tiny side-bar/comment/user avatars.  The foreground story media
+        # is large; this gate prevents right panel / ad images from winning.
+        try:
+            area = float(c.get("area") or 0)
+            natural_area = float(c.get("naturalArea") or 0)
+        except Exception:
+            area = 0
+            natural_area = 0
+        if max(area, natural_area) < 120 * 120:
+            continue
+        c2 = dict(c)
+        c2["_v12_39_explicit_story_visible"] = True
+        c2["score"] = int(c2.get("score", 0) or 0) + 2500000
+        clean.append(c2)
+    clean = _dedupe_ordered(clean)
+    if not clean:
+        return None
+    clean = sorted(clean, key=lambda x: x.get("score", 0), reverse=True)
+    best = clean[0]
+    logger.info(
+        "FB v12.39 explicit story visible media selected: "
+        f"type={best.get('type','image')}, candidates={len(clean)}, primary={os.path.basename(urlparse(str(best.get('src','')).split('?')[0]).path)}"
+    )
+    return {
+        "order": 1,
+        "src": best.get("src") or "",
+        "type": best.get("type") or _media_type_from_url(best.get("src") or ""),
+        "score": best.get("score", 0),
+        "candidates": clean,
+        "source": "v12.39-explicit-story-visible",
+        "_v12_39_explicit_story_visible": True,
+    }
 
 
 def _select_story_proximal_photo_link_v1217(links: list[str] | None, grid_items: list[dict] | None, story_fbid: str) -> tuple[str, list[dict]]:
@@ -5760,14 +6431,6 @@ def _is_album_context_single_photo_v1223(
     return False
 
 
-def _force_single_photo_items_v1223(link_items: list[dict] | None, viewer_items: list[dict] | None) -> list[dict]:
-    """Keep only the first proven image item for unsafe album context."""
-    for seq in [link_items or [], viewer_items or []]:
-        for item in seq:
-            src = item.get("src") or ""
-            if src and not _is_probably_video_url(src):
-                return [item]
-    return []
 
 
 def _recover_full_gallery_near_complete_v1225(
@@ -5939,62 +6602,6 @@ def _fb_v1228_capture_files_from_temp() -> list[str]:
     return paths
 
 
-def _fb_v1228_fill_outputs_from_captures(
-    ordered_output_files: list[str],
-    *,
-    success_count: int,
-    expected_photo_count: int,
-) -> tuple[int, list[str]]:
-    """Fill missing gallery outputs from captured cap_* files.
-
-    Used only after exact-count/full-gallery scope is already proven.  This
-    avoids RETRY when the viewer captured the target image but the later direct
-    CDN candidate degrades to 240x240 during final download.
-    """
-    try:
-        expected = int(expected_photo_count or 0)
-    except Exception:
-        expected = 0
-
-    if not expected or success_count >= expected:
-        return success_count, ordered_output_files
-
-    existing_sizes = set()
-    existing_names = set()
-    for p in ordered_output_files or []:
-        try:
-            existing_names.add(os.path.basename(p))
-            existing_sizes.add(os.path.getsize(p))
-        except Exception:
-            pass
-
-    for cap in _fb_v1228_capture_files_from_temp():
-        if success_count >= expected:
-            break
-        try:
-            if os.path.basename(cap) in existing_names:
-                continue
-            size = os.path.getsize(cap)
-            if size in existing_sizes and size < 40 * 1024:
-                # avoid repeatedly copying the same low-size capture pool item
-                continue
-            ext = os.path.splitext(cap)[1].lower()
-            if ext not in (".jpg", ".jpeg", ".png", ".webp"):
-                ext = ".jpg"
-            out_path = os.path.join(TEMP_DIR, f"fb_{success_count + 1:04d}{ext}")
-            shutil.copy2(cap, out_path)
-            ordered_output_files.append(out_path)
-            existing_names.add(os.path.basename(cap))
-            existing_sizes.add(size)
-            success_count += 1
-            logger.info(
-                f"FB v12.36 response-capture output filled: "
-                f"{success_count}/{expected}, source={os.path.basename(cap)}, bytes={size}"
-            )
-        except Exception as e:
-            logger.debug(f"FB v12.31 response-capture fill skipped: {e}")
-
-    return success_count, ordered_output_files
 
 
 def _fb_v1229_capture_items_from_temp(expected_photo_count: int = 0) -> list[dict]:
@@ -6042,79 +6649,6 @@ def _fb_v1230_capture_item_key(path: str) -> str:
     return f"{name}:{size}"
 
 
-def _fb_v1229_append_capture_items_before_guard(
-    viewer_items: list[dict],
-    *,
-    expected_photo_count: int,
-) -> list[dict]:
-    """Append captured response files until viewer_items can satisfy expected count.
-
-    v12.30:
-    Always log the attempt and use cap filename+size identity.  The previous
-    version could be hard to verify because it only logged when accepted items
-    existed.  This makes it obvious whether the running file is current.
-    """
-    current = list(viewer_items or [])
-    try:
-        expected = int(expected_photo_count or 0)
-    except Exception:
-        expected = 0
-    if not expected or len(current) >= expected:
-        return current
-
-    captures = _fb_v1228_capture_files_from_temp()
-    logger.info(
-        f"FB v12.31 pre-guard response-capture recovery attempt: "
-        f"current={len(current)}, expected={expected}, captures={len(captures)}"
-    )
-
-    seen = set()
-    for item in _fb_v1232_pack_dicts(current):
-        src = item.get("src") or ""
-        if src:
-            seen.add(_media_key_from_src(src))
-        tp = item.get("temp_path") or ""
-        if tp:
-            seen.add(_fb_v1230_capture_item_key(tp))
-            seen.add(os.path.basename(tp))
-
-    for cap_path in captures:
-        key = _fb_v1230_capture_item_key(cap_path)
-        name = os.path.basename(cap_path)
-        if key in seen or name in seen:
-            continue
-
-        # Avoid tiny placeholders.  17KB+ can still be a valid FB best-available
-        # exact gallery image; below 12KB is usually UI/avatar/placeholder.
-        try:
-            cap_size = os.path.getsize(cap_path)
-        except Exception:
-            cap_size = 0
-        if cap_size < 12 * 1024:
-            continue
-
-        src = f"file://{cap_path}"
-        seen.add(key)
-        seen.add(name)
-        seen.add(_media_key_from_src(src))
-        current.append({
-            "type": "image",
-            "src": src,
-            "candidates": [src],
-            "temp_path": cap_path,
-            "source": "v12.30-response-capture-pre-guard",
-            "media_id": os.path.splitext(name)[0],
-            "score": 1,
-            "_allow_fb_best_available_source": True,
-        })
-        logger.info(
-            f"FB v12.31 pre-guard response-capture appended: "
-            f"{len(current)}/{expected}, source={name}, bytes={cap_size}"
-        )
-        if len(current) >= expected:
-            break
-
-    return current
 
 
 # v12.34 ---------------------------------------------------------------------
@@ -6534,88 +7068,1121 @@ def _pack_primary_candidates(pack: dict) -> list[dict]:
     return [fallback] if fallback else []
 
 
-def _download_viewer_items(context, viewer_items, referer: str):
-    success_count = 0
-    ordered_output_files = []
-    seen_hashes = set()
-    seen_media_keys = set()
 
-    normalized_items = []
-    for raw in viewer_items or []:
-        packs = _fb_v1234_candidate_pack_list(raw)
-        normalized_items.extend(packs)
-    normalized_items = _fb_v1232_pack_dicts(normalized_items)
+# ---------------------------------------------------------------------------
 
-    for attempt_i, pack in enumerate(normalized_items, 1):
-        if not isinstance(pack, dict):
-            logger.debug(f"FB v12.35 skip non-dict download pack: {type(pack).__name__}")
-            continue
 
-        primary_src = pack.get("src") or ""
-        primary_key = _media_key_from_src(primary_src)
+def _is_fb_browser_context_closed_error(err: str) -> bool:
+    text = str(err or "").lower()
+    return any(x in text for x in [
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "target closed",
+        "browser closed",
+        "context closed",
+    ])
 
-        if primary_key and primary_key in seen_media_keys:
+
+def _launch_fb_persistent_context_with_retry(p, *, user_data_dir: str, profile_dir: str):
+    """Launch FB_Parser persistent profile with one clean retry.
+
+    v12.37 fixes the failure chain after a large gallery timeout: the outer
+    daemon timeout returned while the Playwright thread was still harvesting,
+    then the next FB task attempted to reuse the same persistent profile and got
+    "Target page, context or browser has been closed" immediately.
+    """
+    launch_kwargs = dict(
+        user_data_dir=user_data_dir,
+        channel="chrome",
+        headless=FB_HEADLESS,
+        no_viewport=True,
+        locale="zh-TW",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        args=[
+            f"--profile-directory={profile_dir}",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--start-maximized",
+        ],
+    )
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            return p.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as e:
+            last_error = e
+            if not _is_fb_browser_context_closed_error(str(e)) and "user data directory is already in use" not in str(e).lower():
+                raise
             logger.warning(
-                f"FB 候選第 {attempt_i} 張 primary media key 已重複，略過: {primary_key}"
+                f"FB v12.37 persistent context launch attempt {attempt} failed; "
+                f"retry after cleanup: {str(e).splitlines()[0]}"
             )
+            try:
+                time.sleep(2.5)
+            except Exception:
+                pass
+    raise last_error
+
+
+# v12.40 ---------------------------------------------------------------------
+# Keep only the largest/best file per logical Facebook photo.
+#
+# Failure fixed:
+# For share/p gallery posts, one fbid can expose multiple CDN URLs with different
+# sizes, for example 807939194... full and 807939194... 329x590 low copy.  Older
+# output dedupe used the full URL key including volatile _oh_ token, so it kept
+# both versions and produced 10 files for a 5-image post.
+#
+# This layer dedupes final output candidates by stable photo identity first
+# (fbid from href/media_id/CDN basename), tries high-res candidates first, and
+# replaces a smaller already-downloaded output when a better resolution/size for
+# the same photo appears later.
+
+def _fb_v1240_logical_photo_key(pack: dict | str) -> str:
+    if isinstance(pack, str):
+        srcs = [pack]
+        media_id = ""
+        href = ""
+    elif isinstance(pack, dict):
+        media_id = str(pack.get("media_id") or pack.get("fbid") or pack.get("photo_id") or "")
+        href = str(pack.get("href") or pack.get("url") or "")
+        srcs = _fb_v1234_candidate_src_list(pack) if "_fb_v1234_candidate_src_list" in globals() else [str(pack.get("src") or "")]
+    else:
+        return ""
+
+    for value in [media_id, href] + srcs:
+        s = str(value or "")
+        m = re.search(r"(?:fbid=|photo_id=)(\d{8,})", s)
+        if m:
+            return f"fbid:{m.group(1)}"
+        m = re.search(r"/(\d{8,})_\d+_\d+_n\.(?:jpg|jpeg|png|webp)", s, re.I)
+        if m:
+            return f"cdn:{m.group(1)}"
+
+    # fallback: stable basename without volatile query/_oh token
+    for src in srcs:
+        base = os.path.basename(urlparse(str(src).split("?")[0]).path)
+        if base:
+            return f"base:{base.lower()}"
+    return ""
+
+
+def _fb_v1240_file_quality(path: str) -> tuple[int, int, int]:
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+    w = h = 0
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            w, h = im.size
+    except Exception:
+        pass
+    return (w * h, max(w, h), size)
+
+
+def _fb_v1240_best_candidate_order(candidates: list[dict]) -> list[dict]:
+    def score(c):
+        src = str((c or {}).get("src") or "")
+        temp_path = str((c or {}).get("temp_path") or (c or {}).get("persisted_path") or "")
+        declared_w = int((c or {}).get("width") or 0)
+        declared_h = int((c or {}).get("height") or 0)
+        declared_area = declared_w * declared_h
+        size_hint = 0
+        if temp_path and os.path.exists(temp_path):
+            try:
+                size_hint = os.path.getsize(temp_path)
+            except Exception:
+                size_hint = 0
+        low_penalty = 0
+        low = src.lower()
+        if re.search(r"[?&](?:stp|_nc_ohc|_nc_ht)=", low):
+            low_penalty -= 2
+        if re.search(r"s(?:120|130|240|320|480|640)x(?:120|130|240|320|480|640)", low):
+            low_penalty -= 20
+        # Prefer larger declared pixels, then existing persisted file size, then original score.
+        return (
+            declared_area,
+            max(declared_w, declared_h),
+            size_hint,
+            int((c or {}).get("score") or 0) + low_penalty,
+        )
+    return sorted(candidates or [], key=score, reverse=True)
+
+
+def _fb_v1240_group_items_by_photo(items: list[dict]) -> list[dict]:
+    groups = {}
+    order = []
+    for pack in _fb_v1232_pack_dicts(items) if "_fb_v1232_pack_dicts" in globals() else [x for x in (items or []) if isinstance(x, dict)]:
+        key = _fb_v1240_logical_photo_key(pack)
+        if not key:
+            key = _media_key_from_src(str(pack.get("src") or ""))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(pack)
+
+    out = []
+    for key in order:
+        packs = groups[key]
+        merged_candidates = []
+        base = dict(packs[0])
+        for pack in packs:
+            if pack.get("src"):
+                merged_candidates.append({
+                    "src": pack.get("src"),
+                    "type": pack.get("type", "image"),
+                    "score": pack.get("score", 0),
+                    "width": pack.get("width", 0),
+                    "height": pack.get("height", 0),
+                    "temp_path": pack.get("temp_path") or pack.get("persisted_path") or "",
+                    "persisted_path": pack.get("persisted_path") or pack.get("temp_path") or "",
+                })
+            for cand in pack.get("candidates") or []:
+                if isinstance(cand, dict):
+                    merged_candidates.append(cand)
+                elif isinstance(cand, str):
+                    merged_candidates.append({"src": cand, "type": _media_type_from_url(cand), "score": 0})
+
+        # normalize and prefer high resolution candidates first
+        if "_fb_v1235_normalize_candidates" in globals():
+            merged_candidates = _fb_v1235_normalize_candidates(merged_candidates, inherited=base)
+        else:
+            merged_candidates = [c for c in merged_candidates if isinstance(c, dict) and c.get("src")]
+
+        base["candidates"] = _fb_v1240_best_candidate_order(merged_candidates)
+        if base["candidates"]:
+            best = base["candidates"][0]
+            base["src"] = best.get("src") or base.get("src")
+            base["temp_path"] = best.get("temp_path") or best.get("persisted_path") or base.get("temp_path", "")
+            base["persisted_path"] = best.get("persisted_path") or best.get("temp_path") or base.get("persisted_path", "")
+        base["_logical_photo_key_v1240"] = key
+        out.append(base)
+
+    if len(out) != len(items or []):
+        logger.info(f"FB v12.40 logical photo dedupe before download: items {len(items or [])}->{len(out)}")
+    return out
+
+
+
+# ---------------------------------------------------------------------------
+
+
+
+# v12.49 ---------------------------------------------------------------------
+# Exact short-video HTML/direct-media identity recovery.
+#
+# FB short-video pages (/share/r/, /share/v/, /reel/) can preload sibling videos.
+# A broad network candidate or even yt-dlp can therefore pair the correct caption
+# with a wrong MP4.  Before yt-dlp, fetch exact numeric-id pages with the current
+# authenticated browser context and accept only direct MP4 URLs found very close
+# to the exact target id in serialized FB data.
+
+def _fb_v1249_unescape_media_url(raw: str) -> str:
+    s = str(raw or '').strip().strip('"\'')
+    if not s:
+        return ''
+    for _ in range(3):
+        old = s
+        s = html.unescape(s)
+        s = s.replace('\\/', '/').replace('\\u002F', '/').replace('\\u002f', '/')
+        s = s.replace('\\u003A', ':').replace('\\u003a', ':')
+        s = s.replace('\\u0026', '&').replace('\\u003D', '=').replace('\\u003d', '=')
+        s = s.replace('\\u0025', '%').replace('\\u003F', '?').replace('\\u003f', '?')
+        s = s.replace('\\u002E', '.').replace('\\u002e', '.')
+        if s == old:
+            break
+    return s
+
+
+def _fb_v1249_extract_exact_video_candidates_from_text(text: str, target_id: str, source_label: str = '') -> list[dict]:
+    text = str(text or '')
+    target_id = str(target_id or '').strip()
+    if not text or not target_id:
+        return []
+
+    positions = [m.start() for m in re.finditer(re.escape(target_id), text)]
+    if not positions:
+        return []
+
+    key_scores = {
+        'browser_native_hd_url': 9000000,
+        'playable_url_quality_hd': 8800000,
+        'browser_native_sd_url': 8200000,
+        'playable_url': 8000000,
+        'hd_src': 7800000,
+        'sd_src': 7400000,
+        'progressive_url': 7200000,
+        'url': 5000000,
+    }
+    out = []
+    seen = set()
+    for pos in positions[:24]:
+        lo = max(0, pos - 18000)
+        hi = min(len(text), pos + 18000)
+        chunk = text[lo:hi]
+        # Require an identity-shaped key close to the target id where possible.
+        if not re.search(rf'(?:video(?:_|)id|videoId|\"id\"|\"video_id\")\s*[:=]\s*[\"\']?{re.escape(target_id)}', chunk, flags=re.I):
+            # Facebook sometimes serializes only the bare id beside delivery fields.
+            # Keep a much tighter window in that case.
+            lo = max(0, pos - 7000)
+            hi = min(len(text), pos + 7000)
+            chunk = text[lo:hi]
+
+        for key, base in key_scores.items():
+            # JSON-escaped direct media URLs.
+            for m in re.finditer(rf'[\"\']{re.escape(key)}[\"\']\s*:\s*[\"\']([^\"\']+)[\"\']', chunk, flags=re.I):
+                src = _fb_v1249_unescape_media_url(m.group(1))
+                low = src.lower()
+                if not src.startswith('http'):
+                    continue
+                if not ('fbcdn' in low or 'scontent' in low or '.mp4' in low or 'video' in low):
+                    continue
+                ident = _fb_media_identity(src) or src.split('&')[0]
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                dist = abs((lo + m.start()) - pos)
+                out.append({
+                    'src': src,
+                    'type': 'video',
+                    'score': int(base + max(0, 18000 - dist)),
+                    'reason': f'v12.49-exact-id-html:{source_label}:{key}',
+                    'target_id': target_id,
+                })
+
+        # Raw escaped/non-escaped MP4 URLs as a final exact-id-local source.
+        for m in re.finditer(r'https?(?:\\/|/)[^\"\'\s<>]{20,}?\.mp4[^\"\'\s<>]*', chunk, flags=re.I):
+            src = _fb_v1249_unescape_media_url(m.group(0))
+            low = src.lower()
+            if not src.startswith('http') or not ('fbcdn' in low or 'scontent' in low):
+                continue
+            ident = _fb_media_identity(src) or src.split('&')[0]
+            if ident in seen:
+                continue
+            seen.add(ident)
+            dist = abs((lo + m.start()) - pos)
+            out.append({
+                'src': src,
+                'type': 'video',
+                'score': int(6500000 + max(0, 18000 - dist)),
+                'reason': f'v12.49-exact-id-html:{source_label}:raw-mp4',
+                'target_id': target_id,
+            })
+
+    out.sort(key=lambda x: int(x.get('score') or 0), reverse=True)
+    return out
+
+
+def _fb_v1249_collect_exact_short_video_candidates(context, target_id: str, original_url: str = '', resolved_url: str = '') -> list[dict]:
+    target_id = str(target_id or '').strip()
+    if not target_id:
+        return []
+    urls = []
+    for u in [
+        resolved_url,
+        original_url,
+        f'https://www.facebook.com/watch/?v={target_id}',
+        f'https://m.facebook.com/watch/?v={target_id}',
+        f'https://mbasic.facebook.com/watch/?v={target_id}',
+        f'https://www.facebook.com/reel/{target_id}/',
+    ]:
+        u = str(u or '').strip()
+        if u and u not in urls:
+            urls.append(u)
+
+    out = []
+    seen = set()
+    for idx, u in enumerate(urls, 1):
+        try:
+            resp = context.request.get(u, timeout=30000, headers={
+                'Referer': resolved_url or original_url or 'https://www.facebook.com/',
+                'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.8',
+            })
+            if not resp.ok:
+                continue
+            body = resp.text()
+            cands = _fb_v1249_extract_exact_video_candidates_from_text(body, target_id, source_label=f'http{idx}')
+            for c in cands:
+                ident = _fb_media_identity(c.get('src') or '') or (c.get('src') or '').split('&')[0]
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                out.append(c)
+        except Exception as e:
+            logger.debug(f'FB v12.49 exact short-video HTTP probe skipped: {u} | {e}')
+    out.sort(key=lambda x: int(x.get('score') or 0), reverse=True)
+    logger.info(f'FB v12.49 exact short-video candidate count={len(out)} target={target_id}')
+    return out
+
+
+def _fb_v1249_download_exact_short_video(context, target_id: str, original_url: str, resolved_url: str, title: str):
+    cands = _fb_v1249_collect_exact_short_video_candidates(context, target_id, original_url, resolved_url)
+    if not cands:
+        return 'RETRY', 'Facebook exact short-video direct media not found for target id'
+    try:
+        clear_temp()
+        final_dst, size = _download_best_candidate(
+            context,
+            cands,
+            os.path.join(TEMP_DIR, 'fb_0001'),
+            referer=resolved_url or original_url,
+        )
+        if not final_dst or size <= 0:
+            clear_temp()
+            return 'RETRY', 'Facebook exact short-video candidate download produced no valid file'
+        clean_title = _clean_fb_post_title_for_path(title, fallback=f'Facebook_Video_{target_id}')
+        if move_files(clean_title):
+            logger.info(
+                f'FB v12.49 exact short-video completed: target={target_id}, '
+                f'candidate={os.path.basename(urlparse((cands[0].get("src") or "").split("?")[0]).path)}, bytes={size}'
+            )
+            return 'SUCCESS', ''
+        clear_temp()
+        return 'FAILED', 'Facebook exact short-video downloaded but move_files failed'
+    except Exception as e:
+        clear_temp()
+        return _classify_error(f'Facebook exact short-video download failed: {e}')
+
+
+# v12.44 ---------------------------------------------------------------------
+# Exact /share/v/ fallback:
+# v12.43 intentionally blocked broad network/meta/html fallback to prevent
+# downloading an unrelated preloaded video.  Some FB /share/v/ pages, however,
+# have foreground=0 because the active <video> is already buffered/blob-only
+# before the response hook is attached.  For those cases use yt-dlp only against
+# the exact canonical video id and verify yt-dlp's extracted id/url before
+# allowing SUCCESS.
+
+def _fb_v1244_export_context_cookies(context) -> str:
+    try:
+        cookies = context.cookies([
+            "https://www.facebook.com/",
+            "https://m.facebook.com/",
+            "https://mbasic.facebook.com/",
+        ])
+    except Exception:
+        cookies = []
+
+    if not cookies:
+        return ""
+
+    path = os.path.join(
+        TEMP_DIR,
+        f"fb_v1244_exact_share_v_{os.getpid()}_{threading.get_ident()}.cookies.txt",
+    )
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            for c in cookies:
+                domain = str(c.get("domain") or ".facebook.com")
+                include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+                cookie_path = str(c.get("path") or "/")
+                secure = "TRUE" if c.get("secure") else "FALSE"
+                expires = c.get("expires")
+                try:
+                    expires = int(expires or 0)
+                    if expires < 0:
+                        expires = 0
+                except Exception:
+                    expires = 0
+                name = str(c.get("name") or "")
+                value = str(c.get("value") or "")
+                if not name:
+                    continue
+                f.write("\t".join([
+                    domain,
+                    include_subdomains,
+                    cookie_path,
+                    secure,
+                    str(expires),
+                    name,
+                    value,
+                ]) + "\n")
+        return path
+    except Exception as e:
+        logger.debug(f"FB v12.44 cookie export failed: {e}")
+        return ""
+
+
+def _fb_v1244_info_matches_target(info: dict, target_id: str, title_hint: str = "") -> bool:
+    if not isinstance(info, dict):
+        return False
+    target = str(target_id or "").strip()
+    if not target:
+        return False
+
+    values = []
+    for key in ["id", "display_id", "webpage_url", "original_url", "url", "extractor_key"]:
+        v = info.get(key)
+        if v:
+            values.append(str(v))
+
+    # Playlist-like result: accept only if the requested id appears on the top
+    # object or first selected entry.  We use noplaylist, but be defensive.
+    entries = info.get("entries")
+    if entries:
+        try:
+            first = next((x for x in entries if isinstance(x, dict)), None)
+            if first:
+                for key in ["id", "display_id", "webpage_url", "original_url", "url"]:
+                    v = first.get(key)
+                    if v:
+                        values.append(str(v))
+        except Exception:
+            pass
+
+    joined = " ".join(values)
+    if target in joined:
+        return True
+
+    # Last-resort title guard: do not use as sole proof for numeric target unless
+    # the title is long and highly specific.  It prevents a totally unrelated
+    # preloaded video from passing if yt-dlp returns a different id.
+    extracted_title = str(info.get("title") or info.get("description") or "")
+    hint = str(title_hint or "")
+    if len(hint) >= 12 and hint[:20] in extracted_title:
+        logger.warning(
+            "FB v12.44 exact id not visible in yt-dlp info; title matched but "
+            "id proof missing, reject to avoid wrong video"
+        )
+    return False
+
+
+def _download_share_v_exact_ytdlp_v1244(
+    context,
+    original_url: str,
+    resolved_url: str,
+    target_id: str,
+    title: str,
+):
+    """Download /share/v/ only through exact target-id yt-dlp URLs.
+
+    Returns (status, error).  It never falls back to broad page candidates.
+    """
+    target_id = str(target_id or "").strip()
+    if not target_id:
+        return "RETRY", "Facebook share/v exact fallback has no canonical video id"
+
+    clear_temp()
+
+    ffmpeg_path = _find_ffmpeg()
+    cookiefile = _fb_v1244_export_context_cookies(context)
+    if not cookiefile and os.path.exists(COOKIES_FILE):
+        cookiefile = os.path.abspath(COOKIES_FILE)
+
+    exact_urls = []
+    for u in [
+        resolved_url,
+        original_url,
+        f"https://www.facebook.com/watch/?v={target_id}",
+        f"https://m.facebook.com/watch/?v={target_id}",
+        f"https://mbasic.facebook.com/watch/?v={target_id}",
+    ]:
+        u = str(u or "").strip()
+        if u and u not in exact_urls:
+            exact_urls.append(u)
+
+    formats = [
+        "best[ext=mp4][height<=1080]/best[protocol^=http][height<=1080]/best",
+        "best[ext=mp4]/best",
+        "best",
+    ]
+
+    last_error = ""
+    for exact_url in exact_urls:
+        for fmt in formats:
+            try:
+                ydl_opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "format": fmt,
+                    "outtmpl": os.path.join(TEMP_DIR, "%(title).120s.%(ext)s"),
+                    "overwrites": True,
+                    "socket_timeout": 30,
+                    "retries": 2,
+                    "fragment_retries": 2,
+                    "http_headers": {
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/123.0.0.0 Safari/537.36"
+                        ),
+                        "Referer": resolved_url or original_url or "https://www.facebook.com/",
+                        "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+                    },
+                }
+                if cookiefile:
+                    ydl_opts["cookiefile"] = cookiefile
+                if ffmpeg_path:
+                    ydl_opts["ffmpeg_location"] = os.path.dirname(ffmpeg_path)
+                    ydl_opts["merge_output_format"] = "mp4"
+                else:
+                    logger.warning("未找到 ffmpeg，FB v12.44 share/v exact yt-dlp 將使用單檔格式")
+
+                logger.info(
+                    f"FB v12.44 exact share/v yt-dlp probe: target={target_id}, "
+                    f"url={exact_url}, fmt={fmt}"
+                )
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(exact_url, download=False)
+
+                if not _fb_v1244_info_matches_target(info, target_id, title):
+                    last_error = (
+                        f"yt-dlp extracted info did not prove target id {target_id}; "
+                        "skip to avoid wrong video"
+                    )
+                    logger.warning(f"FB v12.44 exact share/v id guard rejected: {last_error}")
+                    continue
+
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(exact_url, download=True)
+
+                if not _fb_v1244_info_matches_target(info, target_id, title):
+                    clear_temp()
+                    last_error = f"yt-dlp download result did not prove target id {target_id}"
+                    logger.warning(f"FB v12.44 exact share/v download rejected: {last_error}")
+                    continue
+
+                clean_title = _clean_fb_post_title_for_path(title, fallback=_fb_reel_fallback_title(exact_url))
+                if move_files(clean_title):
+                    logger.info(f"FB v12.44 exact share/v yt-dlp completed: target={target_id}, title={clean_title}")
+                    return "SUCCESS", ""
+
+                last_error = "yt-dlp exact share/v downloaded but move_files found no valid media"
+
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"FB v12.44 exact share/v yt-dlp failed: {last_error}")
+
+    clear_temp()
+    return "RETRY", (
+        "Facebook share/v foreground=0 and exact target-id yt-dlp fallback failed; "
+        f"target={target_id}; {last_error or 'no exact video candidate'}"
+    )
+
+# ---------------------------------------------------------------------------
+
+
+# v12.45 ---------------------------------------------------------------------
+# Exact content duplicate guard:
+#
+# Failure fixed:
+#   /share/p/1BuswMyqWU/ expected 8 images.  The viewer collected 7 unique
+#   media responses, then the response-capture recovery appended a previously
+#   captured file as the 8th output.  The final output was marked SUCCESS, but
+#   some final JPGs were byte-identical duplicates.
+#
+# Policy:
+#   - A gallery must never reach SUCCESS by filling missing slots with a byte-
+#     identical image.
+#   - Response-capture recovery must skip content hashes already present in
+#     viewer_items.
+#   - Final output download must dedupe by exact file hash in addition to fbid /
+#     CDN logical key.
+#   - If the missing photo cannot be proven, return RETRY instead of false
+#     SUCCESS.
+
+def _fb_v1245_file_md5(path: str) -> str:
+    try:
+        if not path or not os.path.exists(path) or not os.path.isfile(path):
+            return ""
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _fb_v1245_candidate_local_paths(pack) -> list[str]:
+    out = []
+
+    def add_path(value):
+        s = str(value or "").strip()
+        if not s:
+            return
+        if s.startswith("file://"):
+            s = s[7:]
+        if s and os.path.exists(s):
+            out.append(s)
+
+    if isinstance(pack, dict):
+        add_path(pack.get("temp_path"))
+        add_path(pack.get("persisted_path"))
+        add_path(pack.get("local_path"))
+        add_path(pack.get("src"))
+        for cand in pack.get("candidates") or []:
+            if isinstance(cand, dict):
+                add_path(cand.get("temp_path"))
+                add_path(cand.get("persisted_path"))
+                add_path(cand.get("local_path"))
+                add_path(cand.get("src"))
+            else:
+                add_path(cand)
+    elif isinstance(pack, str):
+        add_path(pack)
+
+    seen = set()
+    uniq = []
+    for p in out:
+        n = os.path.normcase(os.path.abspath(p))
+        if n in seen:
             continue
+        seen.add(n)
+        uniq.append(p)
+    return uniq
 
-        candidates = _pack_primary_candidates(pack)
-        candidates = _fb_v1235_normalize_candidates(candidates, inherited=pack)
 
-        if not candidates:
-            logger.warning(f"FB 候選第 {attempt_i} 張沒有有效候選，略過")
+def _fb_v1245_item_content_hash(pack) -> str:
+    for path in _fb_v1245_candidate_local_paths(pack):
+        md5 = _fb_v1245_file_md5(path)
+        if md5:
+            return f"md5:{md5}"
+    return ""
+
+
+def _fb_v1229_append_capture_items_before_guard(
+    viewer_items: list[dict],
+    *,
+    expected_photo_count: int,
+) -> list[dict]:
+    """Append captured response files until viewer_items can satisfy expected count.
+
+    v12.45: do not append a capture if its exact file content already exists in
+    the current viewer item set.  This prevents filling the last missing gallery
+    slot with a duplicate and then reporting false SUCCESS.
+    """
+    current = list(viewer_items or [])
+    try:
+        expected = int(expected_photo_count or 0)
+    except Exception:
+        expected = 0
+    if not expected or len(current) >= expected:
+        return current
+
+    captures = _fb_v1228_capture_files_from_temp()
+    logger.info(
+        f"FB v12.45 pre-guard response-capture recovery attempt: "
+        f"current={len(current)}, expected={expected}, captures={len(captures)}"
+    )
+
+    seen = set()
+    seen_content = set()
+    for item in _fb_v1232_pack_dicts(current):
+        src = item.get("src") or ""
+        if src:
+            seen.add(_media_key_from_src(src))
+        tp = item.get("temp_path") or item.get("persisted_path") or ""
+        if tp:
+            seen.add(_fb_v1230_capture_item_key(tp))
+            seen.add(os.path.basename(tp))
+        content_key = _fb_v1245_item_content_hash(item)
+        if content_key:
+            seen_content.add(content_key)
+
+    for cap_path in captures:
+        key = _fb_v1230_capture_item_key(cap_path)
+        name = os.path.basename(cap_path)
+        if key in seen or name in seen:
             continue
-
-        dst_base = os.path.join(TEMP_DIR, f"fb_{success_count + 1:04d}")
 
         try:
-            final_dst, size = _download_best_candidate(
-                context,
-                candidates,
-                dst_base,
-                referer=referer,
-            )
+            cap_size = os.path.getsize(cap_path)
+        except Exception:
+            cap_size = 0
+        if cap_size < 12 * 1024:
+            continue
 
-            digest = _file_md5(final_dst)
-            if digest in seen_hashes:
-                logger.warning(
-                    f"FB 候選第 {attempt_i} 張下載後判定重複，刪除暫存: "
-                    f"{os.path.basename(final_dst)} ({size} bytes) primary={primary_key}"
-                )
-                try:
-                    os.remove(final_dst)
-                except Exception:
-                    pass
+        content_key = _fb_v1245_item_content_hash(cap_path)
+        if content_key and content_key in seen_content:
+            logger.info(
+                f"FB v12.45 response-capture duplicate content skipped: "
+                f"source={name}, hash={content_key}"
+            )
+            continue
+
+        src = f"file://{cap_path}"
+        seen.add(key)
+        seen.add(name)
+        seen.add(_media_key_from_src(src))
+        if content_key:
+            seen_content.add(content_key)
+
+        current.append({
+            "type": "image",
+            "src": src,
+            "candidates": [src],
+            "temp_path": cap_path,
+            "source": "v12.45-response-capture-pre-guard",
+            "media_id": os.path.splitext(name)[0],
+            "score": 1,
+            "_allow_fb_best_available_source": True,
+        })
+        logger.info(
+            f"FB v12.45 pre-guard response-capture appended: "
+            f"{len(current)}/{expected}, source={name}, bytes={cap_size}"
+        )
+        if len(current) >= expected:
+            break
+
+    return current
+
+
+
+# ---------------------------------------------------------------------------
+
+
+# v12.46 ---------------------------------------------------------------------
+# Let grid-tile recovery run before a near-complete +N gallery returns RETRY.
+# Also block post-download capture filling from re-adding a byte-identical image.
+
+def _fb_v1228_fill_outputs_from_captures(
+    ordered_output_files: list[str],
+    *,
+    success_count: int,
+    expected_photo_count: int,
+) -> tuple[int, list[str]]:
+    """Fill missing gallery outputs from captured cap_* files.
+
+    v12.46: a captured file may have a different filename but identical image
+    content.  Do not use it to satisfy exact-count completion; otherwise 4.jpg
+    and 7.jpg can be the same photo while the task is marked SUCCESS.
+    """
+    try:
+        expected = int(expected_photo_count or 0)
+    except Exception:
+        expected = 0
+
+    if not expected or success_count >= expected:
+        return success_count, ordered_output_files
+
+    existing_names = set()
+    existing_sizes = set()
+    existing_hashes = set()
+
+    for p in ordered_output_files or []:
+        try:
+            existing_names.add(os.path.basename(p))
+            existing_sizes.add(os.path.getsize(p))
+            content_key = _fb_v1245_item_content_hash(p)
+            if content_key:
+                existing_hashes.add(content_key)
+        except Exception:
+            pass
+
+    for cap in _fb_v1228_capture_files_from_temp():
+        if success_count >= expected:
+            break
+        try:
+            cap_name = os.path.basename(cap)
+            if cap_name in existing_names:
                 continue
 
-            seen_hashes.add(digest)
-            if primary_key:
-                seen_media_keys.add(primary_key)
+            size = os.path.getsize(cap)
+            if size in existing_sizes and size < 40 * 1024:
+                continue
 
-            if size < 80 * 1024 and len(normalized_items) >= 8:
-                logger.warning(
-                    f"FB 輸出第 {success_count + 1} 張檔案偏小，可能是縮圖/placeholder: "
-                    f"{os.path.basename(final_dst)} ({size} bytes)"
+            content_key = _fb_v1245_item_content_hash(cap)
+            if content_key and content_key in existing_hashes:
+                logger.info(
+                    f"FB v12.46 response-capture output duplicate-content skipped: "
+                    f"source={cap_name}, hash={content_key}"
                 )
+                continue
 
+            ext = os.path.splitext(cap)[1].lower()
+            if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+                ext = ".jpg"
+
+            out_path = os.path.join(TEMP_DIR, f"fb_{success_count + 1:04d}{ext}")
+            shutil.copy2(cap, out_path)
+            ordered_output_files.append(out_path)
+            existing_names.add(cap_name)
+            existing_sizes.add(size)
+            if content_key:
+                existing_hashes.add(content_key)
             success_count += 1
-            ordered_output_files.append(final_dst)
             logger.info(
-                f"FB 已下載輸出第 {success_count} 張: {os.path.basename(final_dst)} "
-                f"({size} bytes) primary={primary_key}"
+                f"FB v12.46 response-capture output filled: "
+                f"{success_count}/{expected}, source={cap_name}, bytes={size}"
             )
-
         except Exception as e:
-            logger.warning(f"FB 候選第 {attempt_i} 張下載失敗: {e}")
+            logger.debug(f"FB v12.46 response-capture fill skipped: {e}")
 
-    logger.info(f"FB unique output media count={success_count}")
     return success_count, ordered_output_files
 
 # ---------------------------------------------------------------------------
 
 
+# v12.47 ---------------------------------------------------------------------
+# Exhaust every candidate inside the same proven photo pack before declaring it
+# duplicate/incomplete.  v12.45 correctly prevented duplicate-content false
+# SUCCESS, but it dropped the whole logical photo as soon as the best candidate
+# downloaded to the same bytes as an earlier image.  Some FB albums expose the
+# correct hidden +N image as the second/third candidate of that same pack.  This
+# override tries each candidate group independently and only skips the pack after
+# all same-pack alternatives fail or duplicate existing content.
+
+def _fb_v1247_normalize_candidate_list(pack) -> list[dict]:
+    if not isinstance(pack, dict):
+        return []
+    if "_pack_primary_candidates" in globals():
+        candidates = _pack_primary_candidates(pack)
+    else:
+        candidates = list(pack.get("candidates") or [])
+        if pack.get("src"):
+            candidates.insert(0, {"src": pack.get("src"), "type": pack.get("type", "image"), "score": pack.get("score", 0)})
+    if "_fb_v1235_normalize_candidates" in globals():
+        candidates = _fb_v1235_normalize_candidates(candidates, inherited=pack)
+    else:
+        candidates = [c for c in candidates if isinstance(c, dict) and c.get("src")]
+    candidates = _fb_v1240_best_candidate_order(candidates)
+
+    seen = set()
+    out = []
+    for cand in candidates:
+        if not isinstance(cand, dict):
+            continue
+        src = str(cand.get("src") or "")
+        temp_path = str(cand.get("temp_path") or cand.get("persisted_path") or "")
+        key = (src, temp_path)
+        if not src and not temp_path:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cand)
+    return out
+
+
+def _fb_v1247_download_one_candidate(context, cand: dict, dst_base: str, referer: str):
+    # Pass one candidate at a time so a duplicate best URL does not prevent
+    # trying the next proven URL in the same pack.
+    return _download_best_candidate(context, [cand], dst_base, referer=referer)
+
+
+def _download_viewer_items(context, viewer_items, referer: str):
+    success_count = 0
+    by_photo: dict[str, dict] = {}
+    by_content: dict[str, dict] = {}
+
+    normalized_items = []
+    for raw in viewer_items or []:
+        if "_fb_v1234_candidate_pack_list" in globals():
+            normalized_items.extend(_fb_v1234_candidate_pack_list(raw))
+        elif isinstance(raw, dict):
+            normalized_items.append(raw)
+
+    normalized_items = _fb_v1240_group_items_by_photo(normalized_items)
+
+    for attempt_i, pack in enumerate(normalized_items, 1):
+        if not isinstance(pack, dict):
+            continue
+
+        logical_key = pack.get("_logical_photo_key_v1240") or _fb_v1240_logical_photo_key(pack)
+        if not logical_key:
+            logical_key = _media_key_from_src(pack.get("src", ""))
+
+        candidates = _fb_v1247_normalize_candidate_list(pack)
+        if not candidates:
+            logger.warning(f"FB v12.47 候選第 {attempt_i} 張沒有有效候選，略過")
+            continue
+
+        accepted = False
+        duplicate_seen = 0
+        failed_seen = 0
+
+        for cand_i, cand in enumerate(candidates[:24], 1):
+            dst_base = os.path.join(TEMP_DIR, f"fb_{success_count + 1:04d}_p{attempt_i:03d}_c{cand_i:02d}")
+            try:
+                final_dst, size = _fb_v1247_download_one_candidate(context, cand, dst_base, referer)
+                new_quality = _fb_v1240_file_quality(final_dst)
+                content_key = _fb_v1245_item_content_hash(final_dst)
+
+                if content_key and content_key in by_content:
+                    old = by_content[content_key]
+                    old_path = old.get("path", "")
+                    old_quality = old.get("quality", (0, 0, 0))
+                    duplicate_seen += 1
+                    if new_quality > old_quality:
+                        logger.info(
+                            f"FB v12.47 replace duplicate-content lower-quality output: "
+                            f"hash={content_key}, old={os.path.basename(old_path)}, "
+                            f"new={os.path.basename(final_dst)}"
+                        )
+                        try:
+                            if old_path and os.path.exists(old_path):
+                                os.remove(old_path)
+                        except Exception:
+                            pass
+                        old["path"] = final_dst
+                        old["quality"] = new_quality
+                        old["size"] = size
+                        by_photo[logical_key] = old
+                    else:
+                        logger.info(
+                            f"FB v12.47 candidate duplicate-content skipped, try next: "
+                            f"pack={attempt_i}, cand={cand_i}/{len(candidates)}, "
+                            f"hash={content_key}, logical={logical_key}, quality={new_quality}"
+                        )
+                        try:
+                            os.remove(final_dst)
+                        except Exception:
+                            pass
+                    continue
+
+                old = by_photo.get(logical_key)
+                if old:
+                    old_path = old.get("path", "")
+                    old_quality = old.get("quality", (0, 0, 0))
+                    duplicate_seen += 1
+                    if new_quality > old_quality:
+                        logger.info(
+                            f"FB v12.47 replace lower-resolution duplicate logical photo: "
+                            f"{logical_key}, old={os.path.basename(old_path)}, new={os.path.basename(final_dst)}"
+                        )
+                        try:
+                            if old_path and os.path.exists(old_path):
+                                os.remove(old_path)
+                        except Exception:
+                            pass
+                        old["path"] = final_dst
+                        old["quality"] = new_quality
+                        old["size"] = size
+                        if content_key:
+                            by_content[content_key] = old
+                    else:
+                        logger.info(
+                            f"FB v12.47 candidate same logical photo skipped, try next: "
+                            f"pack={attempt_i}, cand={cand_i}/{len(candidates)}, logical={logical_key}, quality={new_quality}"
+                        )
+                        try:
+                            os.remove(final_dst)
+                        except Exception:
+                            pass
+                    continue
+
+                rec = {"path": final_dst, "quality": new_quality, "size": size}
+                by_photo[logical_key] = rec
+                if content_key:
+                    by_content[content_key] = rec
+                success_count += 1
+                accepted = True
+                logger.info(
+                    f"FB 已下載輸出第 {success_count} 張: {os.path.basename(final_dst)} "
+                    f"({size} bytes) logical={logical_key}, content={content_key or '-'}, "
+                    f"quality={new_quality}, pack={attempt_i}, cand={cand_i}/{len(candidates)}"
+                )
+                break
+
+            except Exception as e:
+                failed_seen += 1
+                logger.debug(
+                    f"FB v12.47 candidate failed, try next: "
+                    f"pack={attempt_i}, cand={cand_i}/{len(candidates)}, error={e}"
+                )
+                try:
+                    folder = os.path.dirname(dst_base)
+                    prefix = os.path.basename(dst_base)
+                    for fn in os.listdir(folder):
+                        if fn.startswith(prefix):
+                            os.remove(os.path.join(folder, fn))
+                except Exception:
+                    pass
+
+        if not accepted:
+            logger.warning(
+                f"FB v12.47 pack unresolved after exhaustive candidate scan: "
+                f"pack={attempt_i}, logical={logical_key}, candidates={len(candidates)}, "
+                f"duplicates={duplicate_seen}, failed={failed_seen}"
+            )
+
+    ordered_output_files = []
+    compact_i = 1
+    emitted_content = set()
+    for key, rec in by_photo.items():
+        path = rec.get("path", "")
+        if not path or not os.path.exists(path):
+            continue
+        content_key = _fb_v1245_item_content_hash(path)
+        if content_key and content_key in emitted_content:
+            logger.info(
+                f"FB v12.47 final duplicate-content compact skip: "
+                f"hash={content_key}, file={os.path.basename(path)}"
+            )
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            continue
+        if content_key:
+            emitted_content.add(content_key)
+
+        ext = os.path.splitext(path)[1].lower() or ".jpg"
+        target = os.path.join(TEMP_DIR, f"fb_{compact_i:04d}{ext}")
+        if os.path.abspath(path) != os.path.abspath(target):
+            try:
+                if os.path.exists(target):
+                    os.remove(target)
+                os.replace(path, target)
+                path = target
+            except Exception:
+                pass
+        ordered_output_files.append(path)
+        compact_i += 1
+
+    success_count = len(ordered_output_files)
+    logger.info(f"FB v12.47 unique content output count={success_count}")
+    logger.info(f"FB unique output media count={success_count}")
+    return success_count, ordered_output_files
+
+
+# v12.47 strict: do not let a partial RETRY gallery leave old folder contents
+# that look like a successful download.  The original final guard already blocks
+# move_files_ordered when output < expected; this helper is used by manual checks
+# and future recovery paths to keep the policy explicit.
+def _fb_v1247_clear_partial_outputs_on_incomplete(success_count: int, expected_photo_count: int) -> None:
+    try:
+        if expected_photo_count and success_count < int(expected_photo_count):
+            logger.info(
+                f"FB v12.47 incomplete gallery cleanup policy active: "
+                f"output={success_count}/target={expected_photo_count}; keep RETRY, no false SUCCESS"
+            )
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+
+
 def _collect_fb_media_playwright(url: str):
+    logger.info("FB v14.2 integrated pipeline active: immutable GalleryPlan + validated helper signatures + strict completeness")
+    try:
+        _target_contract = _contract_parse_facebook_target(url)
+        logger.info(
+            f"FB v13.0 target identity: kind={_target_contract.kind}, "
+            f"numeric_id={_target_contract.numeric_id or '-'}, "
+            f"story_fbid={_target_contract.story_fbid or '-'}, "
+            f"post_id={_target_contract.post_id or '-'}, share_token={_target_contract.share_token or '-'}"
+        )
+    except Exception as _contract_e:
+        logger.debug(f"FB v13.0 target identity parse skipped: {_contract_e}")
     clear_temp()
 
     browser = None
@@ -6624,6 +8191,11 @@ def _collect_fb_media_playwright(url: str):
     try:
         resolved = _resolve_share_url(url)
         network_items = []
+        # v13.1: bounded structured-response buffer.  We keep only GraphQL/JSON/text
+        # responses that can carry exact post/photo identities; media bodies are handled
+        # by the existing binary capture path.
+        structured_payloads_v131 = []
+        structured_payload_state_v133 = {"bytes": 0}
 
         with sync_playwright() as p:
             user_data_dir = _get_fb_parser_profile_root()
@@ -6633,26 +8205,10 @@ def _collect_fb_media_playwright(url: str):
                 f"profile={profile_dir}, cookies.txt=legacy-fallback"
             )
 
-            context = p.chromium.launch_persistent_context(
+            context = _launch_fb_persistent_context_with_retry(
+                p,
                 user_data_dir=user_data_dir,
-                channel="chrome",
-                headless=FB_HEADLESS,
-                no_viewport=True,
-                locale="zh-TW",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
-                args=[
-                    f"--profile-directory={profile_dir}",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--start-maximized",
-                ],
+                profile_dir=profile_dir,
             )
 
             try:
@@ -6677,6 +8233,33 @@ def _collect_fb_media_playwright(url: str):
             def on_response(resp):
                 try:
                     u = resp.url
+
+                    # v13.1 exact-PCB payload recovery.  Facebook often keeps the
+                    # hidden +N slide identities in GraphQL/JSON even when the DOM
+                    # exposes only five photo anchors.  Capture a bounded text copy
+                    # now, then parse it only after the post's pcb id is proven.
+                    if len(structured_payloads_v131) < 96 and int(structured_payload_state_v133.get("bytes", 0)) < 24_000_000:
+                        low_u_v131 = str(u or "").lower()
+                        ctype_v131 = ""
+                        try:
+                            ctype_v131 = str(resp.headers.get("content-type", "") or "").lower()
+                        except Exception:
+                            ctype_v131 = ""
+                        if (
+                            "graphql" in low_u_v131
+                            or "/api/" in low_u_v131
+                            or "application/json" in ctype_v131
+                            or "text/javascript" in ctype_v131
+                        ):
+                            try:
+                                txt_v131 = resp.text()
+                                if txt_v131 and len(txt_v131) <= 1_200_000:
+                                    low_txt_v131 = txt_v131.lower()
+                                    if "fbid" in low_txt_v131 or "set=pcb" in low_txt_v131 or "\"photo\"" in low_txt_v131:
+                                        structured_payloads_v131.append(txt_v131)
+                                        structured_payload_state_v133["bytes"] = int(structured_payload_state_v133.get("bytes", 0)) + len(txt_v131)
+                            except Exception:
+                                pass
 
                     if not _looks_like_real_fb_media_url(u):
                         return
@@ -6795,35 +8378,78 @@ def _collect_fb_media_playwright(url: str):
                         resolved,
                     )
 
-                    # Keep the proven pre-v11.91 collection path as a fallback, but rank it
-                    # behind foreground candidates so the title cannot be paired with a
-                    # neighboring preloaded video.
-                    reel_candidates = _collect_current_page_candidates(
-                        page,
-                        network_items=network_items,
-                        include_network=True,
-                        include_meta=True,
-                        include_html=True,
+                    strict_share_video_v1243 = bool(
+                        re.search(r"/(?:share/[rv]|reels?)/", f"{url} {resolved} {page.url}", flags=re.I)
                     )
 
-                    broad_video_candidates = []
-                    for cand in reel_candidates:
-                        src = cand.get("src") or ""
-                        if cand.get("type") == "video" or _is_probably_video_url(src) or any(
-                            x in src.lower() for x in [".mp4", ".m4v", ".mov"]
-                        ):
-                            c2 = dict(cand)
-                            c2["type"] = "video"
-                            c2["score"] = int(c2.get("score") or 0) + 1500000
-                            broad_video_candidates.append(c2)
+                    if strict_share_video_v1243:
+                        # v12.43:
+                        # /share/v/ pages frequently preload unrelated videos behind the
+                        # active viewer.  The old broad page/network fallback can pair the
+                        # correct title with a wrong MP4.  For share/v use only foreground
+                        # responses triggered after focusing/clicking the active video.
+                        reel_candidates = []
+                        broad_video_candidates = []
+                        video_candidates = _dedupe_ordered(foreground_candidates)
+                        logger.info(
+                            f"FB v12.49 strict short-video mode: "
+                            f"foreground={len(foreground_candidates)}, title={reel_title}"
+                        )
+                    else:
+                        # Keep the proven pre-v11.91 collection path as a fallback for
+                        # ordinary Reel URLs, but rank it behind foreground candidates.
+                        reel_candidates = _collect_current_page_candidates(
+                            page,
+                            network_items=network_items,
+                            include_network=True,
+                            include_meta=True,
+                            include_html=True,
+                        )
 
-                    video_candidates = _dedupe_ordered(foreground_candidates + broad_video_candidates)
+                        broad_video_candidates = []
+                        for cand in reel_candidates:
+                            if not isinstance(cand, dict):
+                                continue
+                            src = cand.get("src") or ""
+                            if cand.get("type") == "video" or _is_probably_video_url(src) or any(
+                                x in src.lower() for x in [".mp4", ".m4v", ".mov"]
+                            ):
+                                c2 = dict(cand)
+                                c2["type"] = "video"
+                                c2["score"] = int(c2.get("score") or 0) + 1500000
+                                broad_video_candidates.append(c2)
+
+                        video_candidates = _dedupe_ordered(foreground_candidates + broad_video_candidates)
+
                     logger.info(
                         f"FB Reel video candidate count={len(video_candidates)} "
                         f"foreground={len(foreground_candidates)} from total={len(reel_candidates)}; title={reel_title}"
                     )
 
                     if not video_candidates:
+                        if strict_share_video_v1243:
+                            exact_target_v1249 = observed_reel_id or _extract_fb_reel_or_share_id(resolved or url)
+                            logger.info(
+                                "FB v12.49 strict short-video foreground=0; try exact-id "
+                                "serialized direct-media recovery before yt-dlp"
+                            )
+                            status_v1249, err_v1249 = _fb_v1249_download_exact_short_video(
+                                context, exact_target_v1249, url, resolved, reel_title
+                            )
+                            if status_v1249 == "SUCCESS":
+                                return status_v1249, err_v1249
+                            # Keep v12.44 as a last compatibility fallback, but only for
+                            # exact numeric identity. Broad preloaded candidates remain blocked.
+                            if str(exact_target_v1249 or '').isdigit():
+                                logger.info(
+                                    f"FB v12.49 exact direct-media unavailable ({err_v1249}); "
+                                    "try exact target-id yt-dlp compatibility fallback"
+                                )
+                                return _download_share_v_exact_ytdlp_v1244(
+                                    context, url, resolved, exact_target_v1249, reel_title
+                                )
+                            clear_temp()
+                            return "RETRY", err_v1249
                         clear_temp()
                         return "RETRY", "Facebook Reel 未擷取到有效影片候選，避免誤存封面圖為 jpg"
 
@@ -6855,15 +8481,29 @@ def _collect_fb_media_playwright(url: str):
             logger.info(f"FB photo link count before +N={len(links_before)}")
             logger.info(f"FB +N overlay count before={plus_count_before}")
 
-            # 第二階段：點 +12 / 更多照片，再收集完整列表
-            try:
-                _click_plus_overlay_or_first_photo(page)
-                page.wait_for_timeout(3000)
-            except Exception:
-                pass
+            # v12.39: exact story.php/story_fbid/post_id targets are single-entry
+            # posts.  Do not click +N / first photo before identity gating; that
+            # opens the surrounding album/viewer and pollutes the target with
+            # other dates or recommendation media.
+            exact_story_pre_v1239 = _is_exact_story_entry_v1239(url, resolved)
 
-            grid_after = _collect_fb_grid_items(page)
-            links_after = _collect_fb_photo_links(page)
+            # 第二階段：點 +12 / 更多照片，再收集完整列表
+            if exact_story_pre_v1239:
+                logger.info(
+                    "FB v12.39 exact story entry detected before +N click; "
+                    "skip gallery expansion and keep foreground story page"
+                )
+                grid_after = list(grid_before or [])
+                links_after = list(links_before or [])
+            else:
+                try:
+                    _click_plus_overlay_or_first_photo(page)
+                    page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+
+                grid_after = _collect_fb_grid_items(page)
+                links_after = _collect_fb_photo_links(page)
             logger.info(f"FB grid item count after +N={len(grid_after)}")
             logger.info(f"FB photo link count after +N={len(links_after)}")
 
@@ -6891,34 +8531,50 @@ def _collect_fb_media_playwright(url: str):
 
             explicit_story_single_mode = False
             explicit_story_target_link = ""
+            explicit_story_visible_pack_v1239 = None
             explicit_album_single_mode = False
+            exact_story_entry_v1239 = bool(locals().get("exact_story_pre_v1239")) or _is_exact_story_entry_v1239(url, resolved)
             share_p_gallery_like_v1226 = bool(
-                re.search(r"/share/p/", f"{url} {resolved}", flags=re.I)
+                (not exact_story_entry_v1239)
+                and re.search(r"/share/p/", f"{url} {resolved}", flags=re.I)
                 and (plus_count_before or len(ordered_grid_items) >= 2 or len(ordered_links) >= 3)
             )
             if _is_explicit_story_post_url_v1217(url, resolved) and not share_p_gallery_like_v1226:
-                story_fbid_v1217 = _extract_story_fbid_v1217(url, resolved)
-                explicit_story_target_link, explicit_story_grid_items = _select_story_proximal_photo_link_v1217(
-                    ordered_links,
-                    ordered_grid_items,
-                    story_fbid_v1217,
-                )
-                if explicit_story_target_link:
+                if exact_story_entry_v1239:
+                    explicit_story_visible_pack_v1239 = _build_explicit_story_visible_pack_v1239(page, network_items=network_items)
+                if explicit_story_visible_pack_v1239:
                     explicit_story_single_mode = True
-                    ordered_links = [explicit_story_target_link]
-                    ordered_grid_items = explicit_story_grid_items
+                    explicit_story_target_link = "__v12_39_visible_story_media__"
+                    ordered_links = []
+                    ordered_grid_items = []
                     plus_count_before = 0
                     logger.info(
-                        "FB v12.18 explicit story single-photo identity gate: "
-                        "use proximal target photo only; skip album/set first-anchor and viewer gallery"
+                        "FB v12.39 explicit story single-media identity gate: "
+                        "use visible foreground story media only; skip album/set/+N/viewer gallery"
                     )
                 else:
-                    logger.warning(
-                        "FB v12.17 explicit story could not select proximal target photo; "
-                        "return RETRY to avoid wrong post"
+                    story_fbid_v1217 = _extract_story_fbid_v1217(url, resolved)
+                    explicit_story_target_link, explicit_story_grid_items = _select_story_proximal_photo_link_v1217(
+                        ordered_links,
+                        ordered_grid_items,
+                        story_fbid_v1217,
                     )
-                    clear_temp()
-                    return "RETRY", "Facebook explicit story target photo identity not proven"
+                    if explicit_story_target_link:
+                        explicit_story_single_mode = True
+                        ordered_links = [explicit_story_target_link]
+                        ordered_grid_items = explicit_story_grid_items
+                        plus_count_before = 0
+                        logger.info(
+                            "FB v12.18 explicit story single-photo identity gate: "
+                            "use proximal target photo only; skip album/set first-anchor and viewer gallery"
+                        )
+                    else:
+                        logger.warning(
+                            "FB v12.17 explicit story could not select proximal target photo; "
+                            "return RETRY to avoid wrong post"
+                        )
+                        clear_temp()
+                        return "RETRY", "Facebook explicit story target photo identity not proven"
             elif share_p_gallery_like_v1226:
                 logger.info(
                     "FB v12.26 share/p gallery mode: skip explicit story single-photo gate; "
@@ -6959,6 +8615,46 @@ def _collect_fb_media_playwright(url: str):
                     f"grid {before_grid_n}->{len(ordered_grid_items)}"
                 )
 
+                # v12.49: the +N tile can hide photo permalinks that never appear
+                # as live DOM anchors. Recover only exact same-pcb links from the
+                # serialized post payload, preserving all existing visible-link
+                # behavior and never widening to another post/album.
+                try:
+                    hidden_links_v1249 = _fb_v1249_collect_hidden_pcb_photo_links(page, dominant_pcb_key)
+                    added_v1249 = 0
+                    for _u in hidden_links_v1249:
+                        if _u not in ordered_links:
+                            ordered_links.append(_u)
+                            added_v1249 += 1
+                    if added_v1249:
+                        logger.info(
+                            f"FB v12.49 exact-pcb hidden links merged: added={added_v1249}, "
+                            f"total_links={len(ordered_links)}, pcb={dominant_pcb_key}"
+                        )
+                except Exception as _e:
+                    logger.debug(f"FB v12.49 hidden pcb merge skipped: {_e}")
+
+                # v13.1: merge exact-PCB links discovered from captured structured
+                # responses.  This is still same-post only and is the primary fix
+                # for galleries that repeatedly stall at 7/8 because the eighth
+                # permalink is virtualized and never becomes a live DOM anchor.
+                try:
+                    payload_links_v131 = _fb_v131_collect_exact_pcb_links_from_payloads(
+                        structured_payloads_v131, dominant_pcb_key
+                    )
+                    added_payload_v131 = 0
+                    for _u in payload_links_v131:
+                        if _u not in ordered_links:
+                            ordered_links.append(_u)
+                            added_payload_v131 += 1
+                    if added_payload_v131:
+                        logger.info(
+                            f"FB v13.2 exact-pcb payload merge: added={added_payload_v131}, "
+                            f"total_links={len(ordered_links)}, pcb={dominant_pcb_key}"
+                        )
+                except Exception as _e:
+                    logger.debug(f"FB v13.2 exact-pcb payload merge skipped: {_e}")
+
             # v11.19 / v12.18: title must be scoped to the selected media.
             # Generic page selectors can grab neighboring/recommended posts in logged-in feeds.
             if explicit_story_single_mode and explicit_story_target_link:
@@ -6971,6 +8667,19 @@ def _collect_fb_media_playwright(url: str):
             # v12.24: album/photo viewer uses the right-side viewer panel caption,
             # not normal feed article selectors.
             fb_account = _get_fb_page_account(page, fallback_title=title)
+            exact_pcb_account_v1250 = ""
+            group_container_account_v131 = ""
+            if dominant_pcb_key:
+                # v13.1 GUI semantics: a group share belongs to the group/container,
+                # not to the member author shown under the group name.  This fixes
+                # BubuDudu lover/Yuni Cahyani and similar exact-PCB group posts.
+                group_container_account_v131 = _fb_v131_get_group_container_account(page, dominant_pcb_key)
+                exact_pcb_account_v1250 = _get_fb_exact_pcb_account_v1250(page, dominant_pcb_key)
+                fb_account = _contract_choose_post_account(
+                    group_root=group_container_account_v131,
+                    page_or_author=exact_pcb_account_v1250,
+                    fallback=fb_account,
+                )
             if explicit_album_single_mode and (
                 not title or title == "Facebook_Post" or _is_fallback_fb_title(title)
             ):
@@ -6981,30 +8690,189 @@ def _collect_fb_media_playwright(url: str):
                 )
 
             # v12.20: publish both resolved caption and account to the GUI immediately.
-            fb_account = _get_fb_page_account(page, fallback_title=title) or fb_account
-            title, fb_account = _publish_fb_task_metadata(url, title, fb_account, page=page)
+            if not exact_pcb_account_v1250:
+                fb_account = _get_fb_page_account(page, fallback_title=title) or fb_account
+            title, fb_account = _publish_fb_task_metadata(
+                url, title, fb_account, page=page, account_locked=bool(group_container_account_v131 or exact_pcb_account_v1250)
+            )
             if resolved and resolved != url:
-                _publish_fb_task_metadata(resolved, title, fb_account, page=page)
+                _publish_fb_task_metadata(
+                    resolved, title, fb_account, page=page, account_locked=bool(group_container_account_v131 or exact_pcb_account_v1250)
+                )
 
-            expected_photo_count = _estimate_expected_photo_count(
+            provisional_expected_photo_count = _estimate_expected_photo_count(
                 page,
                 ordered_links,
                 ordered_grid_items,
                 plus_count=plus_count_before,
             )
+            # v13.5 authoritative gallery-count contract.
+            #
+            # Facebook's "+N" badge is painted ON TOP OF the last visible tile.
+            # Therefore the total is:
+            #
+            #     visible tiles before the overlay + N
+            #   = (visible_grid_count - 1) + N
+            #
+            # Example:
+            #   5 visible tiles with "+3"  -> 4 + 3  = 7 total
+            #   5 visible tiles with "+76" -> 4 + 76 = 80 total
+            #
+            # v13.1 incorrectly treated the overlay tile as an additional visible
+            # photo and used grid + N, creating the exact permanent N-1 RETRY
+            # observed in 7/8 and 80/81 galleries.
+            #
+            # Keep exact-PCB links as independent evidence.  They may raise the
+            # target only when they prove more unique exact-post photo identities.
+            # A local defensive correction is intentionally retained here so an
+            # older fb_contracts.py cannot reintroduce the off-by-one failure.
+            try:
+                _scoped_link_count_v131 = 0
+                _scoped_fbid_v135 = set()
+                _pcb_id_v131 = ""
+                if str(dominant_pcb_key or "").startswith("pcb:"):
+                    _pcb_id_v131 = str(dominant_pcb_key).split(":", 1)[1]
+
+                for _u in ordered_links or []:
+                    _su = str(_u or "")
+                    _belongs_v135 = False
+                    if _pcb_id_v131:
+                        _belongs_v135 = (
+                            f"set=pcb.{_pcb_id_v131}" in _su
+                            or f"set=pcb%2E{_pcb_id_v131}" in _su
+                        )
+                    else:
+                        _belongs_v135 = _is_true_photo_link(_su)
+
+                    if not _belongs_v135:
+                        continue
+
+                    _m_v135 = re.search(r"[?&]fbid=(\d{8,})", _su, flags=re.I)
+                    if _m_v135:
+                        _scoped_fbid_v135.add(_m_v135.group(1))
+                    else:
+                        # Retain a bounded raw-link count only when no fbid is
+                        # exposed.  Unique fbids are preferred whenever possible.
+                        _scoped_link_count_v131 += 1
+
+                if _scoped_fbid_v135:
+                    _scoped_link_count_v131 += len(_scoped_fbid_v135)
+
+                _grid_v135 = len(ordered_grid_items or [])
+                _plus_v135 = max(0, int(plus_count_before or 0))
+
+                _plan_v131 = _contract_derive_gallery_plan(
+                    visible_grid_count=_grid_v135,
+                    plus_count=_plus_v135,
+                    scoped_link_count=_scoped_link_count_v131,
+                )
+
+                _overlay_target_v135 = 0
+                if _grid_v135 > 0 and _plus_v135 > 0:
+                    _overlay_target_v135 = max(1, _grid_v135 - 1) + _plus_v135
+
+                _contract_target_v135 = int(getattr(_plan_v131, "expected_count", 0) or 0)
+
+                # Defensive compatibility with pre-v13.5 fb_contracts.py:
+                # if it reports grid+plus, replace only that known-wrong count.
+                _legacy_wrong_target_v135 = (
+                    _grid_v135 + _plus_v135
+                    if _grid_v135 > 0 and _plus_v135 > 0
+                    else 0
+                )
+                if (
+                    _overlay_target_v135 > 0
+                    and _contract_target_v135 == _legacy_wrong_target_v135
+                    and _legacy_wrong_target_v135 == _overlay_target_v135 + 1
+                ):
+                    logger.warning(
+                        "FB v13.6 corrected legacy +N off-by-one contract: "
+                        f"contract={_contract_target_v135} -> overlay={_overlay_target_v135}, "
+                        f"grid={_grid_v135}, plus={_plus_v135}"
+                    )
+                    _contract_target_v135 = max(
+                        _overlay_target_v135,
+                        _scoped_link_count_v131,
+                    )
+
+                _trusted_target_v135 = max(
+                    int(provisional_expected_photo_count or 0),
+                    _contract_target_v135,
+                    _overlay_target_v135,
+                    _scoped_link_count_v131,
+                )
+
+                # _estimate_expected_photo_count() already uses the correct
+                # (4 + N) semantics for the common five-tile layout.  Never let
+                # the known legacy grid+N value raise it by exactly one.
+                if (
+                    _overlay_target_v135 > 0
+                    and _trusted_target_v135 == _legacy_wrong_target_v135
+                    and _legacy_wrong_target_v135 == _overlay_target_v135 + 1
+                    and _scoped_link_count_v131 <= _overlay_target_v135
+                ):
+                    _trusted_target_v135 = _overlay_target_v135
+
+                if _trusted_target_v135 > 0:
+                    provisional_expected_photo_count = _trusted_target_v135
+
+                logger.info(
+                    f"FB v13.6 gallery plan: target={provisional_expected_photo_count}, "
+                    f"grid={_grid_v135}, plus={_plus_v135}, "
+                    f"overlay_total={_overlay_target_v135 or '-'}, "
+                    f"unique_scoped_links={_scoped_link_count_v131}, "
+                    f"contract={_contract_target_v135}, "
+                    f"confidence={getattr(_plan_v131, 'confidence', '-')}, "
+                    f"reason={getattr(_plan_v131, 'reason', '-')}"
+                )
+            except Exception as _e:
+                logger.debug(f"FB v13.5 gallery plan skipped: {_e}")
             if explicit_story_single_mode:
                 logger.info(
                     f"FB v12.18 explicit story expected target forced: "
-                    f"{expected_photo_count}->1"
+                    f"{provisional_expected_photo_count}->1"
                 )
-                expected_photo_count = 1
+                provisional_expected_photo_count = 1
             if explicit_album_single_mode:
                 logger.info(
                     f"FB v12.23 album-context expected target forced: "
-                    f"{expected_photo_count}->1"
+                    f"{provisional_expected_photo_count}->1"
                 )
-                expected_photo_count = 1
-            logger.info(f"FB expected photo target={expected_photo_count}")
+                provisional_expected_photo_count = 1
+            logger.info(f"FB v14.1 provisional gallery evidence target={provisional_expected_photo_count}")
+
+            # v12.50: recover virtualized +N photo permalinks before the expensive
+            # image-harvest loop.  Only exact set=pcb links are accepted.
+            try:
+                if (
+                    provisional_expected_photo_count
+                    and int(provisional_expected_photo_count) > 1
+                    and plus_count_before
+                    and share_p_gallery_like_v1226
+                    and str(dominant_pcb_key or "").startswith("pcb:")
+                ):
+                    pcb_id_v1250 = str(dominant_pcb_key).split(":", 1)[1]
+                    exact_now_v1250 = [
+                        _u for _u in (ordered_links or [])
+                        if _is_true_photo_link(str(_u or ""))
+                        and (f"set=pcb.{pcb_id_v1250}" in str(_u) or f"set=pcb%2E{pcb_id_v1250}" in str(_u))
+                    ]
+                    if len(exact_now_v1250) < int(provisional_expected_photo_count):
+                        discovered_v1250 = _fb_v1250_discover_exact_pcb_links_from_viewer(
+                            context, exact_now_v1250, dominant_pcb_key, int(provisional_expected_photo_count)
+                        )
+                        added_v1250 = 0
+                        for _u in discovered_v1250:
+                            if _u not in ordered_links:
+                                ordered_links.append(_u)
+                                added_v1250 += 1
+                        logger.info(
+                            f"FB v12.50 exact-pcb pre-harvest merge: added={added_v1250}, "
+                            f"scoped_links={len([x for x in ordered_links if f'set=pcb.{pcb_id_v1250}' in str(x) or f'set=pcb%2E{pcb_id_v1250}' in str(x)])}, "
+                            f"target={provisional_expected_photo_count}"
+                        )
+            except Exception as _e:
+                logger.debug(f"FB v12.50 exact-pcb pre-harvest recovery skipped: {_e}")
 
             # v11.46 safety:
             # This uploaded full version does not include the later large-album
@@ -7013,17 +8881,20 @@ def _collect_fb_media_playwright(url: str):
             # does not raise NameError and does not alter normal gallery behavior.
             large_album_mode = False
 
-            if expected_photo_count and len(ordered_links) > expected_photo_count + 3:
+            if provisional_expected_photo_count and len(ordered_links) > provisional_expected_photo_count + 3:
                 logger.warning(
-                    f"FB bounded scope: ordered_links={len(ordered_links)} > expected={expected_photo_count}，"
+                    f"FB bounded scope: ordered_links={len(ordered_links)} > expected={provisional_expected_photo_count}，"
                     "後段多半是首頁/推薦連結，先裁切"
                 )
-                ordered_links = ordered_links[:expected_photo_count + 3]
+                ordered_links = ordered_links[:provisional_expected_photo_count + 3]
 
             link_items = []
             viewer_items = []
 
-            if ordered_grid_items or ordered_links:
+            if explicit_story_visible_pack_v1239:
+                link_items = [explicit_story_visible_pack_v1239]
+                logger.info("FB v12.39 explicit story link_items forced to single visible media")
+            elif ordered_grid_items or ordered_links:
                 # 主路徑：只處理真正 photo links；permalink/post 入口交給 viewer。
                 link_items = _build_photo_items_from_links(
                     page,
@@ -7047,26 +8918,108 @@ def _collect_fb_media_playwright(url: str):
                 scoped_manifest_count = len(manifest_ids or [])
                 scoped_link_count = len(link_items or [])
                 if (
-                    expected_photo_count
+                    provisional_expected_photo_count
                     and plus_count_before
                     and int(plus_count_before) <= 1
                     and dominant_pcb_key
                     and scoped_manifest_count >= 3
                     and scoped_manifest_count == scoped_link_count
-                    and int(expected_photo_count) > scoped_manifest_count
+                    and int(provisional_expected_photo_count) > scoped_manifest_count
                     and len(ordered_links or []) <= scoped_manifest_count + 1
                     and len(ordered_grid_items or []) <= scoped_manifest_count + 2
                 ):
                     logger.info(
-                        "FB v11.93 corrected +N mixed-context target by scoped manifest: "
-                        f"expected {expected_photo_count}->{scoped_manifest_count}, "
+                        "FB v14.1 pre-final evidence: scoped manifest correction: "
+                        f"expected {provisional_expected_photo_count}->{scoped_manifest_count}, "
                         f"plus={plus_count_before}, links={len(ordered_links or [])}, "
                         f"grid={len(ordered_grid_items or [])}, manifest={scoped_manifest_count}, "
                         f"pcb={dominant_pcb_key}"
                     )
-                    expected_photo_count = scoped_manifest_count
+                    provisional_expected_photo_count = scoped_manifest_count
             except Exception as _e:
                 logger.debug(f"FB v11.93 scoped manifest target correction skipped: {_e}")
+
+            # v12.42 exact-pcb manifest/grid target correction:
+            # Some share/p dialog pages show a +N overlay from the visible grid,
+            # but after scoping to the exact pcb post the reliable manifest proves
+            # only N real photos.  In the current failing "Nice" post:
+            #   expected=12, scoped links=6, grid=5, manifest=5, link_items=5.
+            # The old fast retry guard then waited for 12 and RETRY forever.
+            # Correct only when all exact-pcb scoped signals agree and no large
+            # album mode is active.
+            try:
+                normalized_count_v1242 = len(link_items or [])
+                manifest_count_v1242 = len(manifest_ids or [])
+                grid_count_v1242 = len(ordered_grid_items or [])
+                link_count_v1242 = len(ordered_links or [])
+                if (
+                    provisional_expected_photo_count
+                    and dominant_pcb_key
+                    and str(dominant_pcb_key).startswith("pcb:")
+                    and not plus_count_before
+                    and normalized_count_v1242 >= 2
+                    and manifest_count_v1242 == normalized_count_v1242
+                    and grid_count_v1242 <= normalized_count_v1242
+                    and link_count_v1242 <= normalized_count_v1242 + 1
+                    and int(provisional_expected_photo_count) > normalized_count_v1242
+                    and not large_album_mode
+                ):
+                    logger.info(
+                        "FB v14.1 pre-final evidence: exact-pcb manifest/grid correction: "
+                        f"expected {provisional_expected_photo_count}->{normalized_count_v1242}, "
+                        f"links={link_count_v1242}, grid={grid_count_v1242}, "
+                        f"manifest={manifest_count_v1242}, pcb={dominant_pcb_key}"
+                    )
+                    provisional_expected_photo_count = normalized_count_v1242
+            except Exception as _e:
+                logger.debug(f"FB v12.42 exact-pcb target correction skipped: {_e}")
+
+            # v13.6 authoritative +N target reconciliation.
+            #
+            # IMPORTANT:
+            # The centralized v13.5/v13.6 gallery plan above is the sole count
+            # authority.  Older v12.43 logic used:
+            #
+            #     visible_grid + N
+            #
+            # which is off by one because Facebook paints "+N" ON the last
+            # visible tile.  The correct overlay total is:
+            #
+            #     (visible_grid - 1) + N
+            #
+            # This downstream guard therefore may only CONFIRM the target.  It
+            # must never re-raise a corrected 7 -> 8 or 80 -> 81.
+            try:
+                if (
+                    provisional_expected_photo_count
+                    and plus_count_before
+                    and int(plus_count_before) > 0
+                    and len(ordered_grid_items or []) >= 2
+                    and not explicit_story_single_mode
+                    and not explicit_album_single_mode
+                ):
+                    _grid_v136 = len(ordered_grid_items or [])
+                    _plus_v136 = int(plus_count_before)
+                    _overlay_total_v136 = max(1, _grid_v136 - 1) + _plus_v136
+
+                    # Exact-PCB/manifest evidence is allowed to prove MORE than
+                    # the overlay count, but the overlay itself never raises by
+                    # the legacy +1 formula.
+                    if int(provisional_expected_photo_count) < _overlay_total_v136:
+                        logger.info(
+                            "FB v14.1 pre-final evidence: +N reconciliation raises provisional: "
+                            f"expected {provisional_expected_photo_count}->{_overlay_total_v136}, "
+                            f"grid={_grid_v136}, plus={_plus_v136}"
+                        )
+                        provisional_expected_photo_count = _overlay_total_v136
+                    else:
+                        logger.info(
+                            "FB v14.1 pre-final evidence: +N reconciliation confirmed: "
+                            f"target={provisional_expected_photo_count}, overlay_total={_overlay_total_v136}, "
+                            f"grid={_grid_v136}, plus={_plus_v136}"
+                        )
+            except Exception as _e:
+                logger.debug(f"FB v13.6 authoritative +N reconciliation skipped: {_e}")
 
             # v11.47 scoped ghost-link correction:
             # Some /share/ posts expose one extra set=pcb link that points to the post
@@ -7077,23 +9030,23 @@ def _collect_fb_media_playwright(url: str):
             try:
                 normalized_count = len(link_items or [])
                 if (
-                    expected_photo_count
+                    provisional_expected_photo_count
                     and not plus_count_before
                     and normalized_count >= 2
-                    and int(expected_photo_count) == normalized_count + 1
-                    and len(ordered_links or []) == int(expected_photo_count)
+                    and int(provisional_expected_photo_count) == normalized_count + 1
+                    and len(ordered_links or []) == int(provisional_expected_photo_count)
                     and len(ordered_grid_items or []) <= normalized_count
                     and len(manifest_ids or []) == normalized_count
                     and not large_album_mode
                 ):
                     logger.info(
-                        "FB v11.47 corrected one ghost photo link target: "
-                        f"expected {expected_photo_count}->{normalized_count}, "
+                        "FB v14.1 pre-final evidence: ghost-link correction: "
+                        f"expected {provisional_expected_photo_count}->{normalized_count}, "
                         f"ordered_links={len(ordered_links or [])}, "
                         f"grid={len(ordered_grid_items or [])}, "
                         f"normalized={normalized_count}, manifest={len(manifest_ids or [])}"
                     )
-                    expected_photo_count = normalized_count
+                    provisional_expected_photo_count = normalized_count
             except Exception as _e:
                 logger.debug(f"FB v11.47 ghost-link correction skipped: {_e}")
 
@@ -7109,8 +9062,8 @@ def _collect_fb_media_playwright(url: str):
             # large-album completeness guards remain strict.
             try:
                 if (
-                    expected_photo_count
-                    and int(expected_photo_count) == 2
+                    provisional_expected_photo_count
+                    and int(provisional_expected_photo_count) == 2
                     and not plus_count_before
                     and len(ordered_grid_items or []) <= 1
                     and len(ordered_links or []) <= 2
@@ -7119,14 +9072,14 @@ def _collect_fb_media_playwright(url: str):
                     and not large_album_mode
                 ):
                     logger.info(
-                        "FB v11.46 corrected duplicate single-photo target: "
-                        f"expected {expected_photo_count}->1, "
+                        "FB v14.1 pre-final evidence: single-photo correction: "
+                        f"expected {provisional_expected_photo_count}->1, "
                         f"ordered_links={len(ordered_links or [])}, "
                         f"grid={len(ordered_grid_items or [])}, "
                         f"link_items={len(link_items or [])}, "
                         f"manifest={len(manifest_ids or [])}"
                     )
-                    expected_photo_count = 1
+                    provisional_expected_photo_count = 1
             except Exception as _e:
                 logger.debug(f"FB v11.46 duplicate single-photo target correction skipped: {_e}")
 
@@ -7134,7 +9087,61 @@ def _collect_fb_media_playwright(url: str):
                 logger.warning(f"FB photo-link sequence 明顯不足: link_items={len(link_items)} / ordered_links={len(ordered_links)}，代表部分 photo link 開頁後仍回同一張或只給縮圖")
 
             # v11.15: Determine post media cluster BEFORE opening the viewer, so off-post
-            # recommendations never count toward expected_photo_count during harvesting.
+
+            # v14.1 IMMUTABLE GALLERY TARGET FINALIZATION ------------------
+            # All legacy evidence corrections above operate on
+            # provisional_expected_photo_count only.
+            # From this point onward, gallery_target is read-only.
+            try:
+                _final_grid_v141 = len(ordered_grid_items or [])
+                _final_plus_v141 = max(0, int(plus_count_before or 0))
+
+                _final_pcb_id_v141 = ""
+                if str(dominant_pcb_key or "").startswith("pcb:"):
+                    _final_pcb_id_v141 = str(dominant_pcb_key).split(":", 1)[1]
+
+                _final_scoped_photo_ids_v141 = set()
+                for _u in ordered_links or []:
+                    _su = str(_u or "")
+                    if _final_pcb_id_v141:
+                        if not (
+                            f"set=pcb.{_final_pcb_id_v141}" in _su
+                            or f"set=pcb%2E{_final_pcb_id_v141}" in _su
+                        ):
+                            continue
+                    _m_v141 = re.search(r"[?&]fbid=(\d{8,})", _su, flags=re.I)
+                    if _m_v141:
+                        _final_scoped_photo_ids_v141.add(_m_v141.group(1))
+
+                _final_manifest_count_v141 = len(manifest_ids or [])
+                gallery_plan_v141 = _contract_finalize_gallery_plan(
+                    provisional_expected_photo_count,
+                    _final_grid_v141,
+                    _final_plus_v141,
+                    len(_final_scoped_photo_ids_v141),
+                    _final_manifest_count_v141,
+                    explicit_single=bool(
+                        explicit_story_single_mode or explicit_album_single_mode
+                    ),
+                )
+                gallery_target = int(gallery_plan_v141.expected_count or 0)
+
+                logger.info(
+                    "FB v14.1 FINAL GalleryPlan locked: "
+                    f"target={gallery_target}, "
+                    f"grid={gallery_plan_v141.visible_grid_count}, "
+                    f"plus={gallery_plan_v141.plus_count}, "
+                    f"scoped_ids={gallery_plan_v141.scoped_link_count}, "
+                    f"manifest={_final_manifest_count_v141}, "
+                    f"confidence={gallery_plan_v141.confidence}, "
+                    f"reason={gallery_plan_v141.reason}"
+                )
+            except Exception as _e:
+                logger.error(f"FB v14.1 GalleryPlan finalization failed: {_e}")
+                return "RETRY", "Facebook gallery target finalization failed"
+
+            # V14.1 IMMUTABLE TARGET LOCK -----------------------------------
+            # recommendations never count toward the immutable gallery_target during harvesting.
             pre_viewer_cluster = _dominant_media_cluster(link_items, min_count=2)
             # v12.27:
             # For share/p gallery posts, FB media IDs in the same pcb post can
@@ -7175,22 +9182,102 @@ def _collect_fb_media_playwright(url: str):
                     )
                     post_sequence = []
                 else:
-                    post_sequence = _collect_viewer_sequence_from_url(
-                        context,
-                        resolved,
-                        label="post",
-                        is_photo_page=False,
-                        target_count=expected_photo_count or None,
-                        stale_threshold=4,
-                        max_turns=max(24, (expected_photo_count or 16) + 10),
-                        allowed_cluster=pre_viewer_cluster or None,
+                    fast_share_gallery_v1250 = bool(
+                        share_p_gallery_like_v1226
+                        and plus_count_before
+                        and gallery_target
+                        and int(gallery_target) <= 20
+                        and str(dominant_pcb_key or "").startswith("pcb:")
                     )
+                    unique_links_v1250 = len(_dedupe_items_by_media_id(link_items or []))
+                    if fast_share_gallery_v1250 and unique_links_v1250 >= int(gallery_target):
+                        logger.info(
+                            f"FB v12.50 exact-pcb link manifest already complete: "
+                            f"{unique_links_v1250}/{gallery_target}; skip post viewer walk"
+                        )
+                        post_sequence = []
+                    else:
+                        post_sequence = _collect_viewer_sequence_from_url(
+                            context,
+                            resolved,
+                            label="post",
+                            is_photo_page=False,
+                            target_count=gallery_target or None,
+                            stale_threshold=(3 if fast_share_gallery_v1250 else 4),
+                            max_turns=(max(10, min(16, int(gallery_target or 8) + 5)) if fast_share_gallery_v1250 else max(24, (gallery_target or 16) + 10)),
+                            allowed_cluster=pre_viewer_cluster or None,
+                            fast_mode=fast_share_gallery_v1250,
+                        )
                 viewer_sequences.append(post_sequence)
+
+                # v12.48: bounded multi-entry recovery for share/p +N galleries.
+                #
+                # v11.13 intentionally skipped opening individual photo pages in
+                # post-scoped mode because generic photo pages can redirect into
+                # recommendations/albums.  That is still correct for normal posts.
+                # However, for explicit /share/p/ galleries with a proven set=pcb
+                # scope and +N overlay, the current post viewer can loop at 7/8
+                # while each scoped photo permalink may start the same viewer at a
+                # different segment.  Open only the already-scoped pcb photo links,
+                # keep the same final strict completeness guard, and never accept
+                # off-post links.
+                try:
+                    if (
+                        gallery_target
+                        and int(gallery_target) > 1
+                        and plus_count_before
+                        and share_p_gallery_like_v1226
+                        and str(dominant_pcb_key or "").startswith("pcb:")
+                    ):
+                        current_n_v1248 = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, *viewer_sequences)))
+                        if current_n_v1248 < int(gallery_target):
+                            pcb_id_v1248 = str(dominant_pcb_key).split(":", 1)[1]
+                            scoped_links_v1248 = []
+                            for _lnk in ordered_links or []:
+                                try:
+                                    _s = str(_lnk or "")
+                                    if (
+                                        _is_true_photo_link(_s)
+                                        and (f"set=pcb.{pcb_id_v1248}" in _s or f"set=pcb%2E{pcb_id_v1248}" in _s)
+                                    ):
+                                        if _s not in scoped_links_v1248:
+                                            scoped_links_v1248.append(_s)
+                                except Exception:
+                                    continue
+
+                            logger.info(
+                                f"FB v12.48 share/p multi-entry recovery start: "
+                                f"current={current_n_v1248}, expected={gallery_target}, "
+                                f"scoped_links={len(scoped_links_v1248)}, pcb={dominant_pcb_key}"
+                            )
+                            for _idx, _lnk in enumerate(scoped_links_v1248[:2], 1):
+                                now_n_v1248 = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, *viewer_sequences)))
+                                if now_n_v1248 >= int(gallery_target):
+                                    break
+                                seq_v1248 = _collect_viewer_sequence_from_url(
+                                    context,
+                                    _lnk,
+                                    label=f"share-p-photo{_idx}",
+                                    is_photo_page=True,
+                                    target_count=int(gallery_target),
+                                    stale_threshold=2,
+                                    max_turns=max(6, min(10, int(gallery_target) + 2)),
+                                    allowed_cluster=None,
+                                    fast_mode=True,
+                                )
+                                viewer_sequences.append(seq_v1248)
+                                new_n_v1248 = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, *viewer_sequences)))
+                                logger.info(
+                                    f"FB v12.48 share/p multi-entry recovery progress: "
+                                    f"entry={_idx}, collected={len(seq_v1248)}, unique={new_n_v1248}/{gallery_target}"
+                                )
+                except Exception as _e:
+                    logger.debug(f"FB v12.48 share/p multi-entry recovery skipped: {_e}")
 
                 # v11.13: In post-scoped mode, never open individual photo pages
                 # after post viewer. Logged-in Facebook often redirects those photo pages
                 # to feed/recommendation contexts and pollutes the output.
-                if expected_photo_count:
+                if gallery_target:
                     logger.info(
                         "FB v11.13 post-scoped mode: 略過 photo1/photo2 補挖，"
                         "只保留主貼文 viewer + scoped link candidates"
@@ -7218,11 +9305,105 @@ def _collect_fb_media_playwright(url: str):
                 viewer_items = _aggregate_unique_items(*viewer_sequences)
                 logger.info(f"FB viewer sequence count={len(viewer_items)}")
 
+                # v13.3: re-parse structured payloads *after* the viewer walk.  The
+                # hidden last slide is frequently serialized only after ArrowRight
+                # navigation, so parsing the buffer only before the viewer produced
+                # deterministic target-1 failures (7/8, 80/81).  Accept only photo
+                # permalinks carrying the already-proven exact pcb id.
+                try:
+                    if (
+                        gallery_target
+                        and plus_count_before
+                        and share_p_gallery_like_v1226
+                        and str(dominant_pcb_key or "").startswith("pcb:")
+                    ):
+                        current_v133 = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
+                        if current_v133 < int(gallery_target):
+                            late_links_all_v133 = _fb_v131_collect_exact_pcb_links_from_payloads(
+                                structured_payloads_v131, dominant_pcb_key
+                            )
+                            known_fbid_v133 = set()
+                            for _known in ordered_links or []:
+                                _m = re.search(r"[?&]fbid=(\d{8,})", str(_known or ""), flags=re.I)
+                                if _m:
+                                    known_fbid_v133.add(_m.group(1))
+                            late_links_v133 = []
+                            for _u in late_links_all_v133:
+                                _m = re.search(r"[?&]fbid=(\d{8,})", str(_u or ""), flags=re.I)
+                                _fid = _m.group(1) if _m else ""
+                                if _fid and _fid not in known_fbid_v133:
+                                    known_fbid_v133.add(_fid)
+                                    late_links_v133.append(_u)
+                                    ordered_links.append(_u)
+                            if late_links_v133:
+                                missing_v133 = max(1, int(gallery_target) - current_v133)
+                                logger.info(
+                                    f"FB v13.3 late exact-pcb payload reconciliation: "
+                                    f"new_links={len(late_links_v133)}, current={current_v133}/{gallery_target}, "
+                                    f"payloads={len(structured_payloads_v131)}"
+                                )
+                                # Open only the newly-proven exact links, bounded by the
+                                # number still missing plus two alternates.
+                                late_items_v133 = _build_photo_items_from_links(
+                                    page,
+                                    late_links_v133[: missing_v133 + 2],
+                                    network_items=[],
+                                    grid_items=[],
+                                ) or []
+                                if late_items_v133:
+                                    link_items = _aggregate_unique_items(link_items, late_items_v133)
+                                    merged_v133 = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
+                                    logger.info(
+                                        f"FB v13.3 late exact-pcb items merged: "
+                                        f"items={len(late_items_v133)}, unique={merged_v133}/{gallery_target}"
+                                    )
+                except Exception as _e:
+                    logger.debug(f"FB v13.3 late payload reconciliation skipped: {_e}")
+
+                # v12.51: only when an exact share/p +N gallery is missing exactly
+                # one media item, run one bounded high-effort tail pass.  This is
+                # deliberately narrow so normal galleries keep the fast v12.50 path.
+                try:
+                    if (
+                        gallery_target
+                        and share_p_gallery_like_v1226
+                        and plus_count_before
+                        and str(dominant_pcb_key or "").startswith("pcb:")
+                    ):
+                        current_unique_v1251 = _dedupe_items_by_media_id(
+                            _aggregate_unique_items(link_items, viewer_items)
+                        )
+                        if len(current_unique_v1251) == int(gallery_target) - 1:
+                            pcb_id_v1251 = str(dominant_pcb_key).split(":", 1)[1]
+                            exact_links_v1251 = [
+                                _u for _u in (ordered_links or [])
+                                if _is_true_photo_link(str(_u or ""))
+                                and (
+                                    f"set=pcb.{pcb_id_v1251}" in str(_u)
+                                    or f"set=pcb%2E{pcb_id_v1251}" in str(_u)
+                                )
+                            ]
+                            recovered_v1251 = _fb_v1251_near_complete_tail_recovery(
+                                context,
+                                exact_links_v1251,
+                                current_unique_v1251,
+                                int(gallery_target),
+                                dominant_pcb_key,
+                            )
+                            viewer_items = _aggregate_unique_items(viewer_items, recovered_v1251)
+                            logger.info(
+                                f"FB v12.51 tail recovery merged: "
+                                f"unique={len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))}/"
+                                f"{gallery_target}"
+                            )
+                except Exception as _e:
+                    logger.debug(f"FB v12.51 near-complete tail recovery skipped: {_e}")
+
                 # v11.22.1 Fast Retry Guard:
                 # The old v11.21 slow recovery can run for many minutes and may keep logging after
                 # the worker has timed out. If the primary Theater pass is short, immediately ask
                 # the worker for a clean browser-context retry instead of looping stale frames.
-                if expected_photo_count:
+                if gallery_target:
                     try:
                         before_retry_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
                     except Exception:
@@ -7230,8 +9411,8 @@ def _collect_fb_media_playwright(url: str):
 
                     if (
                         plus_count_before
-                        and int(expected_photo_count) >= 8
-                        and before_retry_n == int(expected_photo_count) - 1
+                        and int(gallery_target) >= 8
+                        and before_retry_n == int(gallery_target) - 1
                     ):
                         viewer_items = _recover_full_gallery_near_complete_v1225(
                             context,
@@ -7240,7 +9421,7 @@ def _collect_fb_media_playwright(url: str):
                             ordered_grid_items=ordered_grid_items,
                             link_items=link_items,
                             viewer_items=viewer_items,
-                            expected_photo_count=int(expected_photo_count),
+                            expected_photo_count=int(gallery_target),
                             title=title,
                             url=url,
                             resolved=resolved,
@@ -7251,43 +9432,47 @@ def _collect_fb_media_playwright(url: str):
                         except Exception:
                             before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
 
-                    if before_retry_n < expected_photo_count:
-                        if plus_count_before and int(expected_photo_count) >= 6:
+                    if before_retry_n < gallery_target:
+                        if plus_count_before and int(gallery_target) >= 6:
                             viewer_items = _fb_v1232_pack_dicts(_fb_v1229_append_capture_items_before_guard(
                                 viewer_items,
-                                expected_photo_count=int(expected_photo_count),
+                                expected_photo_count=int(gallery_target),
                             ))
                             try:
                                 before_retry_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
                             except Exception:
                                 before_retry_n = len(_aggregate_unique_items(link_items, viewer_items))
 
-                        if before_retry_n < expected_photo_count:
+                        if before_retry_n < gallery_target:
                             logger.info(
-                                f"FB v11.22.1 fast retry guard: incomplete={before_retry_n}/target={expected_photo_count}; "
-                                "skip slow recovery and retry fresh context"
+                                f"FB v12.46 defer fast retry until grid tile recovery: "
+                                f"incomplete={before_retry_n}/target={gallery_target}; "
+                                "allow grid-tile mode/final completeness guard before returning RETRY"
                             )
-                            return "RETRY", f"Facebook viewer incomplete {before_retry_n}/{expected_photo_count}; retry fresh context"
+                            # Do not return here.  The v11.22 grid tile mode below can still
+                            # recover the hidden +N tile image by physical grid order.  If it
+                            # cannot prove the missing item, the final strict completeness guard
+                            # will return RETRY without moving partial/duplicate outputs.
 
             except Exception as e:
                 logger.warning(f"FB viewer fallback 失敗: {e}")
 
             # v11.22 Grid Tile Mode: if Theater Viewer still misses one or more tiles,
             # extract by physical grid order from the +N dialog/current page.
-            if expected_photo_count:
+            if gallery_target:
                 try:
                     current_unique_n = len(_dedupe_items_by_media_id(_aggregate_unique_items(link_items, viewer_items)))
                 except Exception:
                     current_unique_n = len(_aggregate_unique_items(link_items, viewer_items))
-                if current_unique_n < expected_photo_count:
+                if current_unique_n < gallery_target:
                     logger.info(
-                        f"FB v11.22 grid tile mode trigger: unique={current_unique_n}/target={expected_photo_count}"
+                        f"FB v11.22 grid tile mode trigger: unique={current_unique_n}/target={gallery_target}"
                     )
                     grid_tile_items = _collect_grid_tile_mode_items(
                         context,
                         page,
                         pcb_key=dominant_pcb_key,
-                        expected_count=expected_photo_count,
+                        expected_count=gallery_target,
                         allowed_cluster=pre_viewer_cluster or None,
                     )
                     if grid_tile_items:
@@ -7342,7 +9527,7 @@ def _collect_fb_media_playwright(url: str):
             # v11.22: when grid tile mode found a full/near-full ordered set, use its physical order.
             # This is the only reliable way to solve the missing visual 10.jpg and 6/7 swaps.
             try:
-                if expected_photo_count and grid_tile_items and len(_dedupe_items_by_media_id(grid_tile_items)) >= expected_photo_count - 1:
+                if gallery_target and grid_tile_items and len(_dedupe_items_by_media_id(grid_tile_items)) >= gallery_target - 1:
                     logger.info(
                         f"FB v11.22 grid tile mode order preferred: {len(grid_tile_items)} items"
                     )
@@ -7363,12 +9548,12 @@ def _collect_fb_media_playwright(url: str):
             viewer_complete_incomplete_manifest_mode = False
             if (
                 plus_count_before
-                and expected_photo_count
-                and len(manifest_ids_for_filter) < int(expected_photo_count)
+                and gallery_target
+                and len(manifest_ids_for_filter) < int(gallery_target)
             ):
                 logger.info(
                     f"FB v11.96 +N full-gallery mode: keep viewer items beyond manifest "
-                    f"manifest={len(manifest_ids_for_filter)}, expected={expected_photo_count}"
+                    f"manifest={len(manifest_ids_for_filter)}, expected={gallery_target}"
                 )
                 manifest_ids_for_filter = []
                 viewer_complete_incomplete_manifest_mode = True
@@ -7381,16 +9566,16 @@ def _collect_fb_media_playwright(url: str):
             # manifest is incomplete, preserve the viewer sequence instead of
             # applying manifest/cluster narrowing.
             if (
-                expected_photo_count
-                and len(viewer_items) >= int(expected_photo_count)
+                gallery_target
+                and len(viewer_items) >= int(gallery_target)
                 and len(manifest_ids_for_filter) > 0
-                and len(manifest_ids_for_filter) < int(expected_photo_count)
-                and len(link_items) < int(expected_photo_count)
+                and len(manifest_ids_for_filter) < int(gallery_target)
+                and len(link_items) < int(gallery_target)
             ):
                 logger.info(
                     f"FB v12.22 viewer-complete incomplete-manifest mode: "
                     f"viewer={len(viewer_items)}, manifest={len(manifest_ids_for_filter)}, "
-                    f"link_items={len(link_items)}, expected={expected_photo_count}; "
+                    f"link_items={len(link_items)}, expected={gallery_target}; "
                     "skip manifest/cluster narrowing"
                 )
                 manifest_ids_for_filter = []
@@ -7416,7 +9601,7 @@ def _collect_fb_media_playwright(url: str):
             # v11.16: final cleanup before bounding.
             # 1) For photo posts, MP4/ad/reel responses must not count toward the photo target.
             # 2) Sort by FB CDN media id, not by interception time. This fixes 6/7/8 order jumps.
-            if expected_photo_count:
+            if gallery_target:
                 before_photo_clean_n = len(viewer_items)
                 viewer_items = _drop_video_packs_for_photo_post(viewer_items)
                 if len(viewer_items) != before_photo_clean_n:
@@ -7425,7 +9610,7 @@ def _collect_fb_media_playwright(url: str):
                     )
 
                 if (
-                    expected_photo_count
+                    gallery_target
                     and 'manifest_ids_for_filter' in locals()
                     and not manifest_ids_for_filter
                     and (
@@ -7458,12 +9643,12 @@ def _collect_fb_media_playwright(url: str):
                         f"FB v11.19 pre-boundary media-id dedupe: items {before_dedupe_n}->{len(viewer_items)}"
                     )
 
-            if expected_photo_count and len(viewer_items) > expected_photo_count:
+            if gallery_target and len(viewer_items) > gallery_target:
                 logger.warning(
-                    f"FB bounded scope: candidate count={len(viewer_items)} > expected={expected_photo_count}，"
+                    f"FB bounded scope: candidate count={len(viewer_items)} > expected={gallery_target}，"
                     "裁切到目標張數，避免側邊欄/推薦貼文混入"
                 )
-                viewer_items = viewer_items[:expected_photo_count]
+                viewer_items = viewer_items[:gallery_target]
 
             if explicit_album_single_mode:
                 forced_single = _force_single_photo_items_v1223(link_items, viewer_items)
@@ -7520,25 +9705,25 @@ def _collect_fb_media_playwright(url: str):
                 return "RETRY", "Facebook album-context expected exactly one proven photo"
 
             if (
-                expected_photo_count
-                and int(expected_photo_count) > 1
-                and len(viewer_items) >= int(expected_photo_count)
+                gallery_target
+                and int(gallery_target) > 1
+                and len(viewer_items) >= int(gallery_target)
                 and (
                     plus_count_before
                     or ('viewer_complete_incomplete_manifest_mode' in locals() and viewer_complete_incomplete_manifest_mode)
                     or (
                         str(dominant_pcb_key or "").startswith("pcb:")
-                        and len(_fb_v1232_pack_dicts(link_items or [])) >= int(expected_photo_count)
+                        and len(_fb_v1232_pack_dicts(link_items or [])) >= int(gallery_target)
                     )
                     or (
                         str(dominant_pcb_key or "").startswith("pcb:")
-                        and len(_fb_v1232_pack_dicts(viewer_items or [])) >= int(expected_photo_count)
+                        and len(_fb_v1232_pack_dicts(viewer_items or [])) >= int(gallery_target)
                     )
                 )
             ):
                 logger.info(
                     f"FB v12.36 exact-gallery best-available source mode enabled: "
-                    f"items={len(viewer_items)}, expected={expected_photo_count}; "
+                    f"items={len(viewer_items)}, expected={gallery_target}; "
                     "high-res variants are still tried first"
                 )
                 for _pack in _fb_v1232_pack_dicts(viewer_items):
@@ -7562,45 +9747,52 @@ def _collect_fb_media_playwright(url: str):
             )
 
             if (
-                expected_photo_count
-                and success_count < int(expected_photo_count)
-                and int(expected_photo_count) > 1
+                gallery_target
+                and success_count < int(gallery_target)
+                and int(gallery_target) > 1
                 and (
                     plus_count_before
                     or str(dominant_pcb_key or "").startswith("pcb:")
-                    or len(viewer_items or []) >= int(expected_photo_count)
+                    or len(viewer_items or []) >= int(gallery_target)
                 )
             ):
                 success_count, ordered_output_files = _fb_v1228_fill_outputs_from_captures(
                     ordered_output_files,
                     success_count=success_count,
-                    expected_photo_count=int(expected_photo_count),
+                    expected_photo_count=int(gallery_target),
                 )
 
             if success_count <= 0:
-                if expected_photo_count and expected_photo_count > 1:
+                if gallery_target and gallery_target > 1:
                     return "RETRY", (
                         "Facebook gallery candidates were collected but all failed "
                         "resolution/download validation; retry fresh context"
                     )
                 return "FAILED", "Facebook Playwright 有抓到媒體 URL，但全部下載失敗"
 
-            # v11.23.2 Strict Completeness Guard:
-            # For multi-photo posts, incomplete Playwright output must be RETRY.
-            # Never move partial files and never let the outer download() fall back to yt-dlp,
-            # otherwise Facebook share/photo posts can be incorrectly finalized as a .mp4 video.
-            if expected_photo_count and expected_photo_count > 1 and success_count < expected_photo_count:
+            # v13.0 Centralized gallery contract.  This preserves the legacy strict
+            # behavior, but the decision now lives in one pure/tested contract instead
+            # of being reimplemented by successive patches.
+            _gallery_audit = _contract_audit_gallery_completion(
+                expected_count=gallery_target,
+                unique_output_count=success_count,
+            )
+            if not _gallery_audit.complete:
                 logger.warning(
-                    f"FB strict completeness guard: output={success_count}/target={expected_photo_count}; "
-                    "return RETRY and block yt-dlp fallback"
+                    f"FB v14.1 strict completeness guard: "
+                    f"output={_gallery_audit.unique_output_count}/target={_gallery_audit.expected_count}; "
+                    f"reason={_gallery_audit.reason}; return RETRY and block yt-dlp fallback"
                 )
                 clear_temp()
-                return "RETRY", f"Facebook gallery incomplete {success_count}/{expected_photo_count}; retry fresh context"
+                return "RETRY", (
+                    f"Facebook gallery incomplete {_gallery_audit.unique_output_count}/"
+                    f"{_gallery_audit.expected_count}; retry fresh context"
+                )
 
-            if expected_photo_count and success_count >= expected_photo_count and ordered_output_files:
+            if gallery_target and success_count >= gallery_target and ordered_output_files:
                 logger.info(
                     f"FB v12.02 ordered move exact-count completion: "
-                    f"outputs={len(ordered_output_files)}, expected={expected_photo_count}"
+                    f"outputs={len(ordered_output_files)}, expected={gallery_target}"
                 )
                 if move_files_ordered(title, ordered_output_files):
                     return "SUCCESS", ""
@@ -7804,18 +9996,19 @@ def download(url: str):
         )
         result_box[0] = (status1, error1)
 
-    t = threading.Thread(
-        target=_run,
-        daemon=True,
-    )
-
-    t.start()
-    t.join(_DL_TIMEOUT)
-
-    if t.is_alive():
-        logger.error(f"Facebook 下載超時: {url}")
-        clear_temp()
-        return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
+    # v12.37:
+    # The worker itself already runs downloads off the GUI thread.  The old
+    # outer daemon timeout could return while Playwright was still harvesting a
+    # large gallery, leaving the persistent FB profile in use and causing every
+    # following FB task to fail at launch with "Target page/context/browser has
+    # been closed".  Run the task synchronously under a module lock so a large
+    # gallery either completes or fails cleanly before the next FB task starts.
+    with _FB_DOWNLOAD_LOCK:
+        try:
+            _run()
+        except Exception as e:
+            logger.exception(f"FB v12.37 uncaught download error: {e}")
+            result_box[0] = _classify_error(str(e))
 
     result = result_box[0] or ("FAILED", "未知錯誤")
     status, reason = result

@@ -1,3 +1,4 @@
+# v12.18 Copy Post Title Context Menu
 # v12.17 Open Downloaded Item Context Menu
 # v12.16 Auto Reset Filter on Reload
 # v12.15 Open download_link.txt + Preserve link.txt Actions
@@ -993,6 +994,10 @@ class App:
             label="查看完整連結",
             command=self._show_context_url,
         )
+        self._tree_context_menu.add_command(
+            label="複製 Post Title",
+            command=self._copy_context_post_title,
+        )
         self._tree_context_menu.add_separator()
         self._tree_context_menu.add_command(
             label="開啟該連結下載位置",
@@ -1346,6 +1351,56 @@ class App:
 
         self.status_var.set(f"已顯示下載檔：{os.path.basename(path)}")
         self._open_path_in_explorer(path, reveal=True)
+
+    def _get_context_post_title(self) -> str:
+        """Return full Post Title for the right-clicked / selected row."""
+        iid = self._tree_context_iid or self._get_selected_tree_iid()
+
+        # Prefer task metadata because Treeview value can be shortened/truncated.
+        task_map = getattr(self, "_tree_task_by_iid", {}) or {}
+        if iid and iid in task_map:
+            title = str((task_map.get(iid) or {}).get("title", "") or "").strip()
+            if title:
+                return title
+
+        url = self._tree_context_url_snapshot or ""
+        if not url and iid:
+            url = self._tree_url_by_iid.get(iid, "")
+
+        if url:
+            try:
+                for task in queue_manager.get_snapshot():
+                    if str(task.get("url", "") or "") == url:
+                        title = str(task.get("title", "") or "").strip()
+                        if title:
+                            return title
+            except Exception:
+                pass
+
+        try:
+            vals = self.tree.item(iid, "values") if iid else ()
+            if vals and len(vals) >= 3:
+                return str(vals[2] or "").strip()
+        except Exception:
+            pass
+
+        return ""
+
+    def _copy_context_post_title(self):
+        """Right-click: copy the selected row's Post Title."""
+        title = self._get_context_post_title()
+        if not title:
+            messagebox.showwarning(
+                "沒有 Post Title",
+                "這筆任務目前沒有可複製的 Post Title。",
+                parent=self.root,
+            )
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(title)
+        self.root.update()
+        self.status_var.set(f"已複製 Post Title：{title[:80]}")
 
     def _copy_selected_url(self, _event=None):
         """Ctrl+C / 雙擊：複製目前選取列完整 URL。"""

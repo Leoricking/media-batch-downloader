@@ -92,45 +92,37 @@ def _extract_urls_from_text(text: str) -> list[str]:
 
 
 def _task_identity_key(url: str) -> str:
-    """Return a conservative identity key used for queue dedupe/metadata matching.
-
-    v12.10:
-    Instagram share URLs can differ by ?igsh=... while pointing to the same
-    shortcode.  Profile expansion must not enqueue the same post twice merely
-    because one copy is /p/<code>/ and another is /reel/<code>/ or has query
-    parameters.
+    """Return a conservative identity key used only for queue dedupe/metadata.
 
     v12.11:
-    Facebook download stages may publish metadata using the original URL, a
-    resolved/canonical URL, a fragment-stripped URL, or a media URL.  Exact string
-    matching is therefore not enough for FB story/reel rows.  Use stable FB
-    identities so update_task_title/update_task_account can update the visible
-    GUI row after download.
+    Facebook download stages can publish metadata using a resolved URL, a
+    fragment-stripped URL, or a canonical media URL.  Exact string comparison is
+    therefore insufficient for FB story/reel rows.  Add stable FB identities so
+    update_task_title/update_task_account can find the visible GUI row.
     """
     clean = (url or "").strip()
     if not clean:
         return ""
 
-    # URL fragment never identifies a different IG/FB media task.
-    clean_no_fragment = clean.split("#", 1)[0].strip()
+    # Fragments never identify different FB/IG media.
+    clean_no_fragment = clean.split("#", 1)[0]
     low = clean_no_fragment.lower()
 
     if "instagram.com" in low:
         m = re.search(r"/(?:p|reel|reels)/([^/?#&]+)", clean_no_fragment, flags=re.I)
         if m:
             return f"instagram:{m.group(1)}"
-        return clean_no_fragment
 
     if "facebook.com" in low or "fb.watch" in low:
         raw = clean_no_fragment
 
-        # Explicit story/post URLs. story_fbid is the strongest identity for
-        # story.php?story_fbid=... tasks.
+        # Explicit story/post URLs.  story_fbid is the strongest identity for
+        # this user's failing case.
         m = re.search(r"[?&]story_fbid=([0-9]{8,})", raw, flags=re.I)
         if m:
             return f"facebook:story:{m.group(1)}"
 
-        # post_id can be pageid_storyid; preserve full value when present.
+        # post_id may be pageid_storyid; keep full value when present.
         m = re.search(r"[?&]post_id=([0-9_]{8,})", raw, flags=re.I)
         if m:
             return f"facebook:post:{m.group(1)}"
@@ -140,7 +132,7 @@ def _task_identity_key(url: str) -> str:
         if m:
             return f"facebook:photo:{m.group(1)}"
 
-        # Reel / Watch / Video identity.
+        # Reel/watch/video identity.
         for pat in [
             r"/(?:reel|reels)/([0-9]{6,})",
             r"/watch/reel/([0-9]{6,})",
@@ -151,7 +143,7 @@ def _task_identity_key(url: str) -> str:
             if m:
                 return f"facebook:video:{m.group(1)}"
 
-        # Short share IDs are stable for the same submitted share task.
+        # Short share IDs are stable enough for the same submitted link.
         for pat in [
             r"/share/(?:r|v|p)/([^/?#&]+)",
             r"/share/([^/?#&]+)",
@@ -457,25 +449,14 @@ def add_tasks(urls: list[str]) -> dict:
     duplicated = 0
     with _LOCK:
         existing = {t.get("url") for t in _TASKS}
-        existing_keys = {
-            _task_identity_key(t.get("url", ""))
-            for t in _TASKS
-            if t.get("url")
-        }
-        processed_keys = {_task_identity_key(u) for u in _PROCESSED if u}
-
         for raw in urls or []:
             url = (raw or "").strip()
             if not url:
                 continue
-
-            key = _task_identity_key(url)
-
-            if url in existing or (key and key in existing_keys):
+            if url in existing:
                 duplicated += 1
                 continue
-
-            if url in _PROCESSED or (key and key in processed_keys):
+            if url in _PROCESSED:
                 skipped += 1
                 _TASKS.append({
                     "url": url,
@@ -500,8 +481,6 @@ def add_tasks(urls: list[str]) -> dict:
                     "updated_at": time.time(),
                 })
             existing.add(url)
-            if key:
-                existing_keys.add(key)
         _recompute_runtime_counts_locked()
     # 相容舊版 / 新版 GUI 鍵名：
     # - 舊 queue_manager 回傳 skipped / duplicated

@@ -1,3 +1,4 @@
+# v12.33 Profile Output Folder Thread Fix
 # v12.32 Profile Verified Tolerance Fix
 # v12.31 Rate-Limit Terminal BLOCKED Fix
 # v12.30 Rate-Limit Zero-Media Classification Fix
@@ -1086,12 +1087,24 @@ def _get_profile_owner_for_url(url: str) -> str:
 
 
 def _set_current_profile_output_owner(owner: str) -> None:
+    """Set per-thread profile output root owner.
+
+    v12.33 note:
+    _DOWNLOAD_CONTEXT is threading.local().  The worker launches the real IG
+    download inside an inner timeout thread, so setting this only in the parent
+    thread is not enough.  download()._run() must set it again inside that
+    inner thread before move_files().
+    """
     owner = (owner or "").strip()
     if owner:
         try:
             _DOWNLOAD_CONTEXT.profile_owner = _safe_output_name(owner, "Instagram_Profile", max_len=48)
         except Exception:
             _DOWNLOAD_CONTEXT.profile_owner = owner[:48]
+        try:
+            logger.info(f"IG v12.33 profile output root enabled: {_DOWNLOAD_CONTEXT.profile_owner}")
+        except Exception:
+            pass
     else:
         try:
             _DOWNLOAD_CONTEXT.profile_owner = ""
@@ -1125,6 +1138,12 @@ def move_files(title: str, fallback_name: str = "Instagram_Post") -> bool:
 
     output_root = _get_current_download_root()
     os.makedirs(output_root, exist_ok=True)
+    try:
+        owner_for_log = getattr(_DOWNLOAD_CONTEXT, "profile_owner", "") or ""
+        if owner_for_log:
+            logger.info(f"IG v12.33 move_files profile root: {output_root}")
+    except Exception:
+        pass
 
     candidate_names = []
     for raw in [title, fallback_name, "Instagram_Post"]:
@@ -8868,7 +8887,10 @@ def download(url: str):
     if _L is None:
         setup()
 
-    _set_current_profile_output_owner(_get_profile_owner_for_url(url))
+    # v12.33: Capture the remembered profile owner once.  It will be applied
+    # both in the worker thread and inside the inner timeout thread.
+    profile_owner_for_task = _get_profile_owner_for_url(url)
+    _set_current_profile_output_owner(profile_owner_for_task)
     try:
         _DOWNLOAD_CONTEXT.persistent_profile_attempted = False
     except Exception:
@@ -8881,6 +8903,11 @@ def download(url: str):
     result_box = [(None, None)]
 
     def _run():
+        # v12.33: threading.local() does not inherit values from the parent
+        # thread.  Re-apply the profile owner here so move_files() writes
+        # profile-expanded child downloads under downloads/<profile_id>/.
+        _set_current_profile_output_owner(profile_owner_for_task)
+
         normalized_url = _normalize_ig_url(url)
         is_reel = _is_ig_reel_url(normalized_url)
         is_post = _is_ig_post_url(normalized_url)
