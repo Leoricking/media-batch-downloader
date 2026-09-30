@@ -1,3 +1,5 @@
+# v14.3 Exact Direct-Photo Identity + Metadata Fix
+# Direct /photo/?fbid=... is handled without viewer-next navigation; exact current media/right-rail metadata only.
 # v14.2 Complete Runtime Signature Fix
 # Keeps v14.1 immutable GalleryPlan; restores legacy helper keyword API names.
 # Rebuilt from v13.6 known-working baseline; no broken v14.0 code carried forward.
@@ -8171,8 +8173,367 @@ def _fb_v1247_clear_partial_outputs_on_incomplete(success_count: int, expected_p
 # ---------------------------------------------------------------------------
 
 
+
+def _fb_v143_exact_direct_photo_metadata(
+    page,
+    target_fbid: str,
+    *,
+    fallback_title: str = "Facebook_Post",
+    fallback_account: str = "",
+) -> tuple[str, str]:
+    """Resolve caption/account only from the exact direct-photo viewer panel.
+
+    Generic article/page metadata is deliberately not trusted here because a
+    logged-in Facebook photo viewer can keep neighboring feed/profile content in
+    the DOM.  The exact photo's right rail is the only permitted metadata scope.
+    """
+    target_fbid = re.sub(r"\D", "", str(target_fbid or ""))
+    if not target_fbid:
+        return (
+            _clean_fb_post_title_for_path(fallback_title, fallback=f"Facebook_Photo"),
+            _clean_fb_account_name(fallback_account),
+        )
+
+    # Hard identity proof: do not read exact-photo metadata after the viewer has
+    # navigated to another photo.
+    try:
+        current = html.unescape(str(page.url or ""))
+    except Exception:
+        current = ""
+    if target_fbid not in current:
+        logger.warning(
+            f"FB v14.3 exact-photo metadata rejected: current URL no longer contains "
+            f"target fbid={target_fbid}"
+        )
+        return (f"Facebook_Photo_{target_fbid}", "")
+
+    try:
+        raw = page.evaluate(
+            r"""
+            (targetFbid) => {
+              const clean = v => String(v || '').replace(/\s+/g, ' ').trim();
+              const visible = el => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       r.bottom > 0 && r.right > 0 &&
+                       r.left < innerWidth && r.top < innerHeight &&
+                       st.display !== 'none' && st.visibility !== 'hidden' &&
+                       parseFloat(st.opacity || '1') > 0;
+              };
+              const badAccount = t => {
+                const low = clean(t).toLowerCase();
+                if (!low || low.length < 2 || low.length > 90) return true;
+                return [
+                  'facebook','讚','留言','分享','回覆','查看更多','查看貼文',
+                  '追蹤','已追蹤','相片','照片','通知','messenger',
+                  '建立貼文','寫留言','最相關','所有留言'
+                ].some(x => low === x || low.startsWith(x + ' '));
+              };
+              const badCaption = t => {
+                const low = clean(t).toLowerCase();
+                if (!low || low.length < 2 || low.length > 320) return true;
+                if (/^\d+\s*$/.test(low)) return true;
+                if (/^\d{1,2}月\d{1,2}日/.test(low)) return true;
+                if (/^\d{1,2}:\d{2}/.test(low)) return true;
+                if ([
+                  '讚','留言','分享','回覆','查看更多','查看貼文','追蹤','已追蹤',
+                  '寫留言','最相關','所有留言','facebook'
+                ].some(x => low === x)) return true;
+                if (low.startsWith('以 ') && low.includes(' 的身分留言')) return true;
+                return false;
+              };
+
+              // Prefer the right rail. On desktop photo viewer this is normally
+              // role=complementary; use the right-most substantial region only
+              // as a fallback.
+              let root = document.querySelector('[role="complementary"]');
+              if (!root || !visible(root)) {
+                const regions = Array.from(document.querySelectorAll(
+                  '[role="dialog"], [role="main"], section, aside, div'
+                )).filter(el => {
+                  if (!visible(el)) return false;
+                  const r = el.getBoundingClientRect();
+                  return r.width >= 280 && r.height >= 260 &&
+                         (r.left + r.width / 2) > innerWidth * 0.68;
+                }).sort((a,b) => {
+                  const ar=a.getBoundingClientRect(), br=b.getBoundingClientRect();
+                  return (br.width*br.height) - (ar.width*ar.height);
+                });
+                root = regions[0] || null;
+              }
+              if (!root) return {accounts:[], captions:[]};
+
+              const rr = root.getBoundingClientRect();
+              const maxTop = rr.top + Math.min(520, Math.max(260, rr.height * 0.55));
+
+              const accounts = [];
+              let ai = 0;
+              for (const a of Array.from(root.querySelectorAll('a[href]')).slice(0, 220)) {
+                ai += 1;
+                if (!visible(a)) continue;
+                const r = a.getBoundingClientRect();
+                if (r.top > maxTop) continue;
+                const text = clean(a.innerText || a.textContent || a.getAttribute('aria-label'));
+                if (badAccount(text)) continue;
+                const href = String(a.href || a.getAttribute('href') || '');
+                const lowHref = href.toLowerCase();
+                if (!href) continue;
+                if (
+                  lowHref.includes('/photo') ||
+                  lowHref.includes('/reel') ||
+                  lowHref.includes('/watch') ||
+                  lowHref.includes('/hashtag/') ||
+                  lowHref.includes('comment_id=') ||
+                  lowHref.includes('fbid=' + targetFbid)
+                ) continue;
+
+                let score = 9000 - ai * 5 - Math.max(0, r.top - rr.top);
+                if (/facebook\.com\/(?:groups\/[^/?#]+|[A-Za-z0-9._-]+)\/?(?:[?#]|$)/i.test(href)) score += 1800;
+                accounts.push({text, href, score, top:r.top});
+              }
+
+              const captions = [];
+              const pushCaption = (el, source, base) => {
+                if (!el || !visible(el)) return;
+                const r = el.getBoundingClientRect();
+                if (r.top > maxTop) return;
+                let text = clean(el.innerText || el.textContent || '');
+                if (badCaption(text)) return;
+                let score = base - Math.max(0, r.top - rr.top);
+                if (text.includes('#')) score += 200;
+                if (/[😅😂🤣🥹😭❤❤️!?！？]/u.test(text)) score += 180;
+                if (el.children && el.children.length <= 2) score += 120;
+                captions.push({text, source, score, top:r.top});
+              };
+
+              for (const el of Array.from(root.querySelectorAll(
+                '[data-ad-preview="message"], [data-ad-comet-preview="message"]'
+              )).slice(0, 20)) {
+                pushCaption(el, 'message', 12000);
+              }
+
+              for (const el of Array.from(root.querySelectorAll(
+                'div[dir="auto"], span[dir="auto"], [role="heading"]'
+              )).slice(0, 260)) {
+                pushCaption(el, 'dir-auto', 7000);
+              }
+
+              accounts.sort((a,b) => b.score-a.score || a.top-b.top);
+              captions.sort((a,b) => b.score-a.score || a.top-b.top || b.text.length-a.text.length);
+              return {
+                accounts: accounts.slice(0, 30),
+                captions: captions.slice(0, 80),
+              };
+            }
+            """,
+            target_fbid,
+        ) or {}
+    except Exception as e:
+        logger.debug(f"FB v14.3 exact-photo metadata JS skipped: {e}")
+        raw = {}
+
+    account = ""
+    for item in raw.get("accounts") or []:
+        text = _clean_fb_account_name((item or {}).get("text") or "")
+        if not text or _fb_v132_bad_account_label(text):
+            continue
+        if _looks_like_fb_page_name_v1223(text):
+            account = text
+            break
+
+    title = ""
+    account_clean = _clean_fb_account_name(account)
+    for item in raw.get("captions") or []:
+        text = _clean_fb_post_title_for_path((item or {}).get("text") or "", fallback="")
+        if not text:
+            continue
+        if account_clean and text == account_clean:
+            continue
+        if _is_bad_album_context_caption_v1224(text, account_clean):
+            continue
+        # Reject combined wrapper text that contains the account + timestamp +
+        # actions. Prefer the small caption leaf.
+        low = text.lower()
+        if any(x in low for x in ["所有留言", "寫留言", "最相關", "查看", "則留言"]):
+            continue
+        title = text
+        break
+
+    # Never publish unrelated generic page metadata in exact-photo mode.
+    if not title:
+        title = f"Facebook_Photo_{target_fbid}"
+    if not account:
+        account = ""
+
+    logger.info(
+        f"FB v14.3 exact-photo metadata locked: "
+        f"fbid={target_fbid}, account={account or '-'}, title={title}"
+    )
+    return title, account
+
+
+def _fb_v143_exact_direct_photo_candidates(page, target_fbid: str) -> list[dict]:
+    """Return only the dominant currently visible photo for an exact fbid URL.
+
+    Critically, this helper never clicks/presses Next.  It prevents the v14.2
+    failure where the generic viewer warmup navigated away from the requested
+    photo before the first harvest.
+    """
+    target_fbid = re.sub(r"\D", "", str(target_fbid or ""))
+    if not target_fbid:
+        return []
+
+    try:
+        current = html.unescape(str(page.url or ""))
+    except Exception:
+        current = ""
+    if target_fbid not in current:
+        logger.warning(
+            f"FB v14.3 exact-photo media rejected: current URL no longer contains "
+            f"target fbid={target_fbid}"
+        )
+        return []
+
+    try:
+        raw = page.evaluate(
+            r"""
+            (targetFbid) => {
+              const visible = el => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const st = getComputedStyle(el);
+                return r.width >= 180 && r.height >= 180 &&
+                       r.bottom > 0 && r.right > 0 &&
+                       r.left < innerWidth && r.top < innerHeight &&
+                       st.display !== 'none' && st.visibility !== 'hidden' &&
+                       parseFloat(st.opacity || '1') > 0;
+              };
+
+              const rows = [];
+              let idx = 0;
+              for (const img of Array.from(document.querySelectorAll('img'))) {
+                idx += 1;
+                if (!visible(img)) continue;
+                const r = img.getBoundingClientRect();
+                const cx = r.left + r.width / 2;
+                const cy = r.top + r.height / 2;
+
+                // The exact media stage occupies the left/center of the desktop
+                // photo viewer. Exclude right-rail avatars/recommendations.
+                if (cx > innerWidth * 0.80) continue;
+
+                const nw = Number(img.naturalWidth || 0);
+                const nh = Number(img.naturalHeight || 0);
+                const area = r.width * r.height;
+                const naturalArea = nw * nh;
+                if (area < 40000 && naturalArea < 90000) continue;
+
+                const alt = String(img.getAttribute('alt') || '');
+                const srcs = [];
+                const add = (u, bonus) => {
+                  u = String(u || '').trim();
+                  if (!u || u.startsWith('data:') || u.startsWith('blob:')) return;
+                  const low = u.toLowerCase();
+                  if (
+                    low.includes('profile_pic') ||
+                    low.includes('safe_image') ||
+                    low.includes('static.xx.fbcdn.net') ||
+                    low.includes('/emoji.php')
+                  ) return;
+                  if (!srcs.some(x => x.src === u)) srcs.push({src:u, bonus});
+                };
+
+                add(img.currentSrc, 500);
+                add(img.src, 400);
+                add(img.getAttribute('src'), 300);
+                const srcset = img.getAttribute('srcset') || '';
+                for (const part of srcset.split(',').map(x => x.trim()).filter(Boolean)) {
+                  add(part.split(/\s+/)[0], 700);
+                }
+                if (!srcs.length) continue;
+
+                let score =
+                    area * 5 +
+                    naturalArea * 2 -
+                    Math.abs(cx - innerWidth * 0.40) * 500 -
+                    Math.abs(cy - innerHeight * 0.50) * 120 -
+                    idx;
+
+                rows.push({
+                  score,
+                  area,
+                  naturalArea,
+                  width:nw,
+                  height:nh,
+                  alt,
+                  srcs
+                });
+              }
+
+              rows.sort((a,b) => b.score-a.score);
+              return rows.slice(0, 8);
+            }
+            """,
+            target_fbid,
+        ) or []
+    except Exception as e:
+        logger.debug(f"FB v14.3 exact-photo visible media JS skipped: {e}")
+        return []
+
+    if not raw:
+        return []
+
+    # Use ONE DOM image element only: the dominant visible photo. Its src/srcset
+    # variants become candidates for the same logical photo.
+    best = raw[0]
+    candidates = []
+    for entry in best.get("srcs") or []:
+        src = html.unescape(str((entry or {}).get("src") or "")).strip()
+        if not src or not _looks_like_real_fb_media_url(src):
+            continue
+        if _is_probably_video_url(src) or _is_bad_fb_media_url(src.lower()):
+            continue
+        candidates.append({
+            "src": src,
+            "type": "image",
+            "score": int(best.get("score") or 0) + int((entry or {}).get("bonus") or 0),
+            "width": int(best.get("width") or 0),
+            "height": int(best.get("height") or 0),
+            "area": float(best.get("area") or 0),
+            "naturalArea": float(best.get("naturalArea") or 0),
+            "reason": "v14.3-exact-direct-photo-visible",
+            "fbid": target_fbid,
+        })
+
+    candidates = _dedupe_ordered(candidates)
+    if not candidates:
+        return []
+
+    pack = {
+        "order": 1,
+        "src": candidates[0]["src"],
+        "type": "image",
+        "score": candidates[0].get("score", 0),
+        "candidates": candidates,
+        "media_id": target_fbid,
+        "fbid": target_fbid,
+        "source": "v14.3-exact-direct-photo-visible",
+        "_allow_fb_best_available_source": True,
+    }
+    logger.info(
+        f"FB v14.3 exact-photo visible media locked: "
+        f"fbid={target_fbid}, variants={len(candidates)}, "
+        f"natural={best.get('width',0)}x{best.get('height',0)}, "
+        f"area={int(best.get('area') or 0)}"
+    )
+    return [pack]
+
+
+
 def _collect_fb_media_playwright(url: str):
-    logger.info("FB v14.2 integrated pipeline active: immutable GalleryPlan + validated helper signatures + strict completeness")
+    logger.info("FB v14.3 integrated pipeline active: exact direct-photo lock + immutable GalleryPlan + strict completeness")
     try:
         _target_contract = _contract_parse_facebook_target(url)
         logger.info(
@@ -8327,6 +8688,82 @@ def _collect_fb_media_playwright(url: str):
                 return "BLOCKED", "Facebook Playwright 偵測需登入"
 
             title = _clean_fb_post_title_for_path(_get_fb_title(page), fallback="Facebook_Post")
+
+            # v14.3 exact direct-photo lock.
+            #
+            # A direct /photo/?fbid=... URL is already a single exact media
+            # identity. Do NOT enter the generic viewer sequence because its
+            # warmup intentionally presses/clicks Next to harvest galleries.
+            # For a one-photo target that can move off the requested fbid and
+            # silently download a neighboring/recommended photo.
+            exact_direct_photo_fbid_v143 = ""
+            try:
+                if getattr(_target_contract, "kind", "") == "photo":
+                    exact_direct_photo_fbid_v143 = re.sub(
+                        r"\D", "", str(getattr(_target_contract, "numeric_id", "") or "")
+                    )
+            except Exception:
+                exact_direct_photo_fbid_v143 = ""
+
+            if exact_direct_photo_fbid_v143:
+                exact_title_v143, exact_account_v143 = _fb_v143_exact_direct_photo_metadata(
+                    page,
+                    exact_direct_photo_fbid_v143,
+                    fallback_title=title,
+                    fallback_account="",
+                )
+                exact_title_v143, exact_account_v143 = _publish_fb_task_metadata(
+                    url,
+                    exact_title_v143,
+                    exact_account_v143,
+                    page=None,  # exact metadata is already scoped; never re-open generic fallback
+                    account_locked=bool(exact_account_v143),
+                )
+                if resolved and resolved != url:
+                    _publish_fb_task_metadata(
+                        resolved,
+                        exact_title_v143,
+                        exact_account_v143,
+                        page=None,
+                        account_locked=bool(exact_account_v143),
+                    )
+
+                exact_items_v143 = _fb_v143_exact_direct_photo_candidates(
+                    page,
+                    exact_direct_photo_fbid_v143,
+                )
+                if not exact_items_v143:
+                    clear_temp()
+                    return (
+                        "RETRY",
+                        f"Facebook exact photo {exact_direct_photo_fbid_v143} "
+                        "could not prove the currently visible target media; "
+                        "refuse generic viewer fallback to avoid downloading another photo",
+                    )
+
+                success_v143, outputs_v143 = _download_viewer_items(
+                    context,
+                    exact_items_v143,
+                    referer=str(page.url or resolved or url),
+                )
+                if success_v143 != 1 or len(outputs_v143 or []) != 1:
+                    clear_temp()
+                    return (
+                        "RETRY",
+                        f"Facebook exact photo completeness failed: "
+                        f"output={success_v143}/1, target_fbid={exact_direct_photo_fbid_v143}",
+                    )
+
+                if not move_files_ordered(exact_title_v143, outputs_v143):
+                    clear_temp()
+                    return "FAILED", "Facebook exact photo downloaded but final move failed"
+
+                logger.info(
+                    f"FB v14.3 exact direct-photo completed: "
+                    f"fbid={exact_direct_photo_fbid_v143}, "
+                    f"account={exact_account_v143 or '-'}, title={exact_title_v143}"
+                )
+                return "SUCCESS", ""
 
             # v11.92 Reel title-only fix:
             # Restore the previously working Reel media candidate pipeline. Facebook often

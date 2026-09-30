@@ -1,3 +1,6 @@
+# v12.34 Minimal Missing/Short-Video Fix on v12.33 Baseline
+# Keeps every v12.18-v12.33 feature; only tightens soft-MISSING verification
+# and accepts structurally valid exact structured short carousel MP4s.
 # v12.33 Profile Output Folder Thread Fix
 # v12.32 Profile Verified Tolerance Fix
 # v12.31 Rate-Limit Terminal BLOCKED Fix
@@ -1883,6 +1886,25 @@ def _is_missing_ig_page(page) -> bool:
     ]
 
     return any(marker.lower() in combined_lower for marker in missing_markers)
+
+def _ig_main_response_status_v1234(response) -> int:
+    try:
+        return int(getattr(response, 'status', 0) or 0)
+    except Exception:
+        return 0
+
+
+def _classify_persistent_missing_v1234(shortcode: str, nav_response, *, headless_mode: bool):
+    status = _ig_main_response_status_v1234(nav_response)
+    if status in {404, 410}:
+        logger.info(f'IG v12.34 hard MISSING confirmed: status={status}, target={shortcode}')
+        return 'MISSING', f'Instagram confirmed HTTP {status} for target {shortcode}'
+    if headless_mode:
+        logger.warning(f'IG v12.34 headless unavailable UI is ambiguous: http={status or "-"}, target={shortcode}; require visible IG_Parser')
+        return 'BLOCKED', 'IG_VISIBLE_PROFILE_REQUIRED'
+    logger.warning(f'IG v12.34 visible unavailable UI is ambiguous: http={status or "-"}, target={shortcode}; RETRY instead of false MISSING')
+    return 'RETRY', f'Instagram unavailable UI for {shortcode} was not confirmed by HTTP 404/410 (status={status or "unknown"})'
+
 
 def _is_generic_ig_page(page) -> bool:
     """
@@ -5062,11 +5084,12 @@ def _validate_downloaded_media_type(path: str, item: dict) -> tuple[bool, str]:
             return False, f"影片完整性驗證失敗：{e}"
 
         if size < 100 * 1024:
+            # v12.34: playable MP4 structure was already verified above.
             authenticated_best_available = bool(
                 item.get("from") == "authenticated-structured-json"
                 and item.get("_target_shortcode")
                 and item.get("_carousel_slide_index")
-                and size >= 60 * 1024
+                and size >= max(_MIN_FILE_SIZE, 12 * 1024)
             )
             if not authenticated_best_available:
                 return False, (
@@ -5074,7 +5097,7 @@ def _validate_downloaded_media_type(path: str, item: dict) -> tuple[bool, str]:
                 )
 
             logger.info(
-                f"IG authenticated best-available short video accepted: "
+                f"IG v12.34 exact structured short video accepted: "
                 f"slide={item.get('_carousel_slide_index')}, bytes={size}"
             )
 
@@ -5387,7 +5410,7 @@ def _goto_instagram_target_clean(page, target_url: str, target_shortcode: str = 
     except Exception:
         pass
 
-    page.goto(navigation_url, wait_until="domcontentloaded", timeout=timeout)
+    nav_response_v1234 = page.goto(navigation_url, wait_until="domcontentloaded", timeout=timeout)
     _wait_for_target_shortcode_context(page, target_shortcode, timeout_ms=12000)
 
     try:
@@ -5399,6 +5422,8 @@ def _goto_instagram_target_clean(page, target_url: str, target_shortcode: str = 
         page.wait_for_load_state("networkidle", timeout=9000)
     except Exception:
         pass
+
+    return nav_response_v1234
 
 
 def _get_carousel_total_count(page) -> int:
@@ -7803,8 +7828,9 @@ def _collect_ig_media_playwright_persistent_impl(
         except Exception:
             pass
 
+        nav_response_v1234 = None
         try:
-            _goto_instagram_target_clean(page, url, target_shortcode=shortcode, timeout=60000)
+            nav_response_v1234 = _goto_instagram_target_clean(page, url, target_shortcode=shortcode, timeout=60000)
         except PlaywrightTimeoutError:
             logger.warning("IG persistent profile goto 超時，改用目前頁面")
         except Exception as e:
@@ -7818,7 +7844,7 @@ def _collect_ig_media_playwright_persistent_impl(
         _warmup_ig_page_for_media(page, is_reel=_is_ig_reel_url(url))
 
         if _is_missing_ig_page(page):
-            return "MISSING", "Instagram 顯示：很抱歉，此頁面無法使用；連結可能故障或頁面已遭移除"
+            return _classify_persistent_missing_v1234(shortcode, nav_response_v1234, headless_mode=headless_mode)
 
         if not _is_target_shortcode_context(page, shortcode):
             return "RETRY", (
@@ -7836,7 +7862,7 @@ def _collect_ig_media_playwright_persistent_impl(
             )
 
             if _is_missing_ig_page(page):
-                return "MISSING", "Instagram 顯示：很抱歉，此頁面無法使用；連結可能故障或頁面已遭移除"
+                return _classify_persistent_missing_v1234(shortcode, nav_response_v1234, headless_mode=headless_mode)
             if not _is_target_shortcode_context(page, shortcode):
                 return "FAILED", (
                     f"確認後頁面離開目標貼文 {shortcode}；已停止下載。"
@@ -8884,6 +8910,7 @@ def get_login_status() -> tuple[bool, str]:
 
 
 def download(url: str):
+    logger.info("IG v12.34 pipeline active: v12.33 baseline + minimal missing/short-video fix")
     if _L is None:
         setup()
 
