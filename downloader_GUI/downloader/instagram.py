@@ -1,3 +1,8 @@
+# v12.37 Integrated Missing Short-Circuit + Exact Visual High-Res Recovery
+# Fixes delayed MISSING results, locked-profile snapshot copying, and exact-post 640px visual fallback.
+# v12.36 Integrated Missing + Persistent Profile Recovery Fix
+# Fixes visible authenticated MISSING classification, persistent Chrome TargetClosed/profile-lock recovery,
+# and prevents local IG_Parser launch failures from being misreported as terminal BLOCKED.
 # v12.34 Minimal Missing/Short-Video Fix on v12.33 Baseline
 # Keeps every v12.18-v12.33 feature; only tightens soft-MISSING verification
 # and accepts structurally valid exact structured short carousel MP4s.
@@ -156,6 +161,8 @@ _PREFETCHED_TITLES: dict[str, str] = {}
 _PREFETCHED_TITLES_LOCK = threading.RLock()
 _PREFETCHED_ACCOUNTS: dict[str, str] = {}
 _PREFETCHED_ACCOUNTS_LOCK = threading.RLock()
+_PREFETCHED_MISSING_SHORTCODES: set[str] = set()
+_PREFETCHED_MISSING_LOCK = threading.RLock()
 
 
 def setup():
@@ -491,10 +498,19 @@ def _rate_limited_zero_media_result(instaloader_error: str, playwright_error: st
     That should be terminal BLOCKED for this run, not RETRY.
     """
     instaloader_rate_limited = _is_ig_rate_limited_error(instaloader_error)
+
+    # v12.36: local Chrome launch/TargetClosed failures are not content BLOCKED.
+    playwright_clean = _clean_error_text(playwright_error or "")
+    if (
+        "ig_parser_runtime_unavailable" in playwright_clean.lower()
+        or _is_ig_parser_runtime_launch_error(playwright_clean)
+    ):
+        return None
+
     zero_media_or_empty = (
         not playwright_error
         or _is_ig_zero_media_proof_error(playwright_error)
-        or "normal headless collection returned 0" in _clean_error_text(playwright_error).lower()
+        or "normal headless collection returned 0" in playwright_clean.lower()
     )
 
     if instaloader_rate_limited and zero_media_or_empty:
@@ -1571,6 +1587,30 @@ def _get_prefetched_account(url: str) -> str:
         return _PREFETCHED_ACCOUNTS.get(shortcode, "") or ""
 
 
+def _remember_prefetched_missing(url: str) -> None:
+    shortcode = _extract_shortcode(url) or ""
+    if not shortcode:
+        return
+    with _PREFETCHED_MISSING_LOCK:
+        _PREFETCHED_MISSING_SHORTCODES.add(shortcode)
+
+
+def _clear_prefetched_missing(url: str) -> None:
+    shortcode = _extract_shortcode(url) or ""
+    if not shortcode:
+        return
+    with _PREFETCHED_MISSING_LOCK:
+        _PREFETCHED_MISSING_SHORTCODES.discard(shortcode)
+
+
+def _is_prefetched_missing(url: str) -> bool:
+    shortcode = _extract_shortcode(url) or ""
+    if not shortcode:
+        return False
+    with _PREFETCHED_MISSING_LOCK:
+        return shortcode in _PREFETCHED_MISSING_SHORTCODES
+
+
 def _get_ig_post_account(page) -> str:
     # Prefer the author link inside the target post header.  Avoid comment users
     # by checking the first few links nearest the article/dialog header.
@@ -1682,6 +1722,10 @@ def prefetch_post_info(url: str) -> tuple[str, str, str]:
                 logger.info(f"IG info prefetch goto timeout, use current page: {shortcode}")
             page.wait_for_timeout(1800)
             if _is_missing_ig_page(page):
+                _remember_prefetched_missing(url)
+                logger.info(
+                    f"IG v12.37 prefetch canonical missing cached: target={shortcode}"
+                )
                 return "", "", "MISSING"
             if _is_generic_ig_page(page) or _is_ig_audience_restricted_page(page):
                 return "", "", "需要 IG Parser Profile"
@@ -1702,6 +1746,7 @@ def prefetch_post_info(url: str) -> tuple[str, str, str]:
                 _publish_ig_task_account(url, clean_account)
 
             if clean_title or clean_account:
+                _clear_prefetched_missing(url)
                 logger.info(
                     f"IG info prefetch completed before download: "
                     f"account={clean_account or 'unknown'}, title={clean_title or 'unknown'}"
@@ -1895,15 +1940,37 @@ def _ig_main_response_status_v1234(response) -> int:
 
 
 def _classify_persistent_missing_v1234(shortcode: str, nav_response, *, headless_mode: bool):
+    """Classify only after _is_missing_ig_page() matched canonical IG missing UI.
+
+    Headless/cookie-only rendering can show a false unavailable shell, so it is
+    escalated once to the logged-in visible IG_Parser profile. In the visible
+    authenticated profile the same unavailable/removed message is authoritative
+    even when Instagram serves the shell with HTTP 200.
+    """
     status = _ig_main_response_status_v1234(nav_response)
+
     if status in {404, 410}:
-        logger.info(f'IG v12.34 hard MISSING confirmed: status={status}, target={shortcode}')
-        return 'MISSING', f'Instagram confirmed HTTP {status} for target {shortcode}'
+        logger.info(
+            f"IG v12.36 hard MISSING confirmed by HTTP: "
+            f"status={status}, target={shortcode}"
+        )
+        return "MISSING", f"Instagram confirmed HTTP {status} for target {shortcode}"
+
     if headless_mode:
-        logger.warning(f'IG v12.34 headless unavailable UI is ambiguous: http={status or "-"}, target={shortcode}; require visible IG_Parser')
-        return 'BLOCKED', 'IG_VISIBLE_PROFILE_REQUIRED'
-    logger.warning(f'IG v12.34 visible unavailable UI is ambiguous: http={status or "-"}, target={shortcode}; RETRY instead of false MISSING')
-    return 'RETRY', f'Instagram unavailable UI for {shortcode} was not confirmed by HTTP 404/410 (status={status or "unknown"})'
+        logger.warning(
+            f"IG v12.36 headless unavailable UI is ambiguous: "
+            f"http={status or '-'}, target={shortcode}; verify with visible IG_Parser"
+        )
+        return "BLOCKED", "IG_VISIBLE_PROFILE_REQUIRED"
+
+    logger.info(
+        f"IG v12.36 visible authenticated MISSING confirmed by canonical UI: "
+        f"http={status or '-'}, target={shortcode}"
+    )
+    return "MISSING", (
+        f"Instagram logged-in visible page confirms target {shortcode} is unavailable "
+        f"or removed (HTTP {status or 'unknown'})"
+    )
 
 
 def _is_generic_ig_page(page) -> bool:
@@ -3249,6 +3316,170 @@ def _resolve_chrome_profile_directory() -> str:
     )
     configured = str(configured).strip().strip('"')
     return configured or "Default"
+
+
+def _is_ig_parser_runtime_launch_error(err: str) -> bool:
+    """True only for local Chrome/Playwright launch failures, not IG content state."""
+    e = _clean_error_text(err or "").lower()
+    return any(token in e for token in [
+        "targetclosederror",
+        "target page, context or browser has been closed",
+        "browsertype.launch_persistent_context",
+        "user data directory is already in use",
+        "process singleton",
+        "process did exit: exitcode=21",
+        "failed to launch browser",
+        "browser closed",
+    ])
+
+
+def _copy_ig_parser_runtime_snapshot(user_data_dir: str, profile_dir: str) -> str:
+    """Create a lock-free copy of the dedicated IG_Parser profile for recovery."""
+    user_data_dir = os.path.abspath(str(user_data_dir or ""))
+    profile_dir = str(profile_dir or "Default").strip() or "Default"
+    source_profile = os.path.join(user_data_dir, profile_dir)
+
+    if not user_data_dir or not os.path.isdir(source_profile):
+        return ""
+
+    runtime_root = os.path.join(
+        TEMP_DIR,
+        f"ig_parser_runtime_{os.getpid()}_{threading.get_ident()}_{int(time.time() * 1000)}",
+    )
+
+    skip_names = {
+        "Cache", "Code Cache", "GPUCache", "DawnCache", "ShaderCache",
+        "GrShaderCache", "Media Cache", "Crashpad", "Sessions",
+        "Session Storage", "Service Worker",
+        "optimization_guide_prediction_model_downloads",
+        # Chrome keeps these SQLite files locked while IG_Parser is open.
+        # Copying them made the whole snapshot fail with WinError 32.
+        "Cookies", "Cookies-journal",
+    }
+
+    def _ignore(_dir, names):
+        ignored = []
+        for name in names:
+            low = str(name or "").lower()
+            if name in skip_names or low.startswith("singleton") or low in {"lock", "lockfile"}:
+                ignored.append(name)
+        return ignored
+
+    try:
+        os.makedirs(runtime_root, exist_ok=False)
+
+        local_state = os.path.join(user_data_dir, "Local State")
+        if os.path.isfile(local_state):
+            shutil.copy2(local_state, os.path.join(runtime_root, "Local State"))
+
+        shutil.copytree(
+            source_profile,
+            os.path.join(runtime_root, profile_dir),
+            ignore=_ignore,
+            dirs_exist_ok=True,
+        )
+
+        logger.warning(
+            f"IG v12.36 created lock-free IG_Parser runtime snapshot: "
+            f"source={source_profile}, runtime={runtime_root}"
+        )
+        return runtime_root
+
+    except Exception as e:
+        logger.warning(f"IG v12.36 runtime profile snapshot failed: {e}")
+        try:
+            shutil.rmtree(runtime_root, ignore_errors=True)
+        except Exception:
+            pass
+        return ""
+
+
+def _launch_ig_persistent_context_resilient(
+    p,
+    user_data_dir: str,
+    profile_dir: str,
+    *,
+    headless_mode: bool,
+):
+    """Launch dedicated IG profile, then recover once from lock/TargetClosed."""
+    common_kwargs = {
+        "channel": "chrome",
+        "headless": headless_mode,
+        "viewport": {"width": 1400, "height": 1600},
+        "locale": "zh-TW",
+        "args": [
+            f"--profile-directory={profile_dir}",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--window-size=1400,1600",
+            "--window-position=20,20",
+        ],
+    }
+
+    try:
+        return (
+            p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                **common_kwargs,
+            ),
+            "",
+        )
+    except Exception as first_error:
+        if not _is_ig_parser_runtime_launch_error(str(first_error)):
+            raise
+
+        logger.warning(
+            f"IG v12.36 primary persistent profile launch failed; "
+            f"attempt lock-free snapshot recovery: {first_error}"
+        )
+
+        runtime_root = _copy_ig_parser_runtime_snapshot(user_data_dir, profile_dir)
+        if not runtime_root:
+            raise
+
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=runtime_root,
+                **common_kwargs,
+            )
+
+            # The live Chrome cookie SQLite may be locked and is deliberately
+            # excluded from the snapshot. Rehydrate the recovery context from
+            # the downloader's exported Netscape cookie file when available.
+            cookie_path = (
+                _cookie_file
+                if (_cookie_file and os.path.exists(_cookie_file))
+                else COOKIES_FILE
+            )
+            recovery_cookies = _load_netscape_cookies(
+                cookie_path,
+                "instagram.com",
+            )
+            if recovery_cookies:
+                try:
+                    context.add_cookies(recovery_cookies)
+                    logger.info(
+                        f"IG v12.37 recovery profile injected cookies: "
+                        f"{len(recovery_cookies)}"
+                    )
+                except Exception as cookie_error:
+                    logger.warning(
+                        f"IG v12.37 recovery cookie injection skipped: "
+                        f"{cookie_error}"
+                    )
+
+            logger.info(
+                "IG v12.37 persistent profile recovered through lock-free runtime snapshot"
+            )
+            return context, runtime_root
+        except Exception:
+            try:
+                shutil.rmtree(runtime_root, ignore_errors=True)
+            except Exception:
+                pass
+            raise
 
 
 def open_ig_parser_profile(start_url: str = "https://www.instagram.com/") -> str:
@@ -7779,27 +8010,18 @@ def _collect_ig_media_playwright_persistent_impl(
         return "RETRY", "找不到 Chrome User Data；請先按『初始化 IG_Parser』完成專用 Profile 登入"
 
     context = None
+    runtime_profile_root = ""
     try:
         logger.info(
             f"IG 啟用已登入 Chrome Profile fallback: user_data_dir={user_data_dir}, "
             f"profile={profile_dir}, target_shortcode={shortcode}, reason={reason or 'network harvest=0'}"
         )
 
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            channel="chrome",
-            headless=headless_mode,
-            viewport={"width": 1400, "height": 1600},
-            locale="zh-TW",
-            args=[
-                f"--profile-directory={profile_dir}",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--window-size=1400,1600",
-                "--window-position=20,20",
-            ],
+        context, runtime_profile_root = _launch_ig_persistent_context_resilient(
+            p,
+            user_data_dir,
+            profile_dir,
+            headless_mode=headless_mode,
         )
 
         try:
@@ -8008,15 +8230,22 @@ def _collect_ig_media_playwright_persistent_impl(
 
     except Exception as e:
         msg = str(e)
+
+        if _is_ig_parser_runtime_launch_error(msg):
+            logger.warning(
+                f"IG v12.36 local IG_Parser runtime unavailable after recovery: "
+                f"target={shortcode}, error={msg}"
+            )
+            return "RETRY", (
+                "IG_PARSER_RUNTIME_UNAVAILABLE: dedicated IG_Parser Chrome could not "
+                "start even after lock-free profile recovery. This is a local browser "
+                "runtime failure, not proof that the post is BLOCKED."
+            )
+
         logger.exception(
             f"IG persistent profile unexpected exception: "
             f"target={shortcode}, error={msg}"
         )
-        if "user data directory is already in use" in msg.lower() or "process singleton" in msg.lower():
-            return "RETRY", (
-                "IG_Parser Chrome Profile 目前被同一個專用 Chrome 視窗佔用。"
-                "請關閉 IG_Parser 視窗後重試；日常 Chrome 不需要關閉。"
-            )
 
         classified_status, classified_error = _classify_error(msg)
         if classified_status == "MISSING":
@@ -8036,6 +8265,12 @@ def _collect_ig_media_playwright_persistent_impl(
                 context.close()
         except Exception:
             pass
+
+        if runtime_profile_root:
+            try:
+                shutil.rmtree(runtime_profile_root, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def _should_use_v7_clean_persistent_page_for_url(url: str) -> bool:
@@ -8240,6 +8475,61 @@ def _load_exact_post_slide(
     return item
 
 
+def _attach_exact_visual_highres_variants(item: dict) -> dict:
+    """Attach conservative same-image CDN high-res variants to exact visual items.
+
+    The item is already scoped to the requested shortcode by the carousel walk.
+    This helper never accepts a generated URL by itself: every candidate still
+    goes through normal byte/type/dimension/aspect-ratio validation.
+    """
+    if not isinstance(item, dict):
+        return item
+
+    media_type = (item.get("type") or "image").lower()
+    if media_type == "video":
+        return item
+
+    src = str(item.get("src") or "").strip()
+    target = str(item.get("_target_shortcode") or "").strip()
+    if not src or not target:
+        return item
+
+    alternates = list(item.get("_alternate_image_urls") or [])
+    seen = {
+        _normalized_exact_media_url(url)
+        for url in [src, *alternates]
+        if url
+    }
+
+    try:
+        generated = _build_ig_original_image_url_variants(
+            src,
+            declared_width=int(item.get("sourceWidth") or 0),
+            declared_height=int(item.get("sourceHeight") or 0),
+        )
+    except Exception:
+        generated = []
+
+    added = 0
+    for candidate in generated:
+        key = _normalized_exact_media_url(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        alternates.append(candidate)
+        added += 1
+
+    if added:
+        item = dict(item)
+        item["_alternate_image_urls"] = alternates
+        logger.info(
+            f"IG v12.37 exact visual high-res variants attached: "
+            f"added={added}, target={target}"
+        )
+
+    return item
+
+
 def _collect_complete_post_carousel(
     context,
     page,
@@ -8283,6 +8573,7 @@ def _collect_complete_post_carousel(
     first_item["_carousel_slide_index"] = 1
     first_item["_target_shortcode"] = shortcode
     first_item["from"] = first_item.get("from") or "verified-carousel-walk"
+    first_item = _attach_exact_visual_highres_variants(first_item)
 
     first_key = _media_key_from_url(first_item.get("src", ""))
     if not first_key:
@@ -8326,6 +8617,7 @@ def _collect_complete_post_carousel(
         item["_carousel_slide_index"] = slide_index
         item["_target_shortcode"] = shortcode
         item["from"] = item.get("from") or "verified-carousel-walk"
+        item = _attach_exact_visual_highres_variants(item)
 
         key = _media_key_from_url(item.get("src", ""))
         if not key:
@@ -8402,6 +8694,7 @@ def _collect_complete_post_carousel(
                 )
                 return []
 
+            item = _attach_exact_visual_highres_variants(item)
             seen.add(key)
             collected.append(item)
             logger.info(
@@ -8465,6 +8758,7 @@ def _collect_complete_post_carousel(
                             f"index={missing_index}, target={shortcode}"
                         )
                         return []
+                    item = _attach_exact_visual_highres_variants(item)
                     seen.add(key)
                     collected.append(item)
                     logger.info(
@@ -8910,9 +9204,31 @@ def get_login_status() -> tuple[bool, str]:
 
 
 def download(url: str):
-    logger.info("IG v12.34 pipeline active: v12.33 baseline + minimal missing/short-video fix")
+    logger.info(
+        "IG v12.37 pipeline active: authoritative prefetch MISSING + "
+        "locked-profile recovery + exact visual high-res retry"
+    )
     if _L is None:
         setup()
+
+    # v12.37:
+    # prefetch_post_info() already saw Instagram's canonical unavailable/removed
+    # page for this exact shortcode. Do not spend another five minutes running
+    # Instaloader / yt-dlp / persistent-profile verification only to time out.
+    if _is_prefetched_missing(url):
+        shortcode = _extract_shortcode(url) or ""
+        logger.info(
+            f"IG v12.37 terminal MISSING from canonical prefetch evidence: "
+            f"target={shortcode}"
+        )
+        _clear_temp_after_terminal_failure(
+            "MISSING",
+            "canonical missing page confirmed during prefetch",
+        )
+        return (
+            "MISSING",
+            "Instagram canonical unavailable/removed page was confirmed during prefetch",
+        )
 
     # v12.33: Capture the remembered profile owner once.  It will be applied
     # both in the worker thread and inside the inner timeout thread.
@@ -8972,20 +9288,11 @@ def download(url: str):
                         result_box[0] = terminal_rate_limit
                         return
 
-                    # Extra safety for the exact current failure:
-                    # Instaloader 401 + Playwright returned 0 media but the
-                    # downstream error text may be generic.  Do not retry twice.
-                    if _is_ig_rate_limited_error(instaloader_error):
-                        logger.warning(
-                            "IG v12.31 rate-limit terminal BLOCKED: "
-                            "GraphQL is rate-limited and Playwright did not "
-                            "download exact media; stop retry loop."
-                        )
-                        result_box[0] = (
-                            "BLOCKED",
-                            "Instagram GraphQL is rate-limited and no exact media was proven by Playwright/IG_Parser."
-                        )
-                        return
+                    # v12.36:
+                    # Do not convert arbitrary Playwright RETRY into BLOCKED.
+                    # Only _rate_limited_zero_media_result() may return BLOCKED
+                    # after genuine zero-media proof. Local IG_Parser runtime
+                    # failures stay RETRY.
 
                 result_box[0] = (status3, error3)
                 return
