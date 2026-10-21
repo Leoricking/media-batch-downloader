@@ -1,3 +1,6 @@
+# v12.38 No-Orphan Timeout + Slow-Reel Failover Fix
+# Removes the unsafe daemon-thread wall timeout that left yt-dlp running after RETRY,
+# and makes slow Reel yt-dlp fall back cleanly to exact Playwright recovery.
 # v12.37 Integrated Missing Short-Circuit + Exact Visual High-Res Recovery
 # Fixes delayed MISSING results, locked-profile snapshot copying, and exact-post 640px visual fallback.
 # v12.36 Integrated Missing + Persistent Profile Recovery Fix
@@ -127,8 +130,16 @@ logger = get_logger("instagram")
 # v11.48 IG Caption Lock + Full-Frame Media Validation
 
 _MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".mp4", ".webp", ".m4v", ".mov"}
-_DL_TIMEOUT = 300
+_DL_TIMEOUT = 300  # retained for backward compatibility; v12.38 no longer kills a live task thread
+_IG_YTDLP_REEL_SOFT_BUDGET = 120
+_IG_YTDLP_REEL_MAX_ETA_AFTER_BUDGET = 75
 _MAX_CAROUSEL_ITEMS = 40
+
+
+class _IGYTDLPSoftBudgetExceeded(Exception):
+    """Internal signal: yt-dlp is progressing too slowly; fall back to Playwright."""
+
+
 _MIN_FILE_SIZE = 5 * 1024
 # v12.16:
 # Exact authenticated structured carousel children sometimes expose only a
@@ -1317,6 +1328,53 @@ def _download_via_ytdlp(url: str, quick: bool = False):
 
     last_error = "未知錯誤"
 
+    # v12.38:
+    # A fixed 300s outer thread timeout used to return RETRY while yt-dlp kept
+    # running in a daemon thread. The worker then started attempt 2 and both
+    # attempts wrote the same .part file, causing WinError 32 / HTTP 416.
+    #
+    # Keep yt-dlp in the current task thread. For Reels only, if yt-dlp has
+    # already spent a meaningful amount of time and still reports a long ETA,
+    # abort this engine cleanly so the existing exact Playwright fallback can
+    # reconstruct/download the target video instead.
+    ytdlp_started_at = time.monotonic()
+
+    def _v1238_progress_hook(progress):
+        if quick or not is_reel:
+            return
+        if not isinstance(progress, dict):
+            return
+        if progress.get("status") != "downloading":
+            return
+
+        elapsed = max(0.0, time.monotonic() - ytdlp_started_at)
+        if elapsed < _IG_YTDLP_REEL_SOFT_BUDGET:
+            return
+
+        eta = progress.get("eta")
+        try:
+            eta_value = float(eta) if eta is not None else None
+        except Exception:
+            eta_value = None
+
+        # Do not abort a nearly-complete download just because it crossed the
+        # soft budget. Abort only when yt-dlp still predicts a substantial wait.
+        if eta_value is not None and eta_value <= _IG_YTDLP_REEL_MAX_ETA_AFTER_BUDGET:
+            return
+
+        downloaded = int(progress.get("downloaded_bytes") or 0)
+        total = int(progress.get("total_bytes") or progress.get("total_bytes_estimate") or 0)
+        speed = progress.get("speed")
+        logger.warning(
+            f"IG v12.38 yt-dlp Reel soft budget reached: "
+            f"elapsed={int(elapsed)}s, eta={int(eta_value) if eta_value is not None else '-'}s, "
+            f"downloaded={downloaded}, total={total}, speed={speed}; "
+            "switch to Playwright exact-video fallback"
+        )
+        raise _IGYTDLPSoftBudgetExceeded(
+            "yt-dlp Reel download is too slow; switch to exact Playwright fallback"
+        )
+
     for extra in variants:
         for fmt in formats:
             try:
@@ -1328,6 +1386,11 @@ def _download_via_ytdlp(url: str, quick: bool = False):
                     "noplaylist": False,
                     "format": fmt,
                     "ignore_no_formats_error": False,
+                    "socket_timeout": 30,
+                    "retries": 2,
+                    "fragment_retries": 2,
+                    "file_access_retries": 1,
+                    "progress_hooks": [_v1238_progress_hook],
                     "http_headers": {
                         "User-Agent": (
                             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1377,6 +1440,12 @@ def _download_via_ytdlp(url: str, quick: bool = False):
                     return "SUCCESS", ""
 
                 last_error = "yt-dlp 已執行，但沒有有效媒體檔案"
+
+            except _IGYTDLPSoftBudgetExceeded as e:
+                last_error = str(e)
+                logger.warning(f"IG v12.38 yt-dlp Reel soft failover: {last_error}")
+                clear_temp()
+                return "RETRY", last_error
 
             except Exception as e:
                 last_error = str(e)
@@ -9205,8 +9274,8 @@ def get_login_status() -> tuple[bool, str]:
 
 def download(url: str):
     logger.info(
-        "IG v12.37 pipeline active: authoritative prefetch MISSING + "
-        "locked-profile recovery + exact visual high-res retry"
+        "IG v12.38 pipeline active: no-orphan synchronous task + "
+        "slow-Reel yt-dlp failover + v12.37 recovery"
     )
     if _L is None:
         setup()
@@ -9356,18 +9425,20 @@ def download(url: str):
             (instaloader_status, instaloader_error),
         )
 
-    t = threading.Thread(
-        target=_run,
-        daemon=True,
-    )
-
-    t.start()
-    t.join(_DL_TIMEOUT)
-
-    if t.is_alive():
-        logger.error(f"Instagram 下載超時: {url}")
-        clear_temp()
-        return "RETRY", f"下載超時 ({_DL_TIMEOUT}s)"
+    # v12.38:
+    # Run the complete IG pipeline synchronously inside the worker's current
+    # attempt. Python cannot safely kill a live thread. The old daemon-thread
+    # timeout returned RETRY after 300s while yt-dlp continued downloading,
+    # so attempt 2 overlapped attempt 1 and both touched the same .part file.
+    #
+    # Individual engines already have their own bounded network/UI timeouts.
+    # Slow Reel yt-dlp also has the cooperative soft-budget failover above.
+    # Therefore the outer task must not abandon a still-running downloader.
+    try:
+        _run()
+    except Exception as e:
+        logger.exception(f"IG v12.38 task pipeline unexpected exception: {e}")
+        result_box[0] = _classify_error(str(e))
 
     result = result_box[0] or ("FAILED", "未知錯誤")
     status, reason = result
