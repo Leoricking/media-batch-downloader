@@ -1,3 +1,7 @@
+# v14.5 Concurrent FB Login-Status Fix
+# Makes GUI login status safe while worker is actively using FB_Parser profile; preserves v14.4 video integrity fix.
+# v14.4 Standalone Video Integrity + Exact Reel Recovery Fix
+# Rejects fragment-only fMP4 captures (moof without moov/init) and falls back to exact-id yt-dlp.
 # v14.3 Exact Direct-Photo Identity + Metadata Fix
 # Direct /photo/?fbid=... is handled without viewer-next navigation; exact current media/right-rail metadata only.
 # v14.2 Complete Runtime Signature Fix
@@ -59,6 +63,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import tempfile
 from urllib.parse import urlparse, unquote, parse_qs, parse_qsl, urlencode, urlunparse
 
 import requests
@@ -532,34 +537,45 @@ def _fb_cookie_names_from_db(
     user_data_dir: str,
     profile_dir: str,
 ) -> set[str]:
-    """Read Facebook cookie names without decrypting values.
+    """Read FB login-cookie names without competing with worker TEMP_DIR.
 
-    Chromium keeps cookie names and host keys in plaintext even though values are
-    encrypted. Presence of both c_user and xs for facebook.com is sufficient for
-    the UI login indicator and works even while the FB Parser browser is open.
+    v14.5 fixes the GUI "狀態無法確認" race:
+    - worker.clear_temp() can delete TEMP_DIR while status checker is copying DB;
+    - Chrome/Playwright can keep Cookies in WAL mode while FB_Parser is active.
+
+    Use an isolated OS temp directory and copy Cookies + optional -wal/-shm
+    together. Only cookie *names* are queried; encrypted values are never read.
     """
     names = set()
 
     for db_path in _fb_cookie_db_paths(user_data_dir, profile_dir):
-        temp_copy = ""
+        snapshot_dir = ""
 
         try:
-            # Copy first so an actively opened Chrome profile does not hold a
-            # read lock on the file we query.
-            temp_copy = os.path.join(
-                TEMP_DIR,
-                f"fb_login_status_{os.getpid()}_{threading.get_ident()}.sqlite",
-            )
-            os.makedirs(TEMP_DIR, exist_ok=True)
-            shutil.copy2(db_path, temp_copy)
+            snapshot_dir = tempfile.mkdtemp(prefix="fb_login_status_")
+            snapshot_db = os.path.join(snapshot_dir, "Cookies")
 
-            conn = sqlite3.connect(f"file:{temp_copy}?mode=ro", uri=True)
+            shutil.copy2(db_path, snapshot_db)
+
+            for suffix in ("-wal", "-shm"):
+                sidecar = db_path + suffix
+                if os.path.exists(sidecar):
+                    try:
+                        shutil.copy2(sidecar, snapshot_db + suffix)
+                    except Exception:
+                        pass
+
+            conn = sqlite3.connect(
+                f"file:{snapshot_db}?mode=ro",
+                uri=True,
+                timeout=2.0,
+            )
             try:
                 cursor = conn.execute(
                     """
-                    SELECT name
+                    SELECT DISTINCT name
                     FROM cookies
-                    WHERE host_key LIKE '%facebook.com'
+                    WHERE lower(host_key) LIKE '%facebook.com'
                       AND name IN ('c_user', 'xs')
                       AND (
                             length(value) > 0
@@ -571,13 +587,16 @@ def _fb_cookie_names_from_db(
             finally:
                 conn.close()
 
-        except Exception:
-            continue
+        except Exception as e:
+            logger.debug(
+                f"FB v14.5 login-cookie snapshot skipped: "
+                f"{os.path.basename(db_path)} | {e}"
+            )
 
         finally:
-            if temp_copy and os.path.exists(temp_copy):
+            if snapshot_dir:
                 try:
-                    os.remove(temp_copy)
+                    shutil.rmtree(snapshot_dir, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -587,11 +606,32 @@ def _fb_cookie_names_from_db(
     return names
 
 
-def get_login_status() -> tuple[bool, str]:
-    """Check FB Parser login without opening a visible browser.
+def _fb_v145_profile_busy_error(err: str) -> bool:
+    """Recognize Chrome/Playwright profile-in-use failures robustly."""
+    e = re.sub(r"\s+", " ", str(err or "")).strip().lower()
+    return any(token in e for token in [
+        "user data directory is already in use",
+        "process singleton",
+        "singletonlock",
+        "targetclosederror",
+        "target page, context or browser has been closed",
+        "browser has been closed",
+        "process did exit",
+        "failed to launch browser",
+        "profile appears to be in use",
+    ])
 
-    The cookie database is checked first, so the status still works while the
-    dedicated FB Parser Chrome window is open. Playwright is only a fallback.
+
+
+def get_login_status() -> tuple[bool, str]:
+    """Check FB Parser login without interfering with an active download.
+
+    Priority:
+    1. Read c_user/xs from an isolated snapshot of the dedicated profile DB.
+    2. Use legacy cookies.txt as a non-invasive secondary hint.
+    3. Only then try a headless persistent context.
+    4. If the profile is currently owned by the worker/FB_Parser Chrome, return
+       "Profile 使用中" instead of the misleading red "狀態無法確認".
     """
     user_data_dir = _get_fb_parser_profile_root()
     profile_dir = _resolve_fb_chrome_profile_directory()
@@ -599,13 +639,20 @@ def get_login_status() -> tuple[bool, str]:
     if not user_data_dir or not os.path.exists(user_data_dir):
         return False, "未建立 Profile"
 
-    # Primary check: read Chromium's cookie database directly.
     cookie_names = _fb_cookie_names_from_db(
         user_data_dir,
         profile_dir,
     )
     if {"c_user", "xs"}.issubset(cookie_names):
         return True, "已登入"
+
+    try:
+        legacy = _load_netscape_cookies(COOKIES_FILE, "facebook.com")
+        legacy_names = {str(c.get("name") or "") for c in legacy}
+        if {"c_user", "xs"}.issubset(legacy_names):
+            return True, "已登入"
+    except Exception:
+        pass
 
     context = None
     try:
@@ -622,8 +669,6 @@ def get_login_status() -> tuple[bool, str]:
                 ],
             )
 
-            # Request all cookies because FB may store them on .facebook.com,
-            # www.facebook.com, m.facebook.com, or locale-specific hosts.
             cookies = context.cookies()
             names = {
                 str(cookie.get("name") or "")
@@ -637,14 +682,14 @@ def get_login_status() -> tuple[bool, str]:
             return False, "未登入"
 
     except Exception as e:
-        text = re.sub(r"\s+", " ", str(e or "")).strip()
-
-        if "user data directory is already in use" in text.lower():
-            # The DB check above already ran. If no valid login cookies were
-            # found, report the profile lock accurately rather than claiming
-            # the account is logged out.
+        if _fb_v145_profile_busy_error(str(e)):
+            logger.info(
+                f"FB v14.5 login-status profile busy: "
+                f"{str(e).splitlines()[0] if str(e) else 'busy'}"
+            )
             return False, "Profile 使用中"
 
+        logger.debug(f"FB v14.5 login-status fallback failed: {e}")
         return False, "狀態無法確認"
 
     finally:
@@ -653,6 +698,7 @@ def get_login_status() -> tuple[bool, str]:
                 context.close()
         except Exception:
             pass
+
 
 
 def open_fb_parser_profile(start_url: str = "https://www.facebook.com/") -> str:
@@ -1258,6 +1304,138 @@ def _is_verified_fb_best_available_source_file(path: str, src: str = "") -> tupl
     return True, f"v12.22 exact-gallery best-available actual={w}x{h}, bytes={size}"
 
 
+def _fb_v144_mp4_top_level_boxes(path: str, *, max_boxes: int = 4096) -> list[str]:
+    """Parse top-level ISO-BMFF boxes without ffmpeg/ffprobe.
+
+    Facebook Reel responses are frequently fragmented MP4 media segments.
+    A raw media segment can start with `moof`/`mdat` but lacks the initialization
+    metadata (`moov`) required by a standalone .mp4 player.  File extension and
+    byte size alone therefore cannot prove a playable video.
+    """
+    boxes = []
+    try:
+        file_size = os.path.getsize(path)
+        if file_size < 8:
+            return boxes
+
+        with open(path, "rb") as f:
+            pos = 0
+            count = 0
+            while pos + 8 <= file_size and count < max_boxes:
+                f.seek(pos)
+                head = f.read(16)
+                if len(head) < 8:
+                    break
+
+                size32 = int.from_bytes(head[0:4], "big", signed=False)
+                box_type_b = head[4:8]
+                try:
+                    box_type = box_type_b.decode("ascii", errors="replace")
+                except Exception:
+                    box_type = repr(box_type_b)
+
+                header_size = 8
+                if size32 == 1:
+                    if len(head) < 16:
+                        break
+                    box_size = int.from_bytes(head[8:16], "big", signed=False)
+                    header_size = 16
+                elif size32 == 0:
+                    box_size = file_size - pos
+                else:
+                    box_size = size32
+
+                if box_size < header_size:
+                    break
+                if pos + box_size > file_size:
+                    # A truncated top-level box is not a valid standalone file.
+                    boxes.append(f"!truncated:{box_type}")
+                    break
+
+                boxes.append(box_type)
+                count += 1
+
+                if box_size == 0:
+                    break
+                pos += box_size
+
+    except Exception:
+        return boxes
+
+    return boxes
+
+
+def _fb_v144_validate_standalone_video_file(path: str) -> tuple[bool, str]:
+    """Validate final FB video outputs before they are allowed to reach SUCCESS.
+
+    For MP4/M4V/MOV, require initialization metadata (`moov`) plus media payload
+    (`mdat` or `moof`).  A fragment-only `moof` + `mdat` capture is deliberately
+    rejected even when it is hundreds of KB/MB and has an .mp4 suffix.
+    """
+    if not path or not os.path.exists(path):
+        return False, "video file missing"
+
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        size = os.path.getsize(path)
+    except Exception:
+        size = 0
+
+    if size < _MIN_FILE_SIZE:
+        return False, f"video file too small: {size} bytes"
+
+    if ext not in {".mp4", ".m4v", ".mov"}:
+        # Keep existing behavior for any future non-ISO-BMFF video format.
+        return True, "non-mp4 video format"
+
+    boxes = _fb_v144_mp4_top_level_boxes(path)
+    box_set = set(boxes)
+
+    if any(str(x).startswith("!truncated:") for x in boxes):
+        return False, f"truncated MP4 top-level box: {boxes[:12]}"
+
+    if "moov" not in box_set:
+        if "moof" in box_set:
+            return False, (
+                "fragment-only fMP4: found moof/mdat but no moov initialization metadata"
+            )
+        return False, f"MP4 missing moov initialization metadata: boxes={boxes[:12]}"
+
+    if "mdat" not in box_set and "moof" not in box_set:
+        return False, f"MP4 has no media payload box: boxes={boxes[:12]}"
+
+    return True, f"standalone MP4 boxes={boxes[:12]}"
+
+
+def _fb_v144_remove_invalid_video_outputs(paths: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """Remove invalid final video files while preserving valid images/videos."""
+    kept = []
+    rejected = []
+
+    for path in paths or []:
+        ext = os.path.splitext(path or "")[1].lower()
+        if ext not in {".mp4", ".m4v", ".mov"}:
+            kept.append(path)
+            continue
+
+        ok, reason = _fb_v144_validate_standalone_video_file(path)
+        if ok:
+            kept.append(path)
+            continue
+
+        rejected.append((path, reason))
+        logger.warning(
+            f"FB v14.4 reject non-standalone video output: "
+            f"{os.path.basename(path)} | {reason}"
+        )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    return kept, rejected
+
+
 def _download_best_candidate(context, candidates, dst_base: str, referer: str):
     # v12.36: final safety net.  High-res expansion can reintroduce raw URL
     # strings, so normalize before and after expansion.  This prevents the final
@@ -1332,6 +1510,20 @@ def _download_best_candidate(context, candidates, dst_base: str, referer: str):
                     allow_full_gallery_source=bool(
                         item.get("_allow_fb_best_available_source")
                     ),
+                )
+
+            # v14.4: video response captures can be raw fMP4 media segments.
+            # A fragment beginning with moof/mdat is not a standalone MP4 unless
+            # its initialization metadata (moov) is also present.
+            if ext in {".mp4", ".m4v", ".mov"}:
+                video_ok_v144, video_reason_v144 = _fb_v144_validate_standalone_video_file(tmp)
+                if not video_ok_v144:
+                    raise Exception(
+                        f"FB video candidate is not standalone/playable: {video_reason_v144}"
+                    )
+                logger.info(
+                    f"FB v14.4 standalone video candidate accepted: "
+                    f"{os.path.basename(tmp)} | {video_reason_v144}"
                 )
 
             low_res, low_res_reason = _is_low_resolution_fb_output(tmp, src)
@@ -1511,6 +1703,25 @@ def move_files(title: str) -> bool:
     image_files = [p for p in files if os.path.splitext(p)[1].lower() in image_exts]
     video_files = [p for p in files if os.path.splitext(p)[1].lower() in video_exts]
 
+    # v14.4 final integrity gate: never move a fragment-only/corrupt MP4 into
+    # DOWNLOAD_DIR and report SUCCESS.
+    valid_video_files, rejected_video_files_v144 = _fb_v144_remove_invalid_video_outputs(video_files)
+    if rejected_video_files_v144:
+        rejected_set_v144 = {os.path.normcase(os.path.abspath(p)) for p, _ in rejected_video_files_v144}
+        files = [
+            p for p in files
+            if os.path.normcase(os.path.abspath(p)) not in rejected_set_v144
+        ]
+        video_files = valid_video_files
+        image_files = [p for p in files if os.path.splitext(p)[1].lower() in image_exts]
+
+    if not files:
+        logger.warning(
+            "FB v14.4 move_files rejected all outputs because no standalone playable media remained"
+        )
+        clear_temp()
+        return False
+
     # 多檔 + 預設標題 = 高風險污染，不可正式輸出 Facebook_Post/1.mp4...
     if len(files) > 1 and name == "Facebook_Post":
         logger.warning("FB move_files blocked: multi-file output still has fallback title Facebook_Post; clear temp and retry/failed")
@@ -1605,6 +1816,15 @@ def move_files_ordered(title: str, ordered_files: list[str]) -> bool:
             continue
         files.append(path)
 
+    if not files:
+        return False
+
+    files, rejected_ordered_v144 = _fb_v144_remove_invalid_video_outputs(files)
+    if rejected_ordered_v144:
+        logger.warning(
+            f"FB v14.4 ordered output integrity gate rejected "
+            f"{len(rejected_ordered_v144)} invalid video file(s)"
+        )
     if not files:
         return False
 
@@ -8533,7 +8753,7 @@ def _fb_v143_exact_direct_photo_candidates(page, target_fbid: str) -> list[dict]
 
 
 def _collect_fb_media_playwright(url: str):
-    logger.info("FB v14.3 integrated pipeline active: exact direct-photo lock + immutable GalleryPlan + strict completeness")
+    logger.info("FB v14.5 integrated pipeline active: concurrent login-status fix + standalone-video integrity + exact reel recovery")
     try:
         _target_contract = _contract_parse_facebook_target(url)
         logger.info(
@@ -8890,21 +9110,85 @@ def _collect_fb_media_playwright(url: str):
                         clear_temp()
                         return "RETRY", "Facebook Reel 未擷取到有效影片候選，避免誤存封面圖為 jpg"
 
-                    final_dst, size = _download_best_candidate(
-                        context,
-                        video_candidates,
-                        os.path.join(TEMP_DIR, "fb_0001"),
-                        referer=resolved,
-                    )
-                    logger.info(
-                        f"FB Reel 主影片已下載: {os.path.basename(final_dst)} "
-                        f"({size // 1024} KB)"
-                    )
+                    try:
+                        final_dst, size = _download_best_candidate(
+                            context,
+                            video_candidates,
+                            os.path.join(TEMP_DIR, "fb_0001"),
+                            referer=resolved,
+                        )
+                        logger.info(
+                            f"FB Reel 主影片已下載: {os.path.basename(final_dst)} "
+                            f"({size // 1024} KB)"
+                        )
+                    except Exception as direct_video_error_v144:
+                        # v14.4:
+                        # Facebook often exposes only a DASH/fMP4 media fragment
+                        # to Playwright (moof+mdat, no moov init segment). Reject
+                        # that fragment and recover the exact Reel by target id.
+                        exact_target_v144 = (
+                            observed_reel_id
+                            or _extract_canonical_fb_reel_id_from_page(page)
+                            or _extract_fb_reel_or_share_id(resolved or url)
+                        )
+                        logger.warning(
+                            f"FB v14.4 direct Reel candidate rejected: "
+                            f"target={exact_target_v144 or '-'}, error={direct_video_error_v144}"
+                        )
+
+                        if str(exact_target_v144 or "").isdigit():
+                            clear_temp()
+                            status_v144, error_v144 = _download_share_v_exact_ytdlp_v1244(
+                                context,
+                                url,
+                                resolved,
+                                str(exact_target_v144),
+                                reel_title,
+                            )
+                            if status_v144 == "SUCCESS":
+                                logger.info(
+                                    f"FB v14.4 exact Reel yt-dlp recovery completed: "
+                                    f"target={exact_target_v144}"
+                                )
+                                return status_v144, error_v144
+
+                            clear_temp()
+                            return "RETRY", (
+                                "Facebook Reel direct candidates were fragment-only/corrupt "
+                                f"and exact-id recovery failed: {error_v144}"
+                            )
+
+                        raise
 
                     if move_files(reel_title):
                         return "SUCCESS", ""
 
-                    return "FAILED", "Facebook Reel 影片已下載，但搬移檔案失敗"
+                    # A downloaded candidate can still fail the final v14.4
+                    # standalone-video integrity gate. Recover through exact id
+                    # rather than reporting a false SUCCESS or opaque FAILED.
+                    exact_target_v144 = (
+                        observed_reel_id
+                        or _extract_canonical_fb_reel_id_from_page(page)
+                        or _extract_fb_reel_or_share_id(resolved or url)
+                    )
+                    if str(exact_target_v144 or "").isdigit():
+                        clear_temp()
+                        status_v144, error_v144 = _download_share_v_exact_ytdlp_v1244(
+                            context,
+                            url,
+                            resolved,
+                            str(exact_target_v144),
+                            reel_title,
+                        )
+                        if status_v144 == "SUCCESS":
+                            logger.info(
+                                f"FB v14.4 final integrity fallback yt-dlp completed: "
+                                f"target={exact_target_v144}"
+                            )
+                            return status_v144, error_v144
+                        return "RETRY", error_v144
+
+                    return "FAILED", "Facebook Reel 影片未通過 standalone MP4 完整性驗證"
 
                 except Exception as e:
                     clear_temp()
