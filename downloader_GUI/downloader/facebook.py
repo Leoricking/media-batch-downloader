@@ -1,3 +1,15 @@
+# v15.4 NO_ACCESS Audience/Permission Classification
+# v15.3 Zero-Evidence Exact-Post Structured Recovery + Listener Cleanup Fix
+# Preserves every v15.2 feature; recovers exact canonical-post media from identity-bound serialized data before RETRY.
+# v15.0 Exact-Photo Persist + Bounded Exact-PCB Recovery Fix
+# Persists exact-fbid metadata/response images before page close, avoids stale SPA candidate loss,
+# and enables bounded fast recovery for all proven small exact-PCB galleries without relaxing completeness guards.
+# v14.8 Exact-Count + Canonical-Root Recovery Fix
+# Fixes exact-PCB duplicate target inflation and permalink-root recovery while preserving v14.7 generic-share routing.
+# v14.7 Generic /share/<token>/ Two-Phase Identity Fix
+# Resolves generic Facebook share tokens inside the authenticated FB_Parser page before choosing post/reel/photo logic.
+# v14.6 Canonical /posts/ Exact-Scope Fix
+# Recognizes /{owner}/posts/{post_id}/ URLs, scopes metadata/media to that exact post, and rejects unavailable-page UI text as account metadata.
 # v14.5 Concurrent FB Login-Status Fix
 # Makes GUI login status safe while worker is actively using FB_Parser profile; preserves v14.4 video integrity fix.
 # v14.4 Standalone Video Integrity + Exact Reel Recovery Fix
@@ -1950,6 +1962,14 @@ def _clean_fb_account_name(raw: str) -> str:
         "建立貼文", "建立帖子", "建立", "發佈", "發布", "相片", "照片",
         "限時動態", "建立限時動態", "建立限時动态", "新增限時動態",
         "限时动态", "建立限时动态", "動態消息", "首頁", "通知", "朋友", "社團", "Marketplace",
+        # v14.6: Facebook error/unavailable-page UI must never become Post Account.
+        "目前無法查看此內容", "目前无法查看此内容", "此內容目前無法使用", "此内容目前无法使用",
+        "很抱歉，此內容目前無法使用", "很抱歉，此内容目前无法使用",
+        "你可能看到這則訊息的原因是", "你可能看到这则消息的原因是",
+        "前往動態消息", "前往动态消息", "返回動態消息", "返回动态消息",
+        "回到動態消息", "回到动态消息",
+        "瀏覽使用說明", "浏览使用说明", "上線狀態指標 在線上", "上线状态指标 在线",
+        "查看限時動態", "查看限时动态",
     }
     if value.lower() in bad:
         return ""
@@ -2014,6 +2034,740 @@ def _split_fb_title_account(title: str) -> tuple[str, str]:
             return right_title, left_account
 
     return _clean_fb_post_title_for_path(raw, fallback=""), ""
+
+
+def _fb_v147_parse_generic_share_url(url: str) -> str:
+    """Return opaque token for /share/<token>/, excluding typed /share/p|v|r/."""
+    raw = html.unescape(unquote(str(url or "")))
+    try:
+        path = urlparse(raw).path or ""
+    except Exception:
+        path = raw
+    m = re.search(r"/share/([^/?#]+)/?$", path, flags=re.I)
+    if not m:
+        return ""
+    token = str(m.group(1) or "").strip()
+    if not token or token.lower() in {"p", "v", "r"}:
+        return ""
+    return token
+
+
+def _fb_v147_is_generic_share_url(url: str) -> bool:
+    return bool(_fb_v147_parse_generic_share_url(url))
+
+
+def _fb_v147_candidate_canonical_score(url: str) -> int:
+    u = html.unescape(unquote(str(url or ""))).strip()
+    if not u or "facebook.com" not in u.lower():
+        return -1
+    low = u.lower()
+    if _fb_v147_is_generic_share_url(u):
+        return 0
+    if re.search(r"/[^/?#]+/posts/\d{8,}", u, flags=re.I):
+        return 1000
+    if re.search(r"/(?:reel|reels|videos?)/\d{6,}", u, flags=re.I):
+        return 980
+    if re.search(r"[?&](?:fbid|photo_id)=\d{8,}", u, flags=re.I) and "/photo" in low:
+        return 960
+    if "story_fbid=" in low or "post_id=" in low or "story.php" in low:
+        return 940
+    if re.search(r"/share/[pvr]/[^/?#]+", u, flags=re.I):
+        return 700
+    return 100
+
+
+def _fb_v147_resolve_authenticated_share_target(page, original_url: str) -> str:
+    """Resolve generic share token after authenticated page render."""
+    candidates = []
+
+    def add(value, source):
+        value = html.unescape(str(value or "")).strip()
+        if not value or "facebook.com" not in value.lower():
+            return
+        score = _fb_v147_candidate_canonical_score(value)
+        if score <= 0:
+            return
+        candidates.append((score, source, value))
+
+    try:
+        add(page.url, "page.url")
+    except Exception:
+        pass
+
+    try:
+        vals = page.evaluate(
+            r"""
+            () => {
+              const out = [];
+              const push = (v, source) => {
+                v = String(v || '').trim();
+                if (v) out.push({v, source});
+              };
+
+              const canon = document.querySelector('link[rel="canonical"]');
+              if (canon) push(canon.href || canon.getAttribute('href'), 'canonical');
+
+              const og = document.querySelector('meta[property="og:url"]');
+              if (og) push(og.content || og.getAttribute('content'), 'og:url');
+
+              const tw = document.querySelector('meta[name="twitter:url"]');
+              if (tw) push(tw.content || tw.getAttribute('content'), 'twitter:url');
+
+              const roots = [
+                ...Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')),
+                ...Array.from(document.querySelectorAll('[role="article"], article')),
+                document
+              ];
+
+              for (const root of roots) {
+                const anchors = Array.from(root.querySelectorAll('a[href]')).slice(0, 600);
+                for (const a of anchors) {
+                  const h = String(a.href || a.getAttribute('href') || '');
+                  const low = h.toLowerCase();
+                  if (
+                    /\/[^/?#]+\/posts\/\d{8,}/i.test(h) ||
+                    /\/(?:reel|reels|videos?)\/\d{6,}/i.test(h) ||
+                    (low.includes('/photo') && /[?&](?:fbid|photo_id)=\d{8,}/i.test(h)) ||
+                    low.includes('story_fbid=') ||
+                    low.includes('post_id=')
+                  ) {
+                    push(h, 'permalink');
+                  }
+                }
+                if (out.length > 160) break;
+              }
+              return out;
+            }
+            """
+        ) or []
+        for item in vals:
+            add((item or {}).get("v"), (item or {}).get("source") or "dom")
+    except Exception as e:
+        logger.debug(f"FB v14.7 authenticated share canonical scan skipped: {e}")
+
+    if not candidates:
+        return ""
+
+    source_bonus = {
+        "canonical": 50,
+        "og:url": 40,
+        "twitter:url": 30,
+        "page.url": 20,
+        "permalink": 10,
+    }
+    candidates.sort(
+        key=lambda x: (x[0] + source_bonus.get(x[1], 0), -len(x[2])),
+        reverse=True,
+    )
+    best_score, best_source, best_url = candidates[0]
+    logger.info(
+        f"FB v14.7 authenticated share resolved: "
+        f"source={best_source}, score={best_score}, target={best_url}"
+    )
+    return best_url
+
+
+def _fb_v147_effective_target_contract(original_url: str, resolved_url: str):
+    for candidate in (resolved_url, original_url):
+        if not candidate:
+            continue
+        try:
+            contract = _contract_parse_facebook_target(candidate)
+            if getattr(contract, "kind", "") != "unknown":
+                return contract
+        except Exception:
+            pass
+    try:
+        return _contract_parse_facebook_target(original_url)
+    except Exception:
+        return None
+
+
+def _fb_v146_parse_canonical_post_url(url: str) -> tuple[str, str]:
+    """Return (owner, post_id) for canonical /<owner>/posts/<post_id>/ URLs."""
+    raw = html.unescape(unquote(str(url or "")))
+    try:
+        path = urlparse(raw).path or ""
+    except Exception:
+        path = raw
+    m = re.search(r"/([^/?#]+)/posts/(\d{8,})(?:/|$)", path, flags=re.I)
+    if not m:
+        return "", ""
+    owner = str(m.group(1) or "").strip()
+    post_id = str(m.group(2) or "").strip()
+    if not owner or owner.lower() in {"share", "groups", "watch", "reel", "reels", "photo"}:
+        return "", ""
+    return owner, post_id
+
+
+def _fb_v146_is_unavailable_ui_text(value: str) -> bool:
+    t = re.sub(r"\s+", " ", _to_traditional(html.unescape(str(value or "")))).strip().lower()
+    if not t:
+        return False
+    markers = [
+        "目前無法查看此內容",
+        "此內容目前無法使用",
+        "很抱歉，此內容目前無法使用",
+        "你可能看到這則訊息的原因是",
+        "內容已遭移除",
+        "content isn't available",
+        "content is not available",
+        "this content isn't available",
+    ]
+    return any(x.lower() in t for x in markers)
+
+
+def _fb_v154_no_access_evidence(page, canonical_post_id: str = "") -> tuple[bool, str]:
+    """Return explicit audience/permission evidence for a proven canonical post.
+
+    NO_ACCESS is intentionally narrower than generic unavailable-page detection:
+    - the FB Parser persistent session must still be logged in (c_user cookie),
+    - the page must show Facebook's unavailable-content UI, and
+    - the explanatory text must explicitly mention limited audience / share scope.
+
+    A plain 404/not-found page is never classified NO_ACCESS here.
+    """
+    try:
+        cookies = page.context.cookies()
+        logged_in = any(
+            str(c.get("name") or "") == "c_user"
+            and "facebook.com" in str(c.get("domain") or "").lower()
+            for c in (cookies or [])
+        )
+    except Exception:
+        logged_in = False
+
+    if not logged_in:
+        return False, "FB Parser session has no c_user cookie"
+
+    try:
+        body = page.locator("body").inner_text(timeout=2500) or ""
+    except Exception:
+        try:
+            body = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            body = ""
+
+    text = re.sub(r"\s+", " ", _to_traditional(html.unescape(str(body or "")))).strip()
+    low = text.lower()
+    if not low:
+        return False, "empty body text"
+
+    # Strong not-found pages remain MISSING/UNAVAILABLE rather than NO_ACCESS.
+    hard_missing = [
+        "404",
+        "找不到此頁面",
+        "找不到這個頁面",
+        "page not found",
+        "the page you requested was not found",
+    ]
+    if any(x in low for x in hard_missing):
+        return False, "explicit not-found page"
+
+    unavailable_headers = [
+        "目前無法查看此內容",
+        "此內容目前無法使用",
+        "很抱歉，此內容目前無法使用",
+        "目前无法查看此内容",
+        "this content isn't available",
+        "this content is not available",
+        "content isn't available",
+    ]
+    audience_markers = [
+        "僅與一小群用戶分享",
+        "僅與一小群用户分享",
+        "只與一小群用戶分享",
+        "只与一小群用户分享",
+        "變更了分享對象",
+        "变更了分享对象",
+        "分享對象",
+        "分享对象",
+        "特定受眾",
+        "特定受众",
+        "audience",
+        "shared with a small group",
+        "shared with only a small group",
+        "changed who can see",
+        "changed the audience",
+        "not available to everyone",
+    ]
+
+    has_unavailable = any(x in low for x in unavailable_headers)
+    has_audience = any(x in low for x in audience_markers)
+    if not (has_unavailable and has_audience):
+        return False, "no explicit audience/share-scope restriction text"
+
+    post_id = re.sub(r"\D", "", str(canonical_post_id or ""))
+    reason = (
+        f"NO_ACCESS: Facebook canonical post {post_id or '-'} is visible to the authenticated "
+        "FB Parser only as an audience/share-scope restricted page; the current account does "
+        "not have permission to view the media"
+    )
+    return True, reason
+
+
+
+def _fb_v153_exact_post_serialized_candidates(page, post_id: str) -> list[dict]:
+    """Recover image candidates only from a serialized object bound to exact post_id.
+
+    This is intentionally narrower than generic page/network harvesting.  It is
+    used only after canonical /posts/<post_id> identity is already proven and the
+    visible exact scope is completely empty.  Objects that look video-bearing are
+    rejected so a video poster/thumbnail cannot become a false photo SUCCESS.
+    """
+    post_id = re.sub(r"\D", "", str(post_id or ""))
+    if not post_id:
+        return []
+
+    try:
+        rows = page.evaluate(
+            r"""
+            (postId) => {
+              const out = [];
+              const seen = new Set();
+              const idKeys = new Set([
+                'id','post_id','postId','story_fbid','storyFbid',
+                'legacy_fbid','legacyFbid','feedback_id','feedbackId'
+              ]);
+              const imageKey = /(image|photo|src|uri|url|display_url|image_uri|image_url)/i;
+              const videoKey = /(playable_url|browser_native|video_url|videoDelivery|dash_manifest|video_id)/i;
+
+              function add(v, why, score) {
+                if (typeof v !== 'string') return;
+                const u = v.replace(/\\\//g, '/')
+                           .replace(/\\u0025/gi,'%')
+                           .replace(/\\u0026/gi,'&')
+                           .replace(/\\u003d/gi,'=');
+                const low = u.toLowerCase();
+                if (!(low.includes('scontent') || low.includes('fbcdn.net'))) return;
+                if (low.includes('profile_pic') || low.includes('static.xx.fbcdn.net') ||
+                    low.includes('/rsrc.php') || low.includes('emoji') || low.includes('icon')) return;
+                if (seen.has(u)) return;
+                seen.add(u);
+                out.push({src:u, score, reason:why});
+              }
+
+              function hasId(obj) {
+                if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+                for (const [k,v] of Object.entries(obj)) {
+                  if (idKeys.has(k) && String(v || '') === postId) return true;
+                }
+                return false;
+              }
+
+              function objectLooksVideo(obj) {
+                try {
+                  for (const [k,v] of Object.entries(obj || {})) {
+                    if (videoKey.test(k) && v) return true;
+                  }
+                } catch (_) {}
+                return false;
+              }
+
+              function collect(obj, depth, base) {
+                if (depth > 7 || obj == null) return;
+                if (Array.isArray(obj)) {
+                  for (const v of obj) collect(v, depth+1, base-500);
+                  return;
+                }
+                if (typeof obj !== 'object') return;
+                for (const [k,v] of Object.entries(obj)) {
+                  if (typeof v === 'string' && imageKey.test(k)) add(v, 'v15.3-exact-post-json:'+k, base-depth*500);
+                  else if (typeof v === 'object') collect(v, depth+1, base-500);
+                }
+              }
+
+              function walk(obj, depth) {
+                if (depth > 30 || obj == null) return;
+                if (Array.isArray(obj)) {
+                  for (const v of obj) walk(v, depth+1);
+                  return;
+                }
+                if (typeof obj !== 'object') return;
+                if (hasId(obj)) {
+                  if (!objectLooksVideo(obj)) collect(obj, 0, 32000000);
+                  return;
+                }
+                for (const v of Object.values(obj)) walk(v, depth+1);
+              }
+
+              for (const s of Array.from(document.querySelectorAll(
+                'script[type="application/json"],script[data-sjs]'
+              ))) {
+                const t = s.textContent || '';
+                if (!t.includes(postId)) continue;
+                try { walk(JSON.parse(t), 0); } catch (_) {}
+              }
+              return out.slice(0, 24);
+            }
+            """,
+            post_id,
+        ) or []
+    except Exception:
+        rows = []
+
+    out = []
+    seen = set()
+    for row in rows:
+        try:
+            src = html.unescape(str((row or {}).get("src") or "")).replace("\\/", "/")
+            if not src or src in seen or not _looks_like_real_fb_media_url(src):
+                continue
+            if _is_probably_video_url(src) or _is_bad_fb_media_url(src.lower()):
+                continue
+            seen.add(src)
+            out.append({
+                "src": src,
+                "type": "image",
+                "score": int((row or {}).get("score") or 32_000_000) + _media_quality_score(src),
+                "reason": str((row or {}).get("reason") or "v15.3-exact-post-json"),
+                "exact_post_id": post_id,
+            })
+        except Exception:
+            continue
+
+    # Secondary exact-canonical metadata fallback.  Only permit it when the
+    # canonical URL itself contains the same post_id and the page has no video.
+    if not out:
+        canonical = ""
+        try:
+            canonical = str(
+                page.locator('link[rel="canonical"]').first.get_attribute("href") or ""
+            )
+        except Exception:
+            canonical = ""
+        video_visible = False
+        try:
+            video_visible = page.locator("video").count() > 0
+        except Exception:
+            video_visible = False
+        if post_id in canonical and not video_visible:
+            for sel, attr in [
+                ('meta[property="og:image"]', "content"),
+                ('meta[property="og:image:secure_url"]', "content"),
+                ('meta[name="twitter:image"]', "content"),
+            ]:
+                try:
+                    loc = page.locator(sel)
+                    for i in range(min(loc.count(), 3)):
+                        src = str(loc.nth(i).get_attribute(attr) or "").strip()
+                        if (
+                            src and src not in seen
+                            and _looks_like_real_fb_media_url(src)
+                            and not _is_bad_fb_media_url(src.lower())
+                            and not _is_probably_video_url(src)
+                        ):
+                            seen.add(src)
+                            out.append({
+                                "src": src,
+                                "type": "image",
+                                "score": 20_000_000 + _media_quality_score(src),
+                                "reason": "v15.3-exact-canonical-meta",
+                                "exact_post_id": post_id,
+                            })
+                except Exception:
+                    continue
+
+    out = _merge_unique_candidates(out, [])
+    out.sort(key=lambda c: int(c.get("score") or 0), reverse=True)
+    return out[:12]
+
+
+def _fb_v146_exact_post_root_data(page, post_id: str) -> dict:
+    """Resolve metadata and visible media from the exact canonical post container only."""
+    post_id = re.sub(r"\D", "", str(post_id or ""))
+    if not post_id:
+        return {}
+
+    try:
+        return page.evaluate(
+            r"""
+            (postId) => {
+              const visible = el => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       r.bottom > 0 && r.right > 0 &&
+                       r.left < innerWidth && r.top < innerHeight + 1200 &&
+                       s.display !== 'none' && s.visibility !== 'hidden' &&
+                       parseFloat(s.opacity || '1') > 0;
+              };
+              const clean = v => String(v || '').replace(/\s+/g, ' ').trim();
+              const anchors = Array.from(document.querySelectorAll('a[href]'));
+              const exactAnchors = anchors.filter(a => {
+                const h = String(a.href || a.getAttribute('href') || '');
+                return h.includes('/posts/' + postId) ||
+                       h.includes('story_fbid=' + postId) ||
+                       h.includes('post_id=' + postId);
+              });
+
+              let root = null;
+              for (const a of exactAnchors) {
+                const article = a.closest('[role="article"], article');
+                if (article && visible(article)) {
+                  root = article;
+                  break;
+                }
+              }
+
+              if (!root) {
+                const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'))
+                  .filter(visible)
+                  .sort((a,b) => {
+                    const ar=a.getBoundingClientRect(), br=b.getBoundingClientRect();
+                    return (br.width*br.height)-(ar.width*ar.height);
+                  });
+                root = dialogs[0] || null;
+              }
+
+              // v14.8: dedicated permalink pages can render the target article
+              // without repeating the /posts/<postId> anchor inside that article.
+              // Only use this fallback when location.href itself proves postId.
+              if (!root && String(location.href || '').includes('/posts/' + postId)) {
+                const articleCandidates = Array.from(
+                  document.querySelectorAll('[role="article"], article')
+                ).filter(visible).map(el => {
+                  const r = el.getBoundingClientRect();
+                  const media = Array.from(el.querySelectorAll('img,video')).filter(visible);
+                  const mediaArea = media.reduce((sum, m) => {
+                    const mr = m.getBoundingClientRect();
+                    return sum + Math.max(0, mr.width) * Math.max(0, mr.height);
+                  }, 0);
+                  return {el, mediaCount: media.length, mediaArea, area:r.width*r.height};
+                }).filter(x => x.mediaCount > 0);
+
+                articleCandidates.sort((a,b) =>
+                  (b.mediaCount - a.mediaCount) ||
+                  (b.mediaArea - a.mediaArea) ||
+                  (b.area - a.area)
+                );
+                root = articleCandidates.length ? articleCandidates[0].el : null;
+              }
+
+              if (!root && String(location.href || '').includes('/posts/' + postId)) {
+                const main = document.querySelector('[role="main"]');
+                if (main && visible(main) && main.querySelector('img,video')) {
+                  root = main;
+                }
+              }
+
+              if (!root) return {};
+
+              const rr = root.getBoundingClientRect();
+              const links = [];
+              const grid = [];
+              const media = [];
+              const seenLinks = new Set();
+
+              const pushSrc = (arr, src, type, score) => {
+                src = clean(src);
+                if (!src) return;
+                const low = src.toLowerCase();
+                if (!(low.includes('scontent') || low.includes('fbcdn.net'))) return;
+                if (low.includes('profile_pic') || low.includes('static.xx.fbcdn.net') ||
+                    low.includes('/rsrc.php') || low.includes('emoji') || low.includes('icon')) return;
+                arr.push({src, type, score});
+              };
+
+              let idx = 0;
+              for (const a of Array.from(root.querySelectorAll('a[href]'))) {
+                idx += 1;
+                const href = String(a.href || a.getAttribute('href') || '');
+                const low = href.toLowerCase();
+                const img = a.querySelector('img');
+                const looksPhoto = low.includes('/photo') || low.includes('fbid=') ||
+                                   low.includes('set=pcb.') || low.includes('/photos/');
+                if (!looksPhoto || !img) continue;
+
+                const ir = img.getBoundingClientRect();
+                const area = Math.max(0, ir.width) * Math.max(0, ir.height);
+                if (area < 900) continue;
+                if (!seenLinks.has(href)) {
+                  seenLinks.add(href);
+                  links.push(href);
+                }
+
+                const srcs = [];
+                const naturalArea = (img.naturalWidth || 0) * (img.naturalHeight || 0);
+                const base = 2600000 + area + Math.floor(naturalArea / 2);
+                pushSrc(srcs, img.currentSrc || '', 'image', base + 50000);
+                pushSrc(srcs, img.src || '', 'image', base + 40000);
+                pushSrc(srcs, img.getAttribute('src') || '', 'image', base + 30000);
+                const srcset = img.getAttribute('srcset') || '';
+                for (const part of srcset.split(',').map(x=>x.trim()).filter(Boolean)) {
+                  pushSrc(srcs, part.split(/\s+/)[0], 'image', base + 60000);
+                }
+                if (srcs.length) {
+                  grid.push({href, top:ir.top, left:ir.left, area, srcs});
+                }
+              }
+
+              let vindex = 0;
+              for (const v of Array.from(root.querySelectorAll('video'))) {
+                if (!visible(v)) continue;
+                vindex += 1;
+                const vr = v.getBoundingClientRect();
+                const area = Math.max(0, vr.width) * Math.max(0, vr.height);
+                if (area < 12000) continue;
+                const srcs = [];
+                const base = 3000000 + area + ((v.videoWidth||0)*(v.videoHeight||0));
+                pushSrc(srcs, v.currentSrc || '', 'video', base + 60000);
+                pushSrc(srcs, v.src || '', 'video', base + 50000);
+                for (const s of Array.from(v.querySelectorAll('source[src]'))) {
+                  pushSrc(srcs, s.src || s.getAttribute('src') || '', 'video', base + 70000);
+                }
+                media.push({
+                  kind:'video',
+                  top:vr.top, left:vr.left, area,
+                  cx:vr.left + vr.width/2,
+                  cy:vr.top + vr.height/2,
+                  srcs
+                });
+              }
+
+              for (const g of grid) {
+                media.push({kind:'image', top:g.top, left:g.left, area:g.area, href:g.href, srcs:g.srcs});
+              }
+              media.sort((a,b) => {
+                if (Math.abs(a.top-b.top) > 12) return a.top-b.top;
+                return a.left-b.left;
+              });
+
+              let title = '';
+              const titleNodes = Array.from(root.querySelectorAll(
+                'div[data-ad-preview="message"], div[dir="auto"], span[dir="auto"]'
+              ));
+              for (const el of titleNodes) {
+                const r = el.getBoundingClientRect();
+                if (r.bottom < rr.top || r.top > rr.top + Math.min(420, rr.height*0.45)) continue;
+                const t = clean(el.innerText || el.textContent || '');
+                if (t.length >= 8 && t.length <= 700) {
+                  const low = t.toLowerCase();
+                  if (!['讚','留言','分享','查看更多','目前無法查看此內容'].includes(low)) {
+                    title = t;
+                    break;
+                  }
+                }
+              }
+
+              let account = '';
+              const accountLinks = Array.from(root.querySelectorAll('a[href]')).slice(0,120);
+              for (const a of accountLinks) {
+                if (!visible(a)) continue;
+                const r = a.getBoundingClientRect();
+                if (r.top > rr.top + 220) continue;
+                const t = clean(a.innerText || a.textContent || a.getAttribute('aria-label') || '');
+                if (t.length < 2 || t.length > 80) continue;
+                const low = t.toLowerCase();
+                if (['讚','留言','分享','查看更多','目前無法查看此內容'].includes(low)) continue;
+                const href = String(a.href || '');
+                if (href.includes('/photo') || href.includes('/reel') || href.includes('/watch') ||
+                    href.includes('comment_id=') || href.includes('/posts/' + postId)) continue;
+                if (/facebook\.com\/(?:profile\.php|[A-Za-z0-9._-]+)/i.test(href)) {
+                  account = t;
+                  break;
+                }
+              }
+
+              return {
+                title, account, links, grid, media,
+                rootTop:rr.top, rootLeft:rr.left, rootWidth:rr.width, rootHeight:rr.height
+              };
+            }
+            """,
+            post_id,
+        ) or {}
+    except Exception as e:
+        logger.debug(f"FB v14.6 exact canonical post root extraction failed: {e}")
+        return {}
+
+
+def _fb_v146_scoped_grid_items(page, post_id: str) -> list[dict]:
+    data = _fb_v146_exact_post_root_data(page, post_id)
+    out = []
+    seen = set()
+    for rec in data.get("grid") or []:
+        href = str(rec.get("href") or "")
+        if not href or href in seen:
+            continue
+        candidates = []
+        for item in rec.get("srcs") or []:
+            src = str(item.get("src") or "")
+            if not _looks_like_real_fb_media_url(src):
+                continue
+            candidates.append({
+                "type": item.get("type") or _media_type_from_url(src),
+                "src": src,
+                "score": int(item.get("score") or 0) + _media_quality_score(src),
+            })
+        candidates = _dedupe_ordered(candidates)
+        if not candidates:
+            continue
+        seen.add(href)
+        out.append({"href": href, "candidates": candidates})
+    return out
+
+
+def _fb_v146_scoped_photo_links(page, post_id: str) -> list[str]:
+    data = _fb_v146_exact_post_root_data(page, post_id)
+    out, seen = [], set()
+    for href in data.get("links") or []:
+        href = str(href or "")
+        if href and href not in seen and "facebook.com" in href:
+            seen.add(href)
+            out.append(href)
+    return out
+
+
+def _fb_v146_click_scoped_plus(page, post_id: str) -> bool:
+    """Click +N only inside the exact canonical post root."""
+    post_id = re.sub(r"\D", "", str(post_id or ""))
+    if not post_id:
+        return False
+    try:
+        result = page.evaluate(
+            r"""
+            (postId) => {
+              const visible = el => {
+                if (!el) return false;
+                const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+                return r.width>0 && r.height>0 && r.bottom>0 && r.right>0 &&
+                       s.display!=='none' && s.visibility!=='hidden';
+              };
+              const anchors=Array.from(document.querySelectorAll('a[href]'));
+              let root=null;
+              for (const a of anchors) {
+                const h=String(a.href||'');
+                if (h.includes('/posts/'+postId) || h.includes('story_fbid='+postId) || h.includes('post_id='+postId)) {
+                  const art=a.closest('[role="article"], article');
+                  if (art && visible(art)) { root=art; break; }
+                }
+              }
+              if (!root) {
+                const ds=Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')).filter(visible);
+                root=ds[0]||null;
+              }
+              if (!root) return '';
+              for (const el of Array.from(root.querySelectorAll('*'))) {
+                const t=String(el.innerText||el.textContent||'').trim();
+                if (/^\+\d+$/.test(t) && visible(el)) {
+                  const clicker=el.closest('a,button,[role="button"]')||el;
+                  try { clicker.click(); return t; } catch(e) {}
+                }
+              }
+              return '';
+            }
+            """,
+            post_id,
+        ) or ""
+        if result:
+            page.wait_for_timeout(2500)
+            logger.info(f"FB v14.6 exact canonical post +N expanded: {result}")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _fb_metadata_url_aliases(task_url: str) -> list[str]:
@@ -5664,12 +6418,13 @@ def _strict_visible_photo_candidates(page, *, prefer_dialog: bool = True) -> lis
 def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict]:
     """Open one exact photo permalink and collect only that foreground photo.
 
-    v13.2 adds an exact-photo response fallback for the 7/8 class of failures:
-    Facebook can expose a proven set=pcb photo permalink but render no usable
-    <img> candidate for that slide.  We capture image responses only while the
-    exact photo page is loading and use them *only* when DOM extraction is empty.
-    The requested fbid must still be present in the loaded page URL or serialized
-    page HTML, so this fallback cannot silently widen into recommendations.
+    v15.0:
+    - The exact fbid permalink is the identity anchor.
+    - Persist exact-page meta/response image bytes *before* closing the temporary page,
+      so expiring CDN URLs cannot later turn a proven item into pack-unresolved.
+    - Prefer og:image/twitter:image from the exact fbid page because SPA DOM can keep
+      showing the previous slide even while the canonical target is already different.
+    - Never marks success here; global exact-count/content-hash/completeness guards remain authoritative.
     """
     p = None
     response_candidates = []
@@ -5679,6 +6434,195 @@ def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict
         target_fbid = m.group(1) if m else ""
     except Exception:
         target_fbid = ""
+
+    def _persist_exact_candidate(candidate: dict, *, prefix: str = "exact") -> dict:
+        """Persist a candidate while the exact page/session is alive."""
+        if not isinstance(candidate, dict):
+            return candidate
+        src_url = str(candidate.get("src") or "").strip()
+        if not src_url or not _looks_like_real_fb_media_url(src_url):
+            return candidate
+        if candidate.get("temp_path") and os.path.exists(str(candidate.get("temp_path"))):
+            return candidate
+        try:
+            resp = context.request.get(
+                src_url,
+                headers={
+                    "Referer": link,
+                    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+                timeout=15000,
+            )
+            if not resp.ok:
+                return candidate
+            body = resp.body()
+            ctype = str((resp.headers or {}).get("content-type") or "").lower()
+            if not body or len(body) < _FB_FULL_GALLERY_SOURCE_MIN_SIZE:
+                return candidate
+            if not _is_valid_fb_still_image_body(body, media_url=src_url, content_type=ctype):
+                return candidate
+            capture_dir = os.path.join(TEMP_DIR, "_fb_capture")
+            os.makedirs(capture_dir, exist_ok=True)
+            digest = hashlib.md5(body).hexdigest()
+            ext = _ext_from_url(src_url, ".jpg")
+            path = os.path.join(
+                capture_dir,
+                f"{prefix}_fbid_{target_fbid or idx}_{digest[:16]}{ext}",
+            )
+            if not os.path.exists(path) or os.path.getsize(path) < len(body):
+                with open(path, "wb") as f:
+                    f.write(body)
+            out = dict(candidate)
+            out["temp_path"] = path
+            out["persisted_path"] = path
+            out["body_size"] = len(body)
+            out["content_length"] = max(int(out.get("content_length") or 0), len(body))
+            out["content_hash"] = f"md5:{digest}"
+            out["exact_fbid"] = target_fbid
+            out["score"] = int(out.get("score") or 0) + 8_000_000 + min(len(body), 1_200_000)
+            return out
+        except Exception:
+            return candidate
+
+    def _collect_exact_serialized_candidates(page_obj, body_text: str) -> list[dict]:
+        """Recover image URLs from the serialized object bound to the exact target fbid.
+
+        Facebook's SPA may keep the previous slide visible even when the URL already
+        points at another fbid.  This helper therefore prefers structured JSON objects
+        whose own id/fbid/photo_id equals target_fbid, then falls back to only a very
+        small text window around the exact id.  It never widens to unrelated page media.
+        """
+        if not target_fbid:
+            return []
+
+        raw_rows = []
+        try:
+            raw_rows = page_obj.evaluate(
+                r"""
+                (targetFbid) => {
+                  const out = [];
+                  const seen = new Set();
+                  const imageKey = /(?:image|photo|preview|thumbnail|uri|url|src)/i;
+                  const idKeys = new Set(['id','fbid','photo_id','legacy_fbid','legacy_id','media_id']);
+
+                  function pushUrl(v, reason, score) {
+                    if (typeof v !== 'string') return;
+                    const s = v.replace(/\\\//g, '/').replace(/\u0025/gi, '%').replace(/\u0026/gi, '&').replace(/\u003d/gi, '=');
+                    if (!/^https?:\/\//i.test(s)) return;
+                    if (!/(?:fbcdn\.net|scontent[^/]*\.fna\.fbcdn\.net)/i.test(s)) return;
+                    if (seen.has(s)) return;
+                    seen.add(s);
+                    out.push({src:s, reason, score});
+                  }
+
+                  function collectUrls(obj, depth, reason, baseScore) {
+                    if (depth > 8 || obj == null) return;
+                    if (typeof obj === 'string') {
+                      pushUrl(obj, reason, baseScore - depth * 1000);
+                      return;
+                    }
+                    if (Array.isArray(obj)) {
+                      for (const x of obj.slice(0, 100)) collectUrls(x, depth + 1, reason, baseScore);
+                      return;
+                    }
+                    if (typeof obj !== 'object') return;
+                    for (const [k,v] of Object.entries(obj)) {
+                      if (typeof v === 'string' && imageKey.test(k)) pushUrl(v, reason + ':' + k, baseScore + 30000 - depth*1000);
+                      else collectUrls(v, depth + 1, reason, baseScore);
+                    }
+                  }
+
+                  function hasDirectTargetId(obj) {
+                    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+                    for (const [k,v] of Object.entries(obj)) {
+                      if (idKeys.has(k) && String(v || '') === targetFbid) return true;
+                    }
+                    return false;
+                  }
+
+                  function walk(obj, depth) {
+                    if (depth > 30 || obj == null) return;
+                    if (Array.isArray(obj)) {
+                      for (const x of obj) walk(x, depth + 1);
+                      return;
+                    }
+                    if (typeof obj !== 'object') return;
+                    if (hasDirectTargetId(obj)) {
+                      collectUrls(obj, 0, 'v15.2-exact-json-object', 30000000);
+                      return;
+                    }
+                    for (const v of Object.values(obj)) walk(v, depth + 1);
+                  }
+
+                  for (const s of Array.from(document.querySelectorAll('script[type="application/json"],script[data-sjs]'))) {
+                    const t = s.textContent || '';
+                    if (!t.includes(targetFbid)) continue;
+                    try { walk(JSON.parse(t), 0); } catch (_) {}
+                  }
+                  return out.slice(0, 24);
+                }
+                """,
+                target_fbid,
+            ) or []
+        except Exception:
+            raw_rows = []
+
+        out = []
+        seen = set()
+        for row in raw_rows:
+            try:
+                u = html.unescape(str((row or {}).get("src") or "")).replace("\\/", "/")
+                if not u or u in seen or not _looks_like_real_fb_media_url(u):
+                    continue
+                if _is_probably_video_url(u) or _is_bad_fb_media_url(u.lower()):
+                    continue
+                seen.add(u)
+                cand = {
+                    "src": u,
+                    "type": "image",
+                    "score": int((row or {}).get("score") or 30_000_000) + _media_quality_score(u),
+                    "reason": str((row or {}).get("reason") or "v15.2-exact-json-object"),
+                    "exact_fbid": target_fbid,
+                }
+                out.append(_persist_exact_candidate(cand, prefix="exactjson"))
+            except Exception:
+                continue
+
+        # Very narrow fallback for Facebook payloads that are embedded as non-JSON text.
+        # Only URLs within 4500 chars of the exact fbid are considered.
+        if not out and body_text:
+            try:
+                for m in re.finditer(re.escape(target_fbid), body_text):
+                    lo = max(0, m.start() - 4500)
+                    hi = min(len(body_text), m.end() + 4500)
+                    window = body_text[lo:hi]
+                    for um in re.finditer(r'https?:[^\s"\'<>]{20,}', window):
+                        raw = um.group(0)
+                        u = html.unescape(raw).replace("\\/", "/")
+                        u = re.sub(r"\\u0025", "%", u, flags=re.I)
+                        u = re.sub(r"\\u0026", "&", u, flags=re.I)
+                        u = re.sub(r"\\u003d", "=", u, flags=re.I)
+                        if not _looks_like_real_fb_media_url(u) or _is_probably_video_url(u):
+                            continue
+                        if _is_bad_fb_media_url(u.lower()) or u in seen:
+                            continue
+                        seen.add(u)
+                        distance = abs((lo + um.start()) - m.start())
+                        cand = {
+                            "src": u,
+                            "type": "image",
+                            "score": 25_000_000 - min(distance, 1_000_000) + _media_quality_score(u),
+                            "reason": "v15.2-exact-fbid-nearby-serialized",
+                            "exact_fbid": target_fbid,
+                        }
+                        out.append(_persist_exact_candidate(cand, prefix="exactnear"))
+            except Exception:
+                pass
+
+        out = _merge_unique_candidates(out, [])
+        out.sort(key=lambda c: int(c.get("score") or 0), reverse=True)
+        return out[:12]
 
     def _on_response(resp):
         try:
@@ -5697,16 +6641,46 @@ def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict
                 clen = int(headers.get("content-length") or headers.get("Content-Length") or 0)
             except Exception:
                 clen = 0
-            # Skip obvious tiny UI assets; the exact target photo is normally much larger.
             if clen and clen < 12000:
                 return
-            response_candidates.append({
+
+            cand = {
                 "src": u,
                 "type": "image",
                 "score": max(650000, clen * 8),
                 "content_length": clen,
-                "reason": "v13.2-exact-photo-response",
-            })
+                "reason": "v15.2-exact-photo-response",
+                "exact_fbid": target_fbid,
+            }
+
+            # Persist from the browser response itself when possible. This is both
+            # faster and safer than requesting an expiring CDN URL again later.
+            try:
+                body = resp.body()
+                if body and len(body) >= _FB_FULL_GALLERY_SOURCE_MIN_SIZE and _is_valid_fb_still_image_body(
+                    body, media_url=u, content_type=ctype
+                ):
+                    capture_dir = os.path.join(TEMP_DIR, "_fb_capture")
+                    os.makedirs(capture_dir, exist_ok=True)
+                    digest = hashlib.md5(body).hexdigest()
+                    ext = _ext_from_url(u, ".jpg")
+                    path = os.path.join(
+                        capture_dir,
+                        f"exactresp_fbid_{target_fbid or idx}_{digest[:16]}{ext}",
+                    )
+                    if not os.path.exists(path) or os.path.getsize(path) < len(body):
+                        with open(path, "wb") as f:
+                            f.write(body)
+                    cand["temp_path"] = path
+                    cand["persisted_path"] = path
+                    cand["body_size"] = len(body)
+                    cand["content_length"] = max(clen, len(body))
+                    cand["content_hash"] = f"md5:{digest}"
+                    cand["score"] = int(cand["score"]) + 6_000_000 + min(len(body), 1_200_000)
+            except Exception:
+                pass
+
+            response_candidates.append(cand)
         except Exception:
             return
 
@@ -5716,31 +6690,13 @@ def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict
             p.on("response", _on_response)
         except Exception:
             pass
-        p.goto(link, wait_until="domcontentloaded", timeout=60000)
-        p.wait_for_timeout(1800)
+        p.goto(link, wait_until="domcontentloaded", timeout=30000)
+        p.wait_for_timeout(700)
         try:
-            p.wait_for_load_state("networkidle", timeout=4500)
+            p.wait_for_load_state("networkidle", timeout=1800)
         except Exception:
             pass
 
-        candidates = _strict_visible_photo_candidates(p, prefer_dialog=True)
-        if not candidates:
-            candidates = _strict_visible_photo_candidates(p, prefer_dialog=False)
-
-        if not candidates or candidates[0].get("score", 0) < 500000:
-            try:
-                _click_plus_overlay_or_first_photo(p)
-                p.wait_for_timeout(1500)
-                candidates2 = _strict_visible_photo_candidates(p, prefer_dialog=True)
-                if candidates2:
-                    candidates = candidates2
-            except Exception:
-                pass
-
-        # Exact-photo identity proof.  A non-empty DOM candidate list is not enough:
-        # logged-in photo permalinks can render a neighboring/preloaded slide while
-        # the requested fbid is still the canonical target.  Bind response candidates
-        # back to the exact page serialization before adding them as alternates.
         exact_page = False
         body = ""
         try:
@@ -5756,43 +6712,130 @@ def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict
             except Exception:
                 body = ""
 
+        # v15.2 strongest source: the serialized object whose own identity equals
+        # target_fbid.  This fixes the SPA case where exact fbid #4 still displays
+        # slide #3 in DOM/meta and would otherwise produce deterministic 4/5 RETRY.
+        exact_serialized = _collect_exact_serialized_candidates(p, body) if exact_page else []
+        if exact_serialized:
+            logger.info(
+                f"FB v15.2 exact-fbid serialized recovery: idx={idx}, "
+                f"fbid={target_fbid}, candidates={len(exact_serialized)}"
+            )
+
+        # Metadata is now secondary because Facebook SPA metadata can lag one slide.
+        exact_meta = []
+        if exact_page:
+            for sel, attr in [
+                ('meta[property="og:image"]', "content"),
+                ('meta[property="og:image:secure_url"]', "content"),
+                ('meta[name="twitter:image"]', "content"),
+                ('link[rel="preload"][as="image"]', "href"),
+            ]:
+                try:
+                    loc = p.locator(sel)
+                    for n in range(min(loc.count(), 4)):
+                        u = str(loc.nth(n).get_attribute(attr) or "").strip()
+                        if not u or not _looks_like_real_fb_media_url(u):
+                            continue
+                        cand = {
+                            "src": u,
+                            "type": "image",
+                            "score": 12_000_000 + _media_quality_score(u),
+                            "reason": "v15.2-exact-fbid-meta",
+                            "exact_fbid": target_fbid,
+                        }
+                        exact_meta.append(_persist_exact_candidate(cand, prefix="exactmeta"))
+                except Exception:
+                    continue
+            exact_meta = _merge_unique_candidates(exact_meta, [])
+
+        candidates = _strict_visible_photo_candidates(p, prefer_dialog=True)
+        if not candidates:
+            candidates = _strict_visible_photo_candidates(p, prefer_dialog=False)
+
+        # Only one short foreground refresh; do not spend minutes walking the viewer
+        # here. Exact metadata/response captures are the identity-bound recovery.
+        if not candidates or candidates[0].get("score", 0) < 500000:
+            try:
+                _click_plus_overlay_or_first_photo(p)
+                p.wait_for_timeout(500)
+                candidates2 = _strict_visible_photo_candidates(p, prefer_dialog=True)
+                if candidates2:
+                    candidates = candidates2
+            except Exception:
+                pass
+
         tied_response = []
         if exact_page and response_candidates:
             body_norm = str(body or "").replace("\\/", "/")
             for cand in response_candidates:
                 try:
-                    src = html.unescape(str(cand.get("src") or ""))
-                    base = os.path.basename(urlparse(src.split("?", 1)[0]).path)
-                    src_escaped = src.replace("/", "\\/")
-                    if (src and (src in body_norm or src_escaped in body)) or (base and len(base) >= 16 and base in body_norm):
+                    src_url = html.unescape(str(cand.get("src") or ""))
+                    base = os.path.basename(urlparse(src_url.split("?", 1)[0]).path)
+                    src_escaped = src_url.replace("/", "\\/")
+                    if (
+                        (src_url and (src_url in body_norm or src_escaped in body))
+                        or (base and len(base) >= 16 and base in body_norm)
+                    ):
                         tied_response.append(cand)
                 except Exception:
                     continue
 
-        if tied_response:
-            merged = _merge_unique_candidates(candidates or [], tied_response)
+        # Persist identity-bound responses before this temporary page is closed.
+        tied_response = [
+            _persist_exact_candidate(c, prefix="exacttied")
+            for c in tied_response
+            if isinstance(c, dict)
+        ]
+
+        if exact_serialized:
+            merged = _merge_unique_candidates(exact_serialized, exact_meta)
+            merged = _merge_unique_candidates(merged, tied_response)
+            merged = _merge_unique_candidates(merged, candidates or [])
             logger.info(
-                f"FB v13.3 exact-photo identity-bound response merge: idx={idx}, fbid={target_fbid}, "
+                f"FB v15.2 exact-fbid identity candidates: idx={idx}, fbid={target_fbid}, "
+                f"serialized={len(exact_serialized)}, meta={len(exact_meta)}, "
+                f"tied={len(tied_response)}, dom={len(candidates or [])}, merged={len(merged)}"
+            )
+            return merged[:16]
+
+        if exact_meta:
+            merged = _merge_unique_candidates(exact_meta, tied_response)
+            merged = _merge_unique_candidates(merged, candidates or [])
+            logger.info(
+                f"FB v15.2 exact-fbid persisted candidates: idx={idx}, fbid={target_fbid}, "
+                f"meta={len(exact_meta)}, tied={len(tied_response)}, dom={len(candidates or [])}, merged={len(merged)}"
+            )
+            return merged[:12]
+
+        if tied_response:
+            merged = _merge_unique_candidates(tied_response, candidates or [])
+            logger.info(
+                f"FB v15.2 exact-photo persisted response merge: idx={idx}, fbid={target_fbid}, "
                 f"dom={len(candidates or [])}, tied={len(tied_response)}, merged={len(merged)}"
             )
             return merged[:12]
 
-        if candidates:
-            return candidates
-
-        # Last bounded fallback: only when the exact fbid is proven and DOM has no
-        # usable image at all.  Keep the historical response-only behavior, but do
-        # not use it when a visible DOM candidate exists.
         if exact_page and response_candidates:
-            merged = _merge_unique_candidates(response_candidates, [])
-            merged.sort(key=lambda c: (int(c.get("content_length") or 0), int(c.get("score") or 0)), reverse=True)
+            merged = _merge_unique_candidates(response_candidates, candidates or [])
+            merged.sort(
+                key=lambda c: (
+                    1 if c.get("temp_path") or c.get("persisted_path") else 0,
+                    int(c.get("body_size") or c.get("content_length") or 0),
+                    int(c.get("score") or 0),
+                ),
+                reverse=True,
+            )
             logger.info(
-                f"FB v13.3 exact-photo response-only fallback: idx={idx}, fbid={target_fbid}, "
+                f"FB v15.2 exact-photo response fallback: idx={idx}, fbid={target_fbid}, "
                 f"candidates={len(merged)}"
             )
-            return merged[:8]
+            return merged[:10]
 
+        if candidates:
+            return candidates
         return []
+
     except Exception as e:
         logger.warning(f"FB fresh photo page 第 {idx} 張開啟失敗: {e}")
         return []
@@ -5806,7 +6849,6 @@ def _open_photo_link_collect_fresh(context, link: str, *, idx: int) -> list[dict
                 p.close()
         except Exception:
             pass
-
 
 
 def _media_type_from_url(url: str) -> str:
@@ -8753,21 +9795,35 @@ def _fb_v143_exact_direct_photo_candidates(page, target_fbid: str) -> list[dict]
 
 
 def _collect_fb_media_playwright(url: str):
-    logger.info("FB v14.5 integrated pipeline active: concurrent login-status fix + standalone-video integrity + exact reel recovery")
+    logger.info("FB v15.4 integrated pipeline active: NO_ACCESS classification + exact-post structured recovery + strict no-false-success")
+    canonical_owner_v146, canonical_post_id_v146 = _fb_v146_parse_canonical_post_url(url)
+    generic_share_token_v147 = _fb_v147_parse_generic_share_url(url)
     try:
         _target_contract = _contract_parse_facebook_target(url)
+        if generic_share_token_v147:
+            log_kind_v146 = "generic_share"
+        else:
+            log_kind_v146 = (
+                "post_permalink"
+                if canonical_post_id_v146 and getattr(_target_contract, "kind", "") == "unknown"
+                else getattr(_target_contract, "kind", "unknown")
+            )
+        log_post_id_v146 = canonical_post_id_v146 or getattr(_target_contract, "post_id", "")
         logger.info(
-            f"FB v13.0 target identity: kind={_target_contract.kind}, "
-            f"numeric_id={_target_contract.numeric_id or '-'}, "
-            f"story_fbid={_target_contract.story_fbid or '-'}, "
-            f"post_id={_target_contract.post_id or '-'}, share_token={_target_contract.share_token or '-'}"
+            f"FB v14.7 initial target identity: kind={log_kind_v146}, "
+            f"numeric_id={getattr(_target_contract, 'numeric_id', '') or '-'}, "
+            f"story_fbid={getattr(_target_contract, 'story_fbid', '') or '-'}, "
+            f"post_id={log_post_id_v146 or '-'}, "
+            f"share_token={generic_share_token_v147 or getattr(_target_contract, 'share_token', '') or '-'}, "
+            f"owner={canonical_owner_v146 or '-'}"
         )
     except Exception as _contract_e:
-        logger.debug(f"FB v13.0 target identity parse skipped: {_contract_e}")
+        logger.debug(f"FB v14.7 initial target identity parse skipped: {_contract_e}")
     clear_temp()
 
     browser = None
     context = None
+    page = None
 
     try:
         resolved = _resolve_share_url(url)
@@ -8907,7 +9963,65 @@ def _collect_fb_media_playwright(url: str):
             if "login" in current_url and "facebook.com/login" in current_url:
                 return "BLOCKED", "Facebook Playwright 偵測需登入"
 
+            if generic_share_token_v147:
+                authenticated_target_v147 = _fb_v147_resolve_authenticated_share_target(page, url)
+                if authenticated_target_v147:
+                    resolved = authenticated_target_v147
+                    effective_contract_v147 = _fb_v147_effective_target_contract(url, resolved)
+                    if effective_contract_v147 is not None:
+                        _target_contract = effective_contract_v147
+
+                    canonical_owner_v146, canonical_post_id_v146 = _fb_v146_parse_canonical_post_url(resolved)
+                    effective_kind_v147 = getattr(_target_contract, "kind", "unknown") if _target_contract else "unknown"
+                    if canonical_post_id_v146:
+                        effective_kind_v147 = "post_permalink"
+
+                    logger.info(
+                        f"FB v14.7 effective target identity: kind={effective_kind_v147}, "
+                        f"numeric_id={getattr(_target_contract, 'numeric_id', '') or '-'}, "
+                        f"story_fbid={getattr(_target_contract, 'story_fbid', '') or '-'}, "
+                        f"post_id={canonical_post_id_v146 or getattr(_target_contract, 'post_id', '') or '-'}, "
+                        f"share_token={getattr(_target_contract, 'share_token', '') or '-'}, "
+                        f"owner={canonical_owner_v146 or '-'}, resolved={resolved}"
+                    )
+                else:
+                    clear_temp()
+                    return (
+                        "RETRY",
+                        f"Facebook generic share token {generic_share_token_v147} "
+                        "did not expose an exact canonical post/reel/photo identity in the authenticated page; "
+                        "refuse generic page-media fallback",
+                    )
+
             title = _clean_fb_post_title_for_path(_get_fb_title(page), fallback="Facebook_Post")
+
+            # v14.6 canonical /<owner>/posts/<post_id>/ metadata lock.
+            # Scope metadata to the exact visible post root; never accept Facebook
+            # unavailable/error UI text as Post Account.
+            if canonical_post_id_v146:
+                exact_root_v146 = _fb_v146_exact_post_root_data(page, canonical_post_id_v146)
+                exact_title_v146 = _clean_fb_post_title_for_path(
+                    exact_root_v146.get("title") or "",
+                    fallback="",
+                )
+                exact_account_v146 = _clean_fb_account_name(exact_root_v146.get("account") or "")
+                if _fb_v146_is_unavailable_ui_text(exact_account_v146):
+                    exact_account_v146 = ""
+                if exact_title_v146 and not _fb_v146_is_unavailable_ui_text(exact_title_v146):
+                    title = exact_title_v146
+                title, exact_account_v146 = _publish_fb_task_metadata(
+                    url,
+                    title if title != "Facebook_Post" else "",
+                    exact_account_v146,
+                    page=None,
+                    account_locked=bool(exact_account_v146),
+                )
+                logger.info(
+                    f"FB v14.6 canonical post metadata: "
+                    f"post_id={canonical_post_id_v146}, "
+                    f"account={exact_account_v146 or '-'}, title={title or '-'}, "
+                    f"scoped_media={len(exact_root_v146.get('media') or [])}"
+                )
 
             # v14.3 exact direct-photo lock.
             #
@@ -9195,9 +10309,158 @@ def _collect_fb_media_playwright(url: str):
                     return _classify_error(f"Facebook Reel 影片下載失敗: {e}")
 
             # 第一階段：先從原貼文收集 photo links / grid items，這裡最接近畫面順序
-            grid_before = _collect_fb_grid_items(page)
-            links_before = _collect_fb_photo_links(page)
-            plus_count_before = _detect_fb_plus_overlay_count(page)
+            if canonical_post_id_v146:
+                grid_before = _fb_v146_scoped_grid_items(page, canonical_post_id_v146)
+                links_before = _fb_v146_scoped_photo_links(page, canonical_post_id_v146)
+                plus_count_before = _detect_fb_plus_overlay_count(page)
+                logger.info(
+                    f"FB v14.6 canonical post exact scope before expansion: "
+                    f"post_id={canonical_post_id_v146}, grid={len(grid_before)}, "
+                    f"links={len(links_before)}, plus={plus_count_before}"
+                )
+
+                # v15.1 Zero-Evidence Fast Exit Gate.
+                # If an authenticated generic-share resolves to an exact canonical
+                # post but that exact post exposes no scoped media, no exact photo
+                # links, no grid tiles and no +N evidence, do one short bounded
+                # canonical reload/re-scan.  If the exact scope is still empty,
+                # return RETRY immediately instead of entering the long viewer /
+                # exhaustive candidate pipeline.  This does NOT relax SUCCESS:
+                # posts with any exact evidence continue through the normal strict
+                # gallery/video integrity path.
+                try:
+                    _zero_media_v151 = len((exact_root_v146 or {}).get("media") or []) == 0
+                except Exception:
+                    _zero_media_v151 = True
+                _zero_scope_v151 = bool(
+                    _zero_media_v151
+                    and len(grid_before or []) == 0
+                    and len(links_before or []) == 0
+                    and int(plus_count_before or 0) == 0
+                )
+                if _zero_scope_v151:
+                    logger.info(
+                        f"FB v15.1 zero-evidence gate: first scan empty for canonical post "
+                        f"{canonical_post_id_v146}; run one bounded reload/re-scan"
+                    )
+                    try:
+                        page.goto(resolved, wait_until="domcontentloaded", timeout=15000)
+                        page.wait_for_timeout(1200)
+                    except Exception as _e:
+                        logger.debug(f"FB v15.1 bounded canonical reload skipped/failed: {_e}")
+
+                    try:
+                        exact_root_retry_v151 = _fb_v146_exact_post_root_data(page, canonical_post_id_v146)
+                    except Exception:
+                        exact_root_retry_v151 = {}
+                    try:
+                        grid_retry_v151 = _fb_v146_scoped_grid_items(page, canonical_post_id_v146)
+                    except Exception:
+                        grid_retry_v151 = []
+                    try:
+                        links_retry_v151 = _fb_v146_scoped_photo_links(page, canonical_post_id_v146)
+                    except Exception:
+                        links_retry_v151 = []
+                    try:
+                        plus_retry_v151 = _detect_fb_plus_overlay_count(page)
+                    except Exception:
+                        plus_retry_v151 = 0
+
+                    _retry_media_n_v151 = len((exact_root_retry_v151 or {}).get("media") or [])
+                    logger.info(
+                        f"FB v15.1 zero-evidence re-scan: post_id={canonical_post_id_v146}, "
+                        f"scoped_media={_retry_media_n_v151}, grid={len(grid_retry_v151)}, "
+                        f"links={len(links_retry_v151)}, plus={plus_retry_v151}"
+                    )
+
+                    if (
+                        _retry_media_n_v151 == 0
+                        and len(grid_retry_v151) == 0
+                        and len(links_retry_v151) == 0
+                        and int(plus_retry_v151 or 0) == 0
+                    ):
+                        # v15.4: distinguish a real authenticated audience/permission
+                        # restriction from a transient zero-media RETRY.  This is
+                        # intentionally evaluated only after canonical identity is
+                        # proven and the exact scope is empty twice.
+                        no_access_v154, no_access_reason_v154 = _fb_v154_no_access_evidence(
+                            page,
+                            canonical_post_id_v146,
+                        )
+                        if no_access_v154:
+                            logger.info(
+                                f"FB v15.4 NO_ACCESS confirmed: post_id={canonical_post_id_v146}; "
+                                "authenticated page exposes explicit audience/share-scope restriction"
+                            )
+                            clear_temp()
+                            # Signal BLOCKED to the existing worker so it is terminal
+                            # immediately; queue_manager v12.12 promotes this specific
+                            # NO_ACCESS marker to the dedicated NO_ACCESS UI status.
+                            return "BLOCKED", no_access_reason_v154
+
+                        # v15.3: before giving up, recover only from a serialized
+                        # object whose own identity equals this exact canonical post.
+                        # This remains same-post scoped and rejects video-bearing
+                        # objects, so a recommendation or poster cannot satisfy SUCCESS.
+                        exact_zero_candidates_v153 = _fb_v153_exact_post_serialized_candidates(
+                            page,
+                            canonical_post_id_v146,
+                        )
+                        if exact_zero_candidates_v153:
+                            logger.info(
+                                f"FB v15.3 zero-evidence exact-post structured recovery: "
+                                f"post_id={canonical_post_id_v146}, "
+                                f"candidates={len(exact_zero_candidates_v153)}"
+                            )
+                            clear_temp()
+                            try:
+                                recovered_path_v153, _ = _download_best_candidate(
+                                    context,
+                                    exact_zero_candidates_v153,
+                                    os.path.join(TEMP_DIR, "fb_0001"),
+                                    referer=resolved,
+                                )
+                                if recovered_path_v153 and os.path.exists(recovered_path_v153):
+                                    recovered_title_v153 = (
+                                        title
+                                        if title and title != "Facebook_Post"
+                                        else f"Facebook_Post_{canonical_post_id_v146}"
+                                    )
+                                    if move_files(recovered_title_v153):
+                                        logger.info(
+                                            f"FB v15.3 exact canonical zero-evidence recovery SUCCESS: "
+                                            f"post_id={canonical_post_id_v146}"
+                                        )
+                                        return "SUCCESS", ""
+                            except Exception as _v153_e:
+                                logger.warning(
+                                    f"FB v15.3 exact canonical zero-evidence recovery failed: "
+                                    f"{_v153_e}"
+                                )
+                                clear_temp()
+
+                        clear_temp()
+                        return (
+                            "RETRY",
+                            f"Facebook canonical post {canonical_post_id_v146} exposed zero exact-media "
+                            "evidence after bounded authenticated re-scan and exact-post structured recovery; "
+                            "fast RETRY instead of accepting unrelated media",
+                        )
+
+                    # Exact evidence appeared after the bounded reload: continue
+                    # normally using the refreshed scope.
+                    exact_root_v146 = exact_root_retry_v151 or exact_root_v146
+                    grid_before = grid_retry_v151 or grid_before
+                    links_before = links_retry_v151 or links_before
+                    plus_count_before = plus_retry_v151 or plus_count_before
+                    logger.info(
+                        "FB v15.1 zero-evidence gate recovered exact evidence; "
+                        "continue strict normal pipeline"
+                    )
+            else:
+                grid_before = _collect_fb_grid_items(page)
+                links_before = _collect_fb_photo_links(page)
+                plus_count_before = _detect_fb_plus_overlay_count(page)
             logger.info(f"FB grid item count before +N={len(grid_before)}")
             logger.info(f"FB photo link count before +N={len(links_before)}")
             logger.info(f"FB +N overlay count before={plus_count_before}")
@@ -9218,13 +10481,20 @@ def _collect_fb_media_playwright(url: str):
                 links_after = list(links_before or [])
             else:
                 try:
-                    _click_plus_overlay_or_first_photo(page)
+                    if canonical_post_id_v146:
+                        _fb_v146_click_scoped_plus(page, canonical_post_id_v146)
+                    else:
+                        _click_plus_overlay_or_first_photo(page)
                     page.wait_for_timeout(3000)
                 except Exception:
                     pass
 
-                grid_after = _collect_fb_grid_items(page)
-                links_after = _collect_fb_photo_links(page)
+                if canonical_post_id_v146:
+                    grid_after = _fb_v146_scoped_grid_items(page, canonical_post_id_v146)
+                    links_after = _fb_v146_scoped_photo_links(page, canonical_post_id_v146)
+                else:
+                    grid_after = _collect_fb_grid_items(page)
+                    links_after = _collect_fb_photo_links(page)
             logger.info(f"FB grid item count after +N={len(grid_after)}")
             logger.info(f"FB photo link count after +N={len(links_after)}")
 
@@ -9410,12 +10680,33 @@ def _collect_fb_media_playwright(url: str):
                     account=fb_account,
                 )
 
-            # v12.20: publish both resolved caption and account to the GUI immediately.
-            if not exact_pcb_account_v1250:
-                fb_account = _get_fb_page_account(page, fallback_title=title) or fb_account
-            title, fb_account = _publish_fb_task_metadata(
-                url, title, fb_account, page=page, account_locked=bool(group_container_account_v131 or exact_pcb_account_v1250)
-            )
+            # v12.20 / v14.6: publish both resolved caption and account to the GUI.
+            # Canonical /posts/ metadata is already exact-root scoped; never let
+            # generic page fallbacks replace it with an error-page/recommendation label.
+            if canonical_post_id_v146:
+                exact_root_now_v146 = _fb_v146_exact_post_root_data(page, canonical_post_id_v146)
+                canonical_title_now_v146 = _clean_fb_post_title_for_path(
+                    exact_root_now_v146.get("title") or title,
+                    fallback=title or "Facebook_Post",
+                )
+                canonical_account_now_v146 = _clean_fb_account_name(
+                    exact_root_now_v146.get("account") or ""
+                )
+                if _fb_v146_is_unavailable_ui_text(canonical_account_now_v146):
+                    canonical_account_now_v146 = ""
+                title, fb_account = _publish_fb_task_metadata(
+                    url,
+                    canonical_title_now_v146,
+                    canonical_account_now_v146,
+                    page=None,
+                    account_locked=bool(canonical_account_now_v146),
+                )
+            else:
+                if not exact_pcb_account_v1250:
+                    fb_account = _get_fb_page_account(page, fallback_title=title) or fb_account
+                title, fb_account = _publish_fb_task_metadata(
+                    url, title, fb_account, page=page, account_locked=bool(group_container_account_v131 or exact_pcb_account_v1250)
+                )
             if resolved and resolved != url:
                 _publish_fb_task_metadata(
                     resolved, title, fb_account, page=page, account_locked=bool(group_container_account_v131 or exact_pcb_account_v1250)
@@ -9516,12 +10807,29 @@ def _collect_fb_media_playwright(url: str):
                         _scoped_link_count_v131,
                     )
 
-                _trusted_target_v135 = max(
-                    int(provisional_expected_photo_count or 0),
-                    _contract_target_v135,
-                    _overlay_target_v135,
-                    _scoped_link_count_v131,
-                )
+                # v14.8 exact-count lock:
+                # exact PCB + no +N => unique fbid identities are authoritative.
+                # Hidden-link merge can duplicate the same fbid and inflate 4->8
+                # or 5->10 if provisional link count is trusted.
+                if _pcb_id_v131 and _plus_v135 <= 0 and _scoped_link_count_v131 > 0:
+                    _trusted_target_v135 = max(
+                        _contract_target_v135,
+                        _scoped_link_count_v131,
+                    )
+                    if int(provisional_expected_photo_count or 0) != _trusted_target_v135:
+                        logger.info(
+                            "FB v14.8 exact-PCB duplicate-link count corrected: "
+                            f"provisional={provisional_expected_photo_count} -> "
+                            f"unique={_trusted_target_v135}, grid={_grid_v135}, "
+                            f"unique_scoped={_scoped_link_count_v131}"
+                        )
+                else:
+                    _trusted_target_v135 = max(
+                        int(provisional_expected_photo_count or 0),
+                        _contract_target_v135,
+                        _overlay_target_v135,
+                        _scoped_link_count_v131,
+                    )
 
                 # _estimate_expected_photo_count() already uses the correct
                 # (4 + N) semantics for the common five-tile layout.  Never let
@@ -9904,10 +11212,8 @@ def _collect_fb_media_playwright(url: str):
                     post_sequence = []
                 else:
                     fast_share_gallery_v1250 = bool(
-                        share_p_gallery_like_v1226
-                        and plus_count_before
-                        and gallery_target
-                        and int(gallery_target) <= 20
+                        gallery_target
+                        and 1 < int(gallery_target) <= 20
                         and str(dominant_pcb_key or "").startswith("pcb:")
                     )
                     unique_links_v1250 = len(_dedupe_items_by_media_id(link_items or []))
@@ -9924,8 +11230,8 @@ def _collect_fb_media_playwright(url: str):
                             label="post",
                             is_photo_page=False,
                             target_count=gallery_target or None,
-                            stale_threshold=(3 if fast_share_gallery_v1250 else 4),
-                            max_turns=(max(10, min(16, int(gallery_target or 8) + 5)) if fast_share_gallery_v1250 else max(24, (gallery_target or 16) + 10)),
+                            stale_threshold=(2 if fast_share_gallery_v1250 else 4),
+                            max_turns=(max(4, min(8, int(gallery_target or 4) + 2)) if fast_share_gallery_v1250 else max(24, (gallery_target or 16) + 10)),
                             allowed_cluster=pre_viewer_cluster or None,
                             fast_mode=fast_share_gallery_v1250,
                         )
@@ -10489,6 +11795,13 @@ def _collect_fb_media_playwright(url: str):
                         "Facebook gallery candidates were collected but all failed "
                         "resolution/download validation; retry fresh context"
                     )
+                if canonical_post_id_v146:
+                    return (
+                        "RETRY",
+                        f"Facebook canonical post {canonical_post_id_v146} exact-scope media "
+                        "was detected but could not be downloaded; retry instead of accepting "
+                        "background/recommendation media or terminal false FAILED",
+                    )
                 return "FAILED", "Facebook Playwright 有抓到媒體 URL，但全部下載失敗"
 
             # v13.0 Centralized gallery contract.  This preserves the legacy strict
@@ -10527,6 +11840,19 @@ def _collect_fb_media_playwright(url: str):
         return _classify_error(str(e))
 
     finally:
+        # v15.3: response handlers read response bodies synchronously.  Detach the
+        # listener before closing the browser context so Playwright does not emit
+        # stray TargetClosedError / asyncio.CancelledError futures after RETRY.
+        try:
+            if page is not None and "on_response" in locals():
+                page.remove_listener("response", on_response)
+        except Exception:
+            pass
+        try:
+            if page is not None and not page.is_closed():
+                page.wait_for_timeout(80)
+        except Exception:
+            pass
         try:
             if context:
                 context.close()

@@ -1,3 +1,7 @@
+# v12.40 Authenticated Transport Recovery + Playwright Listener Cleanup Fix
+# Preserves every v12.39 feature; retries exact-media transfer through logged-in IG_Parser and detaches response listeners before context close.
+# v12.39 Transport-Recovery + Correct BLOCKED Classification Fix
+# Treats exact-media CDN timeouts as RETRY/recoverable and retries smaller MP4 ranges.
 # v12.38 No-Orphan Timeout + Slow-Reel Failover Fix
 # Removes the unsafe daemon-thread wall timeout that left yt-dlp running after RETRY,
 # and makes slow Reel yt-dlp fall back cleanly to exact Playwright recovery.
@@ -585,6 +589,34 @@ def _is_hard_ig_restricted_error(err: str) -> bool:
     ])
 
 
+def _is_ig_transport_retry_error(err: str) -> bool:
+    """Transient exact-media transfer failures are RETRY, never permission BLOCKED."""
+    e = _clean_error_text(err or "").lower()
+    return any(k in e for k in [
+        "apirequestcontext.get: timeout",
+        "timeout 90000ms exceeded",
+        "timeout 120000ms exceeded",
+        "timeout 150000ms exceeded",
+        "mp4 range request failed",
+        "mp4 range request transport timeout",
+        "mp4 range request returned empty body",
+        "unexpected content-range",
+        "range not satisfiable",
+        "http 416",
+        "http 408",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "connection reset",
+        "connection aborted",
+        "networkerror",
+        "net::err_",
+        "媒體完整性檢查失敗",
+        "媒體全部未通過影片/圖片完整性與解析度驗證",
+    ])
+
+
 def _prefer_final_status(*pairs):
     """
     多引擎結果合併規則：
@@ -610,6 +642,13 @@ def _prefer_final_status(*pairs):
     for st, err in statuses:
         if _is_hard_ig_restricted_error(err):
             return "BLOCKED", err or "Instagram 影片受國家/地區限制，無法下載"
+
+    # v12.39: if exact media was proven but transport failed, keep RETRY.
+    # Instaloader's parallel 401/rate-limit signal must not turn a CDN timeout
+    # into a false permission BLOCKED.
+    for st, err in statuses:
+        if _is_ig_transport_retry_error(err):
+            return "RETRY", err or "Instagram exact-media transport failed; retry"
 
     # v12.30: when one engine proves API/session rate-limit and another proves
     # zero media/no exact media, stop retrying this session.
@@ -644,6 +683,11 @@ def _prefer_final_status(*pairs):
 def _classify_error(err: str):
     raw = _clean_error_text(err)
     e = raw.lower()
+
+    # v12.39: transient CDN/range transfer failure has priority over generic
+    # restriction wording and is never a hard BLOCKED case.
+    if _is_ig_transport_retry_error(raw):
+        return "RETRY", raw
 
     # v12.28: confirmed country/region restricted video is a hard BLOCKED case,
     # not a retryable thumbnail/visual fallback failure.
@@ -3157,7 +3201,8 @@ def _download_complete_mp4_with_ranges(context, url: str, dst: str, referer: str
         "Pragma": "no-cache",
     }
 
-    chunk_size = 2 * 1024 * 1024
+    # v12.39: smaller chunks avoid 90s timeout on slow but valid 206 responses.
+    chunk_size = 512 * 1024
     assembled = bytearray()
     total_size = None
     offset = 0
@@ -3168,11 +3213,31 @@ def _download_complete_mp4_with_ranges(context, url: str, dst: str, referer: str
         headers = dict(headers_base)
         headers["Range"] = f"bytes={offset}-{end}"
 
-        response = context.request.get(
-            url,
-            headers=headers,
-            timeout=90000,
-        )
+        response = None
+        last_range_error = ""
+        for range_attempt in range(3):
+            try:
+                response = context.request.get(
+                    url,
+                    headers=headers,
+                    timeout=150000,
+                )
+                break
+            except Exception as range_exc:
+                last_range_error = str(range_exc)
+                logger.warning(
+                    f"IG v12.39 MP4 range transient failure: "
+                    f"range={offset}-{end}, attempt={range_attempt + 1}/3, "
+                    f"error={range_exc}"
+                )
+                if range_attempt < 2:
+                    time.sleep(1.5 * (range_attempt + 1))
+
+        if response is None:
+            raise Exception(
+                f"IG MP4 range request transport timeout after retries: "
+                f"range={offset}-{end}; {last_range_error}"
+            )
 
         if response.status not in {200, 206}:
             raise Exception(
@@ -5564,13 +5629,17 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
             continue
 
     if success_count <= 0:
-        return "FAILED", "IG 媒體全部未通過影片/圖片完整性與解析度驗證"
+        return "RETRY", (
+            "IG exact media was proven, but all transfers failed validation/transport; "
+            "retry with a fresh authenticated context"
+        )
 
     temp_files_after_capture = _list_media_files(TEMP_DIR)
     if success_count != len(filtered) or len(temp_files_after_capture) != len(filtered):
-        return "FAILED", (
+        return "RETRY", (
             f"IG 媒體完整性檢查失敗：expected={len(filtered)}, "
-            f"written={success_count}, temp_files={len(temp_files_after_capture)}"
+            f"written={success_count}, temp_files={len(temp_files_after_capture)}; "
+            "exact media list is proven, retry missing transport instead of false BLOCKED"
         )
 
     logger.info(
@@ -8079,6 +8148,9 @@ def _collect_ig_media_playwright_persistent_impl(
         return "RETRY", "找不到 Chrome User Data；請先按『初始化 IG_Parser』完成專用 Profile 登入"
 
     context = None
+    page = None
+    _ig_response_listener = None
+    _ig_response_listener_active = True
     runtime_profile_root = ""
     try:
         logger.info(
@@ -8109,10 +8181,16 @@ def _collect_ig_media_playwright_persistent_impl(
             # tabs when opening a brand-new page too early.
             page = _get_persistent_context_page(context)
         def _on_ig_response(response):
-            _capture_playwright_response(response, harvested_media)
-            _capture_ig_structured_response(response, structured_payloads)
+            if not _ig_response_listener_active:
+                return
+            try:
+                _capture_playwright_response(response, harvested_media)
+                _capture_ig_structured_response(response, structured_payloads)
+            except Exception:
+                return
 
-        page.on("response", _on_ig_response)
+        _ig_response_listener = _on_ig_response
+        page.on("response", _ig_response_listener)
 
         try:
             page.bring_to_front()
@@ -8329,6 +8407,20 @@ def _collect_ig_media_playwright_persistent_impl(
         )
 
     finally:
+        # v12.40: detach response-body callbacks before closing the page/context.
+        # This prevents Playwright's internal response body future from surfacing
+        # asyncio.CancelledError / TargetClosedError after the task already ended.
+        _ig_response_listener_active = False
+        try:
+            if page is not None and _ig_response_listener is not None:
+                page.remove_listener("response", _ig_response_listener)
+        except Exception:
+            pass
+        try:
+            if page is not None and not page.is_closed():
+                page.wait_for_timeout(80)
+        except Exception:
+            pass
         try:
             if context:
                 context.close()
@@ -8875,6 +8967,8 @@ def _collect_ig_media_playwright(url: str):
 
     browser = None
     context = None
+    page = None
+    _headless_listener_active = False
 
     original_url = url
     url = _normalize_ig_url(url)
@@ -8921,7 +9015,17 @@ def _collect_ig_media_playwright(url: str):
 
             harvested_media = {}
             page = context.new_page()
-            page.on("response", lambda response: _capture_playwright_response(response, harvested_media))
+            _headless_listener_active = True
+
+            def _on_headless_ig_response(response):
+                if not _headless_listener_active:
+                    return
+                try:
+                    _capture_playwright_response(response, harvested_media)
+                except Exception:
+                    return
+
+            page.on("response", _on_headless_ig_response)
 
             try:
                 _goto_instagram_target_clean(
@@ -9110,6 +9214,12 @@ def _collect_ig_media_playwright(url: str):
                         "解析度",
                         "圖片幾何",
                         "影片/圖片完整性",
+                        # v12.40: exact identity is already proven, but anonymous/headless
+                        # transfer can still fail with CDN 403 after exposing only a 640px
+                        # preview.  Retry the same shortcode through the logged-in
+                        # IG_Parser profile before returning RETRY.
+                        "exact media was proven, but all transfers failed",
+                        "all transfers failed validation/transport",
                     ]
                 )
 
@@ -9215,6 +9325,17 @@ def _collect_ig_media_playwright(url: str):
         return _classify_error(str(e))
 
     finally:
+        _headless_listener_active = False
+        try:
+            if page is not None:
+                page.remove_listener("response", _on_headless_ig_response)
+        except Exception:
+            pass
+        try:
+            if page is not None and not page.is_closed():
+                page.wait_for_timeout(80)
+        except Exception:
+            pass
         try:
             if context:
                 context.close()
@@ -9274,8 +9395,8 @@ def get_login_status() -> tuple[bool, str]:
 
 def download(url: str):
     logger.info(
-        "IG v12.38 pipeline active: no-orphan synchronous task + "
-        "slow-Reel yt-dlp failover + v12.37 recovery"
+        "IG v12.40 pipeline active: authenticated transport recovery + listener cleanup + "
+        "v12.39 transport recovery + no-orphan synchronous task"
     )
     if _L is None:
         setup()

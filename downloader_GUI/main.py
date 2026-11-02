@@ -1,8 +1,5 @@
-# v12.18 Copy Post Title Context Menu
-# v12.17 Open Downloaded Item Context Menu
-# v12.16 Auto Reset Filter on Reload
-# v12.15 Open download_link.txt + Preserve link.txt Actions
-# v12.14 Open link.txt + Preserve Copy URL Actions
+# v12.24 NO_ACCESS status/filter/copy/summary; preserves all v12.23 UI features
+# v12.23: restore batch-copy context-menu shortcuts
 import json
 import math
 import os
@@ -55,6 +52,7 @@ _STATUS_COLORS = {
     "SUCCESS": "#4CAF50",
     "FAILED": "#F44336",
     "BLOCKED": "#FF9800",
+    "NO_ACCESS": "#C2185B",
     "RETRY": "#9C27B0",
     "UNAVAILABLE": "#795548",
     "MISSING": "#607D8B",
@@ -150,6 +148,7 @@ class _HiddenLoginButton:
 
 
 
+# v12.21: restore prior compact FHD toolbar/control layout; keep v12.20 filters
 # v11.89: restore Post Account + centered Account/Title + login status
 # v11.54: center Post Account / Post Title headings and values
 # v11.37: show resolved Instagram Post Title beside URL
@@ -248,7 +247,7 @@ class App:
             # FHD and smaller: fit within the work area and keep bottom buttons visible.
             width = min(max(1180, int(work_w * 0.96)), max(980, work_w - 24))
             height = min(max(720, int(work_h * 0.90)), max(620, work_h - 36))
-            self._compact_ui = work_h <= 950 or work_w <= 1400
+            self._compact_ui = work_h <= 1080 or work_w <= 1700
             self._text_input_height = 4 if self._compact_ui else 5
             self._top_pad_y = 6 if self._compact_ui else 8
             self._button_pady = 4 if self._compact_ui else 6
@@ -517,7 +516,7 @@ class App:
             btn_row2,
             text="📝 link.txt",
             command=self._open_link_txt,
-            bg="#455A64",
+            bg="#546E7A",
             fg="white",
             padx=self._ui_px(5),
             pady=self._button_pady,
@@ -668,6 +667,7 @@ class App:
             ("SUCCESS", "SUCCESS"),
             ("FAILED", "FAILED"),
             ("BLOCKED", "BLOCKED"),
+            ("NO ACCESS", "NO_ACCESS"),
             ("MISSING", "MISSING"),
             ("RETRY", "RETRY"),
             ("DOWNLOADING", "DOWNLOADING"),
@@ -711,58 +711,6 @@ class App:
             text="🚫 BLOCKED",
             command=lambda: self._copy_status_urls("BLOCKED"),
             bg="#EF6C00",
-            fg="white",
-            padx=self._ui_px(5),
-            pady=self._ui_px(3),
-            font=("Microsoft JhengHei UI", self._small_font_size),
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=self._ui_px(2))
-
-        tk.Button(
-            act_frame,
-            text="📋 RETRY",
-            command=self._copy_retry_urls,
-            bg="#8E24AA",
-            fg="white",
-            padx=self._ui_px(5),
-            pady=self._ui_px(3),
-            font=("Microsoft JhengHei UI", self._small_font_size),
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=self._ui_px(2))
-
-        tk.Button(
-            act_frame,
-            text="📋 FAILED",
-            command=self._copy_failed_urls,
-            bg="#C62828",
-            fg="white",
-            padx=self._ui_px(5),
-            pady=self._ui_px(3),
-            font=("Microsoft JhengHei UI", self._small_font_size),
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=self._ui_px(2))
-
-        tk.Button(
-            act_frame,
-            text="📋 MISSING",
-            command=self._copy_missing_urls,
-            bg="#607D8B",
-            fg="white",
-            padx=self._ui_px(5),
-            pady=self._ui_px(3),
-            font=("Microsoft JhengHei UI", self._small_font_size),
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=self._ui_px(2))
-
-        tk.Button(
-            act_frame,
-            text="📋 未成功",
-            command=self._copy_all_unsuccessful_urls,
-            bg="#AD1457",
             fg="white",
             padx=self._ui_px(5),
             pady=self._ui_px(3),
@@ -955,9 +903,10 @@ class App:
             "RETRY": 2,
             "FAILED": 3,
             "BLOCKED": 4,
-            "MISSING": 5,
-            "UNAVAILABLE": 6,
-            "SUCCESS": 7,
+            "NO_ACCESS": 5,
+            "MISSING": 6,
+            "UNAVAILABLE": 7,
+            "SUCCESS": 8,
         }
 
         def key_func(task: dict):
@@ -979,7 +928,7 @@ class App:
             return list(rows)
 
     def _build_tree_context_menu(self):
-        """建立任務清單右鍵選單。"""
+        """建立任務清單右鍵選單。v12.23 restore batch copy shortcuts."""
         self._tree_context_menu = tk.Menu(self.root, tearoff=0)
         self._tree_context_menu.add_command(
             label="複製連結",
@@ -994,39 +943,56 @@ class App:
             label="查看完整連結",
             command=self._show_context_url,
         )
-        self._tree_context_menu.add_command(
-            label="複製 Post Title",
-            command=self._copy_context_post_title,
-        )
-        self._tree_context_menu.add_separator()
-        self._tree_context_menu.add_command(
-            label="開啟該連結下載位置",
-            command=self._open_context_download_location,
-        )
-        self._tree_context_menu.add_command(
-            label="在檔案總管顯示下載檔",
-            command=self._reveal_context_download_item,
-        )
         self._tree_context_menu.add_separator()
         self._tree_context_menu.add_command(
             label="複製目前篩選 URL",
             command=self._copy_current_filtered_urls,
         )
         self._tree_context_menu.add_command(
-            label="複製所有 RETRY URL",
-            command=self._copy_retry_urls,
+            label="複製目前篩選 Post Title",
+            command=self._copy_current_filtered_titles,
+        )
+        self._tree_context_menu.add_separator()
+        self._tree_context_menu.add_command(
+            label="複製 FAILED URL",
+            command=lambda: self._copy_status_urls("FAILED"),
         )
         self._tree_context_menu.add_command(
-            label="複製所有 FAILED URL",
-            command=self._copy_failed_urls,
+            label="複製 MISSING URL",
+            command=lambda: self._copy_status_urls("MISSING"),
         )
         self._tree_context_menu.add_command(
-            label="複製所有 MISSING URL",
-            command=self._copy_missing_urls,
+            label="複製 RETRY URL",
+            command=lambda: self._copy_status_urls("RETRY"),
         )
         self._tree_context_menu.add_command(
-            label="複製所有未成功 URL",
-            command=self._copy_all_unsuccessful_urls,
+            label="複製 NO_ACCESS URL",
+            command=lambda: self._copy_status_urls("NO_ACCESS"),
+        )
+        self._tree_context_menu.add_command(
+            label="複製全部未成功 URL",
+            command=self._copy_unsuccessful_urls,
+        )
+        self._tree_context_menu.add_separator()
+        self._tree_context_menu.add_command(
+            label="複製 FAILED Post Title",
+            command=lambda: self._copy_status_titles("FAILED"),
+        )
+        self._tree_context_menu.add_command(
+            label="複製 MISSING Post Title",
+            command=lambda: self._copy_status_titles("MISSING"),
+        )
+        self._tree_context_menu.add_command(
+            label="複製 RETRY Post Title",
+            command=lambda: self._copy_status_titles("RETRY"),
+        )
+        self._tree_context_menu.add_command(
+            label="複製 NO_ACCESS Post Title",
+            command=lambda: self._copy_status_titles("NO_ACCESS"),
+        )
+        self._tree_context_menu.add_command(
+            label="複製全部未成功 Post Title",
+            command=self._copy_unsuccessful_titles,
         )
 
     def _on_tree_right_click(self, event):
@@ -1039,10 +1005,10 @@ class App:
         self.tree.focus(iid)
         self._tree_context_iid = iid
 
-        vals = self.tree.item(iid, "values") or ("", "", "", "")
+        vals = self.tree.item(iid, "values") or ("", "", "", "", "")
         self._tree_context_url_snapshot = self._tree_url_by_iid.get(iid, "") or (vals[0] if len(vals) > 0 else "")
-        self._tree_context_status_snapshot = vals[2] if len(vals) > 2 else ""
-        self._tree_context_retry_snapshot = vals[3] if len(vals) > 3 else ""
+        self._tree_context_status_snapshot = vals[3] if len(vals) > 3 else ""
+        self._tree_context_retry_snapshot = vals[4] if len(vals) > 4 else ""
 
         try:
             self._tree_context_menu.tk_popup(event.x_root, event.y_root)
@@ -1095,8 +1061,8 @@ class App:
                 return
             vals = self.tree.item(iid, "values")
             url = self._tree_url_by_iid.get(iid, "")
-            status = vals[2] if len(vals) > 2 else ""
-            retry = vals[3] if len(vals) > 3 else ""
+            status = vals[3] if len(vals) > 3 else ""
+            retry = vals[4] if len(vals) > 4 else ""
 
         text = f"{url}\t{status}\t{retry}"
         self._copy_to_clipboard(text, "已複製選取列狀態")
@@ -1112,295 +1078,6 @@ class App:
                     vals = self.tree.item(iid, "values")
                     url = vals[0] if vals else ""
         messagebox.showinfo("完整連結", url or "沒有可顯示的連結", parent=self.root)
-
-    def _get_context_task_snapshot(self) -> dict:
-        """Return full task metadata for the right-clicked row."""
-        iid = self._tree_context_iid or self._get_selected_tree_iid()
-        task_map = getattr(self, "_tree_task_by_iid", {}) or {}
-        if iid and iid in task_map:
-            return dict(task_map.get(iid) or {})
-
-        url = self._tree_context_url_snapshot or ""
-        if not url and iid:
-            url = self._tree_url_by_iid.get(iid, "")
-
-        if url:
-            for task in queue_manager.get_snapshot():
-                if str(task.get("url", "") or "") == url:
-                    return dict(task)
-
-        vals = self.tree.item(iid, "values") if iid else ()
-        return {
-            "url": url,
-            "account": vals[1] if len(vals) > 1 else "",
-            "title": vals[2] if len(vals) > 2 else "",
-            "status": vals[3] if len(vals) > 3 else "",
-        }
-
-    @staticmethod
-    def _download_lookup_norm(value: str) -> str:
-        """Normalize text for matching output file/folder names."""
-        s = str(value or "").lower()
-        s = re.sub(r"https?://", " ", s)
-        s = re.sub(r"[\\/:*?\"<>|#%&=+~`!@#$^()[\]{};,，。！？：；、\s]+", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    @staticmethod
-    def _shortcode_from_url(url: str) -> str:
-        m = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)/?", str(url or ""), re.I)
-        if m:
-            return m.group(1)
-        # Facebook share IDs are not normally in output names, but keep as weak hint.
-        m = re.search(r"facebook\.com/(?:share/(?:p|r)?/|reel/|watch/\?v=)([^/?#&]+)", str(url or ""), re.I)
-        return m.group(1) if m else ""
-
-    def _score_download_candidate(self, path: str, task: dict) -> tuple[int, float]:
-        name = os.path.basename(path)
-        parent = os.path.basename(os.path.dirname(path))
-        hay = self._download_lookup_norm(f"{name} {parent}")
-        title = self._download_lookup_norm(task.get("title", ""))
-        account = self._download_lookup_norm(str(task.get("account", "") or "").lstrip("@"))
-        shortcode = self._download_lookup_norm(self._shortcode_from_url(task.get("url", "")))
-
-        score = 0
-        if title and len(title) >= 3:
-            if title in hay:
-                score += 120
-            elif hay in title and len(hay) >= 5:
-                score += 80
-            else:
-                # partial token overlap for long captions truncated by path length
-                title_words = [w for w in title.split() if len(w) >= 2]
-                if title_words:
-                    overlap = sum(1 for w in title_words[:12] if w in hay)
-                    score += min(50, overlap * 8)
-
-        if account and len(account) >= 2:
-            if account in hay:
-                score += 45
-            elif any(w in hay for w in account.split() if len(w) >= 2):
-                score += 20
-
-        if shortcode and shortcode in hay:
-            score += 80
-
-        status = str(task.get("status", "") or "").upper()
-        if status == "SUCCESS":
-            score += 10
-
-        try:
-            mtime = os.path.getmtime(path)
-        except Exception:
-            mtime = 0.0
-
-        # Prefer real media files over manifest/txt.
-        if os.path.isfile(path):
-            ext = os.path.splitext(path)[1].lower()
-            if ext in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}:
-                score += 25
-        elif os.path.isdir(path):
-            try:
-                has_media = any(
-                    os.path.splitext(x)[1].lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}
-                    for x in os.listdir(path)[:80]
-                )
-                if has_media:
-                    score += 30
-            except Exception:
-                pass
-
-        return score, mtime
-
-    def _find_downloaded_item_for_task(self, task: dict) -> str:
-        """Find the downloaded file/folder for a queue task.
-
-        The downloader historically did not store output_path in queue metadata,
-        so v12.17 resolves it by title/account/URL hints under DOWNLOAD_DIR.
-        """
-        explicit_keys = (
-            "output_path", "download_path", "file_path", "folder_path",
-            "output_file", "output_dir", "saved_path",
-        )
-        for key in explicit_keys:
-            p = str(task.get(key, "") or "").strip()
-            if p and os.path.exists(p):
-                return p
-
-        title = str(task.get("title", "") or "").strip()
-        account = str(task.get("account", "") or "").strip().lstrip("@")
-        url = str(task.get("url", "") or "").strip()
-
-        if not os.path.isdir(DOWNLOAD_DIR):
-            return ""
-
-        candidates = []
-        max_items = 3000
-        scanned = 0
-
-        try:
-            # Top-level folders/files first.
-            top_entries = [os.path.join(DOWNLOAD_DIR, x) for x in os.listdir(DOWNLOAD_DIR)]
-        except Exception:
-            top_entries = []
-
-        for p in top_entries:
-            if os.path.exists(p):
-                score, mtime = self._score_download_candidate(p, task)
-                if score >= 45:
-                    candidates.append((score + 20, mtime, p))
-
-        # Search one to two levels deep for actual media file matches.
-        for root, dirs, files in os.walk(DOWNLOAD_DIR):
-            scanned += 1
-            if scanned > max_items:
-                break
-
-            # Avoid heavy recursion into cache-like dirs.
-            dirs[:] = [
-                d for d in dirs
-                if d.lower() not in {"__pycache__", ".git", "_fb_capture", "data", "pre-processing"}
-            ][:120]
-
-            for name in files[:250]:
-                ext = os.path.splitext(name)[1].lower()
-                if ext not in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}:
-                    continue
-                p = os.path.join(root, name)
-                score, mtime = self._score_download_candidate(p, task)
-                if score >= 55:
-                    candidates.append((score, mtime, p))
-
-        if not candidates and (title or account):
-            # Last-resort: exact folder name prefix / account folder.
-            norm_title = self._download_lookup_norm(title)
-            norm_account = self._download_lookup_norm(account)
-            for p in top_entries:
-                name_norm = self._download_lookup_norm(os.path.basename(p))
-                if (
-                    (norm_title and (name_norm.startswith(norm_title[:20]) or norm_title[:20] in name_norm))
-                    or (norm_account and norm_account == name_norm)
-                ):
-                    try:
-                        candidates.append((40, os.path.getmtime(p), p))
-                    except Exception:
-                        candidates.append((40, 0.0, p))
-
-        if not candidates:
-            return ""
-
-        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        best = candidates[0][2]
-
-        # If the best item is a file inside a matched title folder, reveal file;
-        # if it is a multi-file folder, open folder.
-        return best
-
-    def _open_path_in_explorer(self, path: str, reveal: bool = False):
-        if not path or not os.path.exists(path):
-            messagebox.showwarning("找不到檔案", "目前找不到此連結對應的下載檔案或資料夾。", parent=self.root)
-            return
-
-        try:
-            if os.name == "nt":
-                if reveal and os.path.isfile(path):
-                    subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
-                else:
-                    target = path if os.path.isdir(path) else os.path.dirname(path)
-                    os.startfile(os.path.normpath(target))
-            elif sys.platform == "darwin":
-                if reveal and os.path.isfile(path):
-                    subprocess.Popen(["open", "-R", path])
-                else:
-                    subprocess.Popen(["open", path if os.path.isdir(path) else os.path.dirname(path)])
-            else:
-                subprocess.Popen(["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)])
-        except Exception as e:
-            messagebox.showerror("開啟失敗", f"無法開啟下載位置：{e}", parent=self.root)
-
-    def _open_context_download_location(self):
-        """Right-click: open folder that contains the selected task output."""
-        task = self._get_context_task_snapshot()
-        path = self._find_downloaded_item_for_task(task)
-        if not path:
-            self.status_var.set("找不到此連結對應的下載位置")
-            messagebox.showwarning(
-                "找不到下載位置",
-                "找不到此連結對應的下載檔案或資料夾。\n\n"
-                "可能原因：任務尚未 SUCCESS、檔名被手動改過、或下載輸出已被移動。",
-                parent=self.root,
-            )
-            return
-
-        self.status_var.set(f"已開啟下載位置：{os.path.basename(path)}")
-        self._open_path_in_explorer(path, reveal=False)
-
-    def _reveal_context_download_item(self):
-        """Right-click: reveal/select the downloaded file in Explorer."""
-        task = self._get_context_task_snapshot()
-        path = self._find_downloaded_item_for_task(task)
-        if not path:
-            self.status_var.set("找不到此連結對應的下載檔")
-            messagebox.showwarning(
-                "找不到下載檔",
-                "找不到此連結對應的下載檔案。\n\n"
-                "多圖貼文會開啟資料夾；單檔貼文會在檔案總管中選取該檔。",
-                parent=self.root,
-            )
-            return
-
-        self.status_var.set(f"已顯示下載檔：{os.path.basename(path)}")
-        self._open_path_in_explorer(path, reveal=True)
-
-    def _get_context_post_title(self) -> str:
-        """Return full Post Title for the right-clicked / selected row."""
-        iid = self._tree_context_iid or self._get_selected_tree_iid()
-
-        # Prefer task metadata because Treeview value can be shortened/truncated.
-        task_map = getattr(self, "_tree_task_by_iid", {}) or {}
-        if iid and iid in task_map:
-            title = str((task_map.get(iid) or {}).get("title", "") or "").strip()
-            if title:
-                return title
-
-        url = self._tree_context_url_snapshot or ""
-        if not url and iid:
-            url = self._tree_url_by_iid.get(iid, "")
-
-        if url:
-            try:
-                for task in queue_manager.get_snapshot():
-                    if str(task.get("url", "") or "") == url:
-                        title = str(task.get("title", "") or "").strip()
-                        if title:
-                            return title
-            except Exception:
-                pass
-
-        try:
-            vals = self.tree.item(iid, "values") if iid else ()
-            if vals and len(vals) >= 3:
-                return str(vals[2] or "").strip()
-        except Exception:
-            pass
-
-        return ""
-
-    def _copy_context_post_title(self):
-        """Right-click: copy the selected row's Post Title."""
-        title = self._get_context_post_title()
-        if not title:
-            messagebox.showwarning(
-                "沒有 Post Title",
-                "這筆任務目前沒有可複製的 Post Title。",
-                parent=self.root,
-            )
-            return
-
-        self.root.clipboard_clear()
-        self.root.clipboard_append(title)
-        self.root.update()
-        self.status_var.set(f"已複製 Post Title：{title[:80]}")
 
     def _copy_selected_url(self, _event=None):
         """Ctrl+C / 雙擊：複製目前選取列完整 URL。"""
@@ -1439,38 +1116,79 @@ class App:
             return
         self._copy_to_clipboard("\n".join(urls), f"已複製 {status} URL：{len(urls)} 筆")
 
-    def _copy_problem_urls(self, statuses=None, label: str = "未成功"):
-        """Copy URLs whose status is in the requested status set."""
-        if statuses is None:
-            statuses = ("FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE")
-        wanted = {str(s or "").upper() for s in statuses if str(s or "").strip()}
+    def _copy_current_filtered_titles(self):
+        """複製目前表格篩選結果的 Post Title。"""
         snapshot = queue_manager.get_snapshot()
-        urls = []
-        seen = set()
-        for task in snapshot:
-            status = str(task.get("status", "") or "").upper()
-            url = str(task.get("url", "") or "").strip()
-            if status in wanted and url and url not in seen:
-                seen.add(url)
-                urls.append(url)
-        if not urls:
-            self.status_var.set(f"目前沒有 {label} URL")
+        if self._active_filter != "ALL":
+            snapshot = [
+                t for t in snapshot
+                if str(t.get("status", "") or "").upper() == self._active_filter
+            ]
+        titles = [
+            str(t.get("title", "") or "").strip()
+            for t in snapshot
+            if str(t.get("title", "") or "").strip()
+        ]
+        if not titles:
+            self.status_var.set("目前篩選結果沒有 Post Title 可複製")
             return
-        self._copy_to_clipboard("\n".join(urls), f"已複製 {label} URL：{len(urls)} 筆")
+        self._copy_to_clipboard(
+            "\n".join(titles),
+            f"已複製目前篩選 Post Title：{len(titles)} 筆",
+        )
 
-    def _copy_retry_urls(self):
-        self._copy_problem_urls(("RETRY",), "RETRY")
+    def _copy_status_titles(self, status: str):
+        """複製指定狀態的 Post Title 名單。"""
+        status = (status or "").upper()
+        snapshot = queue_manager.get_snapshot()
+        titles = [
+            str(t.get("title", "") or "").strip()
+            for t in snapshot
+            if str(t.get("status", "") or "").upper() == status
+            and str(t.get("title", "") or "").strip()
+        ]
+        if not titles:
+            self.status_var.set(f"目前沒有 {status} Post Title")
+            return
+        self._copy_to_clipboard(
+            "\n".join(titles),
+            f"已複製 {status} Post Title：{len(titles)} 筆",
+        )
 
-    def _copy_failed_urls(self):
-        self._copy_problem_urls(("FAILED",), "FAILED")
+    def _copy_unsuccessful_urls(self):
+        """複製全部未成功 URL：FAILED / BLOCKED / NO_ACCESS / MISSING / RETRY / UNAVAILABLE。"""
+        bad_statuses = {"FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "RETRY", "UNAVAILABLE"}
+        snapshot = queue_manager.get_snapshot()
+        urls = [
+            str(t.get("url", "") or "").strip()
+            for t in snapshot
+            if str(t.get("status", "") or "").upper() in bad_statuses
+            and str(t.get("url", "") or "").strip()
+        ]
+        if not urls:
+            self.status_var.set("目前沒有未成功 URL")
+            return
+        self._copy_to_clipboard(
+            "\n".join(urls),
+            f"已複製全部未成功 URL：{len(urls)} 筆",
+        )
 
-    def _copy_missing_urls(self):
-        self._copy_problem_urls(("MISSING",), "MISSING")
-
-    def _copy_all_unsuccessful_urls(self):
-        self._copy_problem_urls(
-            ("FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE"),
-            "所有未成功",
+    def _copy_unsuccessful_titles(self):
+        """複製全部未成功任務的 Post Title 名單。"""
+        bad_statuses = {"FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "RETRY", "UNAVAILABLE"}
+        snapshot = queue_manager.get_snapshot()
+        titles = [
+            str(t.get("title", "") or "").strip()
+            for t in snapshot
+            if str(t.get("status", "") or "").upper() in bad_statuses
+            and str(t.get("title", "") or "").strip()
+        ]
+        if not titles:
+            self.status_var.set("目前沒有未成功 Post Title")
+            return
+        self._copy_to_clipboard(
+            "\n".join(titles),
+            f"已複製全部未成功 Post Title：{len(titles)} 筆",
         )
 
     def _init_session(self):
@@ -1743,11 +1461,6 @@ class App:
             messagebox.showwarning("提示", "未找到有效的 URL（需以 http/https 開頭）。", parent=self.root)
             return
 
-        # v12.16: starting a new/reloaded batch must show the full queue.
-        # Without this, a previous filter such as SUCCESS / RETRY / DOWNLOADING
-        # can remain active and make URL / Post Account / Post Title appear blank.
-        self._active_filter = "ALL"
-
         result = queue_manager.add_tasks(urls)
 
         snapshot = queue_manager.get_snapshot()
@@ -1913,12 +1626,7 @@ class App:
             self.text_input.delete("1.0", tk.END)
             self.text_input.insert("1.0", content if content else "")
             self.text_input.config(fg="#000000")
-            # v12.16: reloading download_link.txt is normally a new visible batch.
-            # Always return the task table to ALL, otherwise a previous SUCCESS /
-            # RETRY / DOWNLOADING filter can make the queue look empty.
-            self._active_filter = "ALL"
             self.status_var.set(f"已載入可下載清單：{PREPROCESS_DEFAULT_DOWNLOAD}")
-            self._schedule_refresh(0)
         except Exception as e:
             if not silent:
                 messagebox.showerror("錯誤", f"無法載入 download_link.txt：{e}", parent=self.root)
@@ -1934,57 +1642,49 @@ class App:
     def _open_downloads(self):
         self._open_path(DOWNLOAD_DIR)
 
-    def _open_preprocess_output(self):
-        self._open_path(PREPROCESS_OUTPUT_DIR)
-        self.status_var.set(f"已開啟預處理 output：{PREPROCESS_OUTPUT_DIR}")
-
     def _open_link_txt(self):
-        """Open pre-processing/link.txt; create it when missing."""
+        os.makedirs(PREPROCESS_DIR, exist_ok=True)
         link_path = os.path.join(PREPROCESS_DIR, "link.txt")
+        if not os.path.exists(link_path):
+            try:
+                with open(link_path, "w", encoding="utf-8"):
+                    pass
+            except Exception as e:
+                messagebox.showerror("錯誤", f"無法建立 link.txt：{e}", parent=self.root)
+                return
         try:
-            os.makedirs(PREPROCESS_DIR, exist_ok=True)
-            if not os.path.exists(link_path):
-                with open(link_path, "w", encoding="utf-8") as f:
-                    f.write("")
-
             if sys.platform == "win32":
                 os.startfile(link_path)
             else:
                 import subprocess
-                subprocess.Popen([
-                    "open" if sys.platform == "darwin" else "xdg-open",
-                    link_path,
-                ])
-
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", link_path])
             self.status_var.set(f"已開啟 link.txt：{link_path}")
-
         except Exception as e:
             messagebox.showerror("錯誤", f"無法開啟 link.txt：{e}", parent=self.root)
-            self.status_var.set(f"無法開啟 link.txt：{e}")
 
     def _open_download_link_txt(self):
-        """Open pre-processing/output/download_link.txt; create it when missing."""
-        download_link_path = os.path.join(PREPROCESS_OUTPUT_DIR, "download_link.txt")
+        os.makedirs(PREPROCESS_OUTPUT_DIR, exist_ok=True)
+        download_link_path = PREPROCESS_DEFAULT_DOWNLOAD
+        if not os.path.exists(download_link_path):
+            try:
+                with open(download_link_path, "w", encoding="utf-8"):
+                    pass
+            except Exception as e:
+                messagebox.showerror("錯誤", f"無法建立 download_link.txt：{e}", parent=self.root)
+                return
         try:
-            os.makedirs(PREPROCESS_OUTPUT_DIR, exist_ok=True)
-            if not os.path.exists(download_link_path):
-                with open(download_link_path, "w", encoding="utf-8") as f:
-                    f.write("")
-
             if sys.platform == "win32":
                 os.startfile(download_link_path)
             else:
                 import subprocess
-                subprocess.Popen([
-                    "open" if sys.platform == "darwin" else "xdg-open",
-                    download_link_path,
-                ])
-
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", download_link_path])
             self.status_var.set(f"已開啟 download_link.txt：{download_link_path}")
-
         except Exception as e:
             messagebox.showerror("錯誤", f"無法開啟 download_link.txt：{e}", parent=self.root)
-            self.status_var.set(f"無法開啟 download_link.txt：{e}")
+
+    def _open_preprocess_output(self):
+        self._open_path(PREPROCESS_OUTPUT_DIR)
+        self.status_var.set(f"已開啟預處理 output：{PREPROCESS_OUTPUT_DIR}")
 
     def _pause_downloads(self):
         worker.pause()
@@ -2027,7 +1727,7 @@ class App:
             return
 
         self._failed_window = tk.Toplevel(self.root)
-        self._failed_window.title("失敗 / 封鎖 / Missing URL 清單")
+        self._failed_window.title("失敗 / 封鎖 / No Access / Missing URL 清單")
         self._failed_window.geometry(f"{self._ui_px(980)}x{self._ui_px(620)}")
 
         top = tk.Frame(self._failed_window, padx=self._pad_x, pady=self._pad_x)
@@ -2035,7 +1735,7 @@ class App:
 
         tk.Label(
             top,
-            text="失敗 / 封鎖 / Missing / 不可用 連結",
+            text="失敗 / 封鎖 / No Access / Missing / 不可用 連結",
             font=("Microsoft JhengHei UI", self._title_font_size - 2, "bold"),
         ).pack(anchor="w", pady=(0, self._ui_px(8)))
 
@@ -2047,7 +1747,7 @@ class App:
         self.failed_filter_combo = ttk.Combobox(
             filter_row,
             textvariable=self.failed_filter_var,
-            values=("ALL", "FAILED", "BLOCKED", "MISSING", "UNAVAILABLE", "RETRY"),
+            values=("ALL", "FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "UNAVAILABLE", "RETRY"),
             state="readonly",
             width=16,
         )
@@ -2068,45 +1768,9 @@ class App:
 
         tk.Button(
             filter_row,
-            text="複製 RETRY URL",
-            command=self._copy_retry_urls,
-            bg="#8E24AA",
-            fg="white",
-            padx=self._button_padx,
-            pady=self._ui_px(3),
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=3)
-
-        tk.Button(
-            filter_row,
-            text="複製 FAILED URL",
-            command=self._copy_failed_urls,
-            bg="#C62828",
-            fg="white",
-            padx=self._button_padx,
-            pady=self._ui_px(3),
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=3)
-
-        tk.Button(
-            filter_row,
             text="複製 MISSING URL",
             command=lambda: self._copy_status_urls("MISSING"),
             bg="#607D8B",
-            fg="white",
-            padx=self._button_padx,
-            pady=self._ui_px(3),
-            relief=tk.FLAT,
-            cursor="hand2",
-        ).pack(side=tk.LEFT, padx=3)
-
-        tk.Button(
-            filter_row,
-            text="複製全部未成功",
-            command=self._copy_all_unsuccessful_urls,
-            bg="#AD1457",
             fg="white",
             padx=self._button_padx,
             pady=self._ui_px(3),
@@ -2224,7 +1888,6 @@ class App:
 
     def _set_filter(self, key: str):
         self._active_filter = key
-        self.status_var.set(f"目前篩選：{key}")
         self._schedule_refresh(0)
 
     def _schedule_refresh(self, delay: int = 1000):
@@ -2249,7 +1912,7 @@ class App:
             return
 
         signature_parts = [str(total)]
-        for status in ("SUCCESS", "FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE"):
+        for status in ("SUCCESS", "FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "RETRY", "UNAVAILABLE"):
             signature_parts.append(f"{status}:{counts.get(status, 0)}")
         signature = "|".join(signature_parts)
 
@@ -2268,10 +1931,11 @@ class App:
         success = counts.get("SUCCESS", 0)
         failed = counts.get("FAILED", 0)
         blocked = counts.get("BLOCKED", 0)
+        no_access = counts.get("NO_ACCESS", 0)
         missing = counts.get("MISSING", 0)
         retry = counts.get("RETRY", 0)
         unavailable = counts.get("UNAVAILABLE", 0)
-        problem_total = failed + blocked + missing + retry + unavailable
+        problem_total = failed + blocked + no_access + missing + retry + unavailable
 
         title = "下載完成" if problem_total == 0 else "下載完成，部分任務需檢查"
         icon = "✅" if problem_total == 0 else "⚠️"
@@ -2304,6 +1968,7 @@ class App:
             ("成功", success),
             ("失敗", failed),
             ("封鎖", blocked),
+            ("需權限 / No Access", no_access),
             ("Missing", missing),
             ("待重試", retry),
             ("不可用", unavailable),
@@ -2316,7 +1981,7 @@ class App:
             tk.Label(grid, text=f"{k}：", font=("Microsoft JhengHei UI", self._base_font_size, "bold"), anchor="w").grid(row=r, column=0, sticky="w", pady=self._ui_px(2))
             tk.Label(grid, text=str(v), font=("Microsoft JhengHei UI", self._base_font_size), anchor="w").grid(row=r, column=1, sticky="w", pady=self._ui_px(2))
 
-        hint = "全部任務已成功完成。" if problem_total == 0 else "可點擊「查看失敗」檢查 FAILED / BLOCKED / MISSING / RETRY 清單。"
+        hint = "全部任務已成功完成。" if problem_total == 0 else "可點擊「查看失敗」檢查 FAILED / BLOCKED / NO_ACCESS / MISSING / RETRY 清單。"
         tk.Label(
             frame,
             text=hint,
@@ -2376,23 +2041,9 @@ class App:
         processed_count = queue_manager.get_processed_count()
 
         display = snapshot if self._active_filter == "ALL" else [t for t in snapshot if t.get("status") == self._active_filter]
-
-        # v12.16 safety:
-        # If the queue has tasks but the active filter returns nothing, the GUI
-        # looks like URL/Post Account/Post Title disappeared.  This happens after
-        # loading a new download_link.txt while an old SUCCESS/RETRY/DOWNLOADING
-        # filter is still active.  Auto-reset to ALL to keep the task list visible.
-        if snapshot and not display and self._active_filter != "ALL":
-            old_filter = self._active_filter
-            self._active_filter = "ALL"
-            display = snapshot
-            self.status_var.set(f"目前篩選 {old_filter} 無資料，已自動切回全部")
-
         display = self._apply_tree_sort(display)
 
         self._tree_url_by_iid.clear()
-        # v12.17: keep full task metadata for context-menu download lookup.
-        self._tree_task_by_iid = {}
 
         for row in self.tree.get_children():
             self.tree.delete(row)
@@ -2408,7 +2059,6 @@ class App:
             tag = status if status in _STATUS_COLORS else "PENDING"
             iid = self.tree.insert("", tk.END, values=(url_short, account_short, title_short, status, t["retry"]), tags=(tag,))
             self._tree_url_by_iid[iid] = full_url
-            self._tree_task_by_iid[iid] = dict(t)
 
         total = runtime.get("total", 0)
         done = runtime.get("done", 0)
@@ -2460,13 +2110,14 @@ class App:
             counts[t["status"]] = counts.get(t["status"], 0) + 1
 
         parts = [f"共 {len(snapshot)} 筆", f"已下載紀錄 {processed_count} 筆"]
-        for s in ("DOWNLOADING", "PENDING", "SUCCESS", "FAILED", "BLOCKED", "MISSING", "RETRY", "UNAVAILABLE"):
+        for s in ("DOWNLOADING", "PENDING", "SUCCESS", "FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "RETRY", "UNAVAILABLE"):
             if counts.get(s, 0):
                 parts.append(f"{s}: {counts[s]}")
 
         self._maybe_show_completion_popup(snapshot, runtime, counts, elapsed)
 
         blocked_n = counts.get("BLOCKED", 0)
+        no_access_n = counts.get("NO_ACCESS", 0)
         if blocked_n > 0 and not self._blocked_warned:
             self._blocked_warned = True
             parts.append("⚠️ BLOCKED 代表內容受限；即使有 cookies，若帳號本身沒權限仍會失敗")

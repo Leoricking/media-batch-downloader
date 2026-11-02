@@ -1,4 +1,4 @@
-# v12.11 Facebook Metadata Identity Fix
+# v12.12 NO_ACCESS terminal status + Facebook metadata identity preservation
 # v12.10 Instagram Metadata Identity Fix
 # v12.01 Profile Parent Checkpoint Fix
 # v12.00 Profile Batch Priority Queue
@@ -30,9 +30,9 @@ _RUNTIME = {
     "done": 0,
 }
 
-_TERMINAL_STATUSES = {"SUCCESS", "FAILED", "BLOCKED", "MISSING", "UNAVAILABLE"}
+_TERMINAL_STATUSES = {"SUCCESS", "FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "UNAVAILABLE"}
 _RETRYABLE_STATUSES = {"RETRY"}
-_FAILURE_STATUSES = {"FAILED", "BLOCKED", "MISSING", "UNAVAILABLE", "RETRY"}
+_FAILURE_STATUSES = {"FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "UNAVAILABLE", "RETRY"}
 
 
 def _ensure_dirs():
@@ -72,6 +72,8 @@ def _normalize_status(status: str) -> str:
         "INVALID": "UNAVAILABLE",
         "MISSING_PAGE": "MISSING",
         "NOT_FOUND": "MISSING",
+        "PERMISSION": "NO_ACCESS",
+        "ACCESS_REQUIRED": "NO_ACCESS",
     }
     return aliases.get(status, status or "FAILED")
 
@@ -94,17 +96,14 @@ def _extract_urls_from_text(text: str) -> list[str]:
 def _task_identity_key(url: str) -> str:
     """Return a conservative identity key used only for queue dedupe/metadata.
 
-    v12.11:
-    Facebook download stages can publish metadata using a resolved URL, a
-    fragment-stripped URL, or a canonical media URL.  Exact string comparison is
-    therefore insufficient for FB story/reel rows.  Add stable FB identities so
-    update_task_title/update_task_account can find the visible GUI row.
+    Instagram uses shortcode identity. Facebook download stages may publish
+    metadata using resolved/canonical forms, so stable FB story/post/photo/video
+    and share identities are preserved here.
     """
     clean = (url or "").strip()
     if not clean:
         return ""
 
-    # Fragments never identify different FB/IG media.
     clean_no_fragment = clean.split("#", 1)[0]
     low = clean_no_fragment.lower()
 
@@ -115,24 +114,15 @@ def _task_identity_key(url: str) -> str:
 
     if "facebook.com" in low or "fb.watch" in low:
         raw = clean_no_fragment
-
-        # Explicit story/post URLs.  story_fbid is the strongest identity for
-        # this user's failing case.
         m = re.search(r"[?&]story_fbid=([0-9]{8,})", raw, flags=re.I)
         if m:
             return f"facebook:story:{m.group(1)}"
-
-        # post_id may be pageid_storyid; keep full value when present.
         m = re.search(r"[?&]post_id=([0-9_]{8,})", raw, flags=re.I)
         if m:
             return f"facebook:post:{m.group(1)}"
-
-        # Photo URL identity.
         m = re.search(r"[?&](?:fbid|photo_id)=([0-9]{8,})", raw, flags=re.I)
         if m:
             return f"facebook:photo:{m.group(1)}"
-
-        # Reel/watch/video identity.
         for pat in [
             r"/(?:reel|reels)/([0-9]{6,})",
             r"/watch/reel/([0-9]{6,})",
@@ -142,8 +132,6 @@ def _task_identity_key(url: str) -> str:
             m = re.search(pat, raw, flags=re.I)
             if m:
                 return f"facebook:video:{m.group(1)}"
-
-        # Short share IDs are stable enough for the same submitted link.
         for pat in [
             r"/share/(?:r|v|p)/([^/?#&]+)",
             r"/share/([^/?#&]+)",
@@ -151,11 +139,9 @@ def _task_identity_key(url: str) -> str:
             m = re.search(pat, raw, flags=re.I)
             if m:
                 return f"facebook:share:{m.group(1)}"
-
         return clean_no_fragment
 
     return clean_no_fragment
-
 
 def insert_tasks_after(anchor_url: str, urls: list[str], batch_parent: str = "") -> dict:
     """Insert child tasks immediately after *anchor_url*.
@@ -511,6 +497,11 @@ def get_task() -> Optional[dict]:
 def set_task_result(url: str, status: str, error: str = "", checkpoint_success: bool = True):
     status = _normalize_status(status)
     error = error or ""
+    # v12.12: Facebook uses BLOCKED as an immediate terminal signal so the
+    # existing worker does not waste a second attempt.  Promote only the
+    # explicit NO_ACCESS marker to the dedicated persisted/UI status.
+    if status == "BLOCKED" and map_status(error) == "NO_ACCESS":
+        status = "NO_ACCESS"
     _ensure_dirs()
     with _LOCK:
         task = _find_task(url)
@@ -553,7 +544,7 @@ def set_task_result(url: str, status: str, error: str = "", checkpoint_success: 
         elif status in {"MISSING", "UNAVAILABLE"}:
             _append_unique_line(UNAVAILABLE_FILE, url)
             _append_unique_line(FAILED_LOG_FILE, f"[{status}]\t{url}\t{error}")
-        elif status in {"FAILED", "BLOCKED"}:
+        elif status in {"FAILED", "BLOCKED", "NO_ACCESS"}:
             _append_unique_line(FAILED_LOG_FILE, f"[{status}]\t{url}\t{error}")
         _recompute_runtime_counts_locked()
 
@@ -618,7 +609,7 @@ def get_urls_by_status(status: str) -> list[str]:
 def get_tasks_by_status(status: str = "ALL") -> list[dict]:
     """
     取得指定狀態任務。
-    status="ALL" 回傳所有失敗類任務：FAILED / BLOCKED / MISSING / UNAVAILABLE / RETRY。
+    status="ALL" 回傳所有失敗類任務：FAILED / BLOCKED / NO_ACCESS / MISSING / UNAVAILABLE / RETRY。
     """
     status = (status or "ALL").upper().strip()
     with _LOCK:
@@ -628,7 +619,7 @@ def get_tasks_by_status(status: str = "ALL") -> list[dict]:
 
 
 def get_failed_statuses() -> tuple[str, ...]:
-    return ("ALL", "FAILED", "BLOCKED", "MISSING", "UNAVAILABLE", "RETRY")
+    return ("ALL", "FAILED", "BLOCKED", "NO_ACCESS", "MISSING", "UNAVAILABLE", "RETRY")
 
 
 def get_failed_links_text(status_filter: str = "ALL", url_only: bool = False, urls_only: bool | None = None) -> str:
@@ -787,6 +778,11 @@ def write_logs():
 
 def map_status(error: str) -> str:
     e = (error or "").lower()
+    if any(k in e for k in [
+        "no_access", "access_required", "audience/share-scope restricted",
+        "current account does not have permission", "沒有權限觀看", "無權限觀看",
+    ]):
+        return "NO_ACCESS"
     if any(k in e for k in [
         "missing", "page not found", "not found", "404", "已遭移除", "頁面無法使用", "此頁面無法使用", "link may be broken", "page may have been removed",
     ]):
