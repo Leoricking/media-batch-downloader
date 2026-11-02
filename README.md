@@ -6,7 +6,7 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 
 核心原則：
 
-> **不假成功、不漏圖、不抓其他貼文、不把縮圖或封面誤判成正式媒體。**
+> **確保下載媒體與指定貼文一致，並驗證圖片與影片的品質及完整性。只有全部預期媒體均通過驗證，任務才會標記為 SUCCESS。**
 
 目前版本支援大量連結匯入、URL 預處理、GUI 任務佇列、狀態分類、斷點續跑、登入 Profile、Post Account / Post Title、完整性驗證、失敗清單整理，以及 Instagram / Facebook 多引擎 recovery。
 
