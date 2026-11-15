@@ -1,3 +1,29 @@
+# v12.49 Authenticated Source-Native Small Carousel Image Acceptance
+# When Instagram's original exact-child metadata and ALL explicit alternatives prove
+# the largest available frame is 320x240, accept the actual byte-identical native
+# image only for the final child of an already validated carousel. Keep all other
+# thumbnail, wrong-post, duplicate, and incomplete-gallery hard gates unchanged.
+# v12.48 Preserve Authenticated CDN Signed URL Bytes + Evidence-Based Image Candidates
+# Keep percent-escaped source URLs exactly as Instagram supplied them; never lower-case signed query tokens.
+# Do not fabricate CDN resized URL variants when a signed structured URL already defines the legitimate alternatives.
+# Existing per-child completeness, media-ownership, dimension and no-false-success gates remain unchanged.
+# v12.47 Target-Page Response Body Recovery + Profile Snapshot Lock Fix
+# Capture only identity-proven image bytes returned to the authenticated target post; do not refetch signed URLs or relax quality gates.
+# v12.46 Browser-Native Exact Image Transfer Recovery
+# Recover a known structured child through authenticated Chromium navigation only
+# after APIRequestContext and existing exact child recovery failed. Preserve image gates.
+# v12.45 Browser-Verified Exact Failed-Child Recovery (preserve v12.44 strict gates)
+# v12.44 Exact Failed-Child Fresh Authenticated Media Recovery
+# Refreshes only a failed carousel image from verified same-post structured media;
+# preserves previous successful children, order, quality and strict no-false-success guards.
+# v12.43 Exact Requested Carousel Slide Integrity Gate
+# Preserves v12.38 complete authenticated structured 18-slide extraction and
+# v12.42 strict recommendation/related-post filtering. Adds requested-slide
+# source/byte identity verification before a successful carousel move.
+# v12.42 Carousel Target-Media DOM Ownership Guard
+# Restricts visual slide selection to the active post media, excluding linked recommendations and related-post tiles.
+# v12.41 Verified Carousel Recovery + Partial-Media Rate-Limit Classification
+# Restores a target-scoped carousel walk when direct img_index is ignored and keeps partial media RETRY.
 # v12.40 Authenticated Transport Recovery + Playwright Listener Cleanup Fix
 # Preserves every v12.39 feature; retries exact-media transfer through logged-in IG_Parser and detaches response listeners before context close.
 # v12.39 Transport-Recovery + Correct BLOCKED Classification Fix
@@ -520,6 +546,11 @@ def _rate_limited_zero_media_result(instaloader_error: str, playwright_error: st
         "ig_parser_runtime_unavailable" in playwright_clean.lower()
         or _is_ig_parser_runtime_launch_error(playwright_clean)
     ):
+        return None
+
+    # A visible target carousel with verified slide transitions is not zero-media
+    # evidence.  GraphQL 401 can coexist with an authenticated browser session.
+    if getattr(_DOWNLOAD_CONTEXT, "carousel_partial_evidence", False):
         return None
 
     zero_media_or_empty = (
@@ -2146,12 +2177,46 @@ def _get_current_slide_main_media(page):
     """
     js = r"""
     async () => {
-      const scopes = [];
-      const dialog = document.querySelector('div[role="dialog"]');
-      const article = document.querySelector('article');
-      if (dialog) scopes.push(dialog);
-      if (article) scopes.push(article);
-      if (!scopes.length) scopes.push(document);
+      // v12.42: The 9th slide of a long carousel was accidentally taken from
+      // the "more posts" grid. A same-account recommendation is not owned by
+      // the current carousel even when the address bar keeps the target URL.
+      const targetMatch = location.pathname.match(/^\/(?:p|reel|reels)\/([^/]+)/);
+      const targetCode = targetMatch ? targetMatch[1] : '';
+      const inViewport = el => {
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        return st.display !== 'none' && st.visibility !== 'hidden' &&
+          parseFloat(st.opacity || '1') > 0 && r.right > 0 && r.bottom > 0 &&
+          r.left < innerWidth && r.top < innerHeight;
+      };
+      const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]'))
+        .filter(inViewport);
+      // Choose the real post article, not an article used by the recommendation
+      // feed. A target carousel has a substantial, unlinked media surface.
+      const articles = Array.from(document.querySelectorAll('article'))
+        .filter(inViewport);
+      const root = dialogs.length ? dialogs[dialogs.length - 1] :
+        (articles.length ? articles[0] : document);
+      const scopes = [root];
+      const linkedRecommendation = el => {
+        const link = el.closest('a[href]');
+        if (!link) return false;
+        const href = link.getAttribute('href') || '';
+        const match = href.match(/\/(?:p|reel|reels)\/([^/?#]+)/);
+        // Linked media tiles are navigation targets, not carousel slides.
+        // Reject even same-post thumbnails: only the displayed slide qualifies.
+        return !!match;
+      };
+      const insideRelatedGrid = el => {
+        // Instagram's recommendation grid normally uses post-permalink links;
+        // this also rejects unlinked image placeholders inside a related grid.
+        for (let p = el.parentElement, depth = 0; p && depth < 8;
+             p = p.parentElement, depth++) {
+          const label = String(p.getAttribute('aria-label') || '').toLowerCase();
+          if (/more posts|related posts|suggested posts|更多.*貼文|其他貼文|推薦貼文/.test(label)) return true;
+        }
+        return false;
+      };
 
       function bad(low) {
         return [
@@ -2172,7 +2237,8 @@ def _get_current_slide_main_media(page):
 
       const raw = [];
       for (const scope of scopes) {
-        const nodes = Array.from(scope.querySelectorAll('img, video')).filter(visible);
+        const nodes = Array.from(scope.querySelectorAll('img, video'))
+          .filter(el => visible(el) && !linkedRecommendation(el) && !insideRelatedGrid(el));
         for (const el of nodes) {
           const r = el.getBoundingClientRect();
           const frameRatio = r.height ? r.width / r.height : 0;
@@ -2184,6 +2250,12 @@ def _get_current_slide_main_media(page):
           const dy = Math.abs(centerY - mediaCenterY);
           const overlapX = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
           const overlapY = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+          // Require a substantial, visible main-post frame. Tiny preview
+          // tiles and partially off-screen recommended cards are not slides.
+          if (overlapX < 180 || overlapY < 160 || overlapX * overlapY < 45000) continue;
+          // A normal desktop post renders its slide on the left media pane.
+          // Do not select a large suggestion card below the post.
+          if (r.left >= innerWidth * 0.70) continue;
           const base = overlapX * overlapY * 8 + r.width * r.height - dx * 6000 - dy * 80;
 
           const urls = new Map();
@@ -3483,7 +3555,7 @@ def _copy_ig_parser_runtime_snapshot(user_data_dir: str, profile_dir: str) -> st
 
     skip_names = {
         "Cache", "Code Cache", "GPUCache", "DawnCache", "ShaderCache",
-        "GrShaderCache", "Media Cache", "Crashpad", "Sessions",
+        "GrShaderCache", "Media Cache", "Crashpad", "Sessions", "Sessions_Encrypted",
         "Session Storage", "Service Worker",
         "optimization_guide_prediction_model_downloads",
         # Chrome keeps these SQLite files locked while IG_Parser is open.
@@ -3495,7 +3567,7 @@ def _copy_ig_parser_runtime_snapshot(user_data_dir: str, profile_dir: str) -> st
         ignored = []
         for name in names:
             low = str(name or "").lower()
-            if name in skip_names or low.startswith("singleton") or low in {"lock", "lockfile"}:
+            if low in {entry.lower() for entry in skip_names} or low.startswith("singleton") or low in {"lock", "lockfile"}:
                 ignored.append(name)
         return ignored
 
@@ -5039,6 +5111,44 @@ def _extract_ig_media_from_text(text: str):
     return _dedupe_media(items)
 
 
+def _ig_v1249_authoritative_small_image(item: dict, width: int, height: int) -> bool:
+    """Narrow source-native exception; never infer original quality from a 200 alone.
+
+    The authenticated *original child* must expose only <=320x240 explicit
+    candidates, must not declare a larger original frame, and the bytes must
+    match its largest candidate. Caller gates this to the last slide after all
+    preceding media have passed their normal validation.
+    """
+    if not isinstance(item, dict) or not item.get("_v1249_last_child_after_valid_siblings"):
+        return False
+    if (item.get("from") != "authenticated-structured-json"
+            or not item.get("_target_shortcode")
+            or item.get("type") != "image"
+            or int(item.get("_carousel_slide_index") or 0) < 2):
+        return False
+    try:
+        sw, sh = int(item.get("sourceWidth") or 0), int(item.get("sourceHeight") or 0)
+        ew, eh = int(item.get("_explicitMaxWidth") or 0), int(item.get("_explicitMaxHeight") or 0)
+        ow = int(item.get("_v1249_original_width") or 0)
+        oh = int(item.get("_v1249_original_height") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (width, height) != (320, 240) or (sw, sh) != (320, 240):
+        return False
+    if (ew, eh) != (320, 240):
+        return False
+    # Original dimensions, when supplied, cannot prove a larger master image.
+    if ow > 320 or oh > 240 or ow < 0 or oh < 0:
+        return False
+    u = str(item.get("src") or "")
+    if not _looks_like_real_ig_media_url(u) or not _media_key_from_url(u):
+        return False
+    # Explicit image resize to 320 is evidence of a thumbnail, not native media.
+    if re.search(r"(?:^|[_?&=])(?:s|p)(?:240|320)x\d+", u.lower()):
+        return False
+    return True
+
+
 def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, str]:
     """Hard-gate downloaded still images against thumbnails/cropped variants."""
     if not path or not os.path.exists(path):
@@ -5061,6 +5171,18 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
 
         if w <= 0 or h <= 0:
             return False, "圖片尺寸無效"
+
+        # v12.49: only the last child of an already validated carousel may
+        # retain Instagram's explicitly-declared 320x240 original/native image.
+        # This is NOT a blanket small-thumbnail exemption. All image identity,
+        # ratio, content-hash and complete-gallery checks still execute.
+        native_small_v1249 = _ig_v1249_authoritative_small_image(item, w, h)
+        if native_small_v1249:
+            logger.info(
+                f"IG v12.49 verified source-native best-available: "
+                f"slide={item.get('_carousel_slide_index')}, actual={w}x{h}, "
+                "structured_max=320x240, earlier_slides_validated=True"
+            )
 
         # Normal images still require a 720px long edge. A narrow exception is
         # allowed only for an exact authenticated structured child where:
@@ -5122,7 +5244,7 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                 )
             )
 
-            if not acceptable_best_available:
+            if not (acceptable_best_available or native_small_v1249):
                 return False, (
                     f"下載結果是低解析度縮圖：actual={w}x{h}"
                 )
@@ -5159,7 +5281,7 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                 and min(w, h) >= _IG_EXACT_STRUCTURED_BEST_AVAILABLE_PORTRAIT_SHORT_EDGE
                 and (max(w, h) / max(min(w, h), 1)) <= 1.35
             )
-            if not (
+            if not (native_small_v1249 or (
                 best_available
                 and declared_match
                 and (
@@ -5170,7 +5292,7 @@ def _validate_downloaded_media_geometry(path: str, item: dict) -> tuple[bool, st
                     or square_best_available_v1225
                     or portrait_best_available_v1226
                 )
-            ):
+            )):
                 return False, (
                     f"下載圖片短邊過小，疑似裁切縮圖：actual={w}x{h}"
                 )
@@ -5231,12 +5353,16 @@ def _normalized_exact_media_url(url: str) -> str:
     variants must remain separate for still-image quality fallback.
     """
     try:
-        cleaned = html.unescape(unquote(str(url or "").strip()))
+        # Only decode HTML entities. Percent escapes and query case are part of
+        # the signed CDN URL and must stay byte-for-byte intact. In particular,
+        # unquote() could turn a percent-encoded query delimiter into a literal
+        # '&', silently changing the effective CDN request.
+        cleaned = html.unescape(str(url or "").strip())
         parsed = urlparse(cleaned)
         host = (parsed.netloc or "").lower()
         path = re.sub(r"/+", "/", parsed.path or "")
         query = parsed.query or ""
-        return f"{host}{path}?{query}".lower() if query else f"{host}{path}".lower()
+        return f"{host}{path}?{query}" if query else f"{host}{path}"
     except Exception:
         return str(url or "").strip().lower()
 
@@ -5475,7 +5601,520 @@ def _validate_downloaded_media_type(path: str, item: dict) -> tuple[bool, str]:
 
 
 
-def _download_filtered_items_from_context(context, filtered, harvested_media, title: str, shortcode: str, referer: str):
+def _ig_v1243_audit_requested_carousel_slide(
+    ordered_items: list[dict], temporary_root: str, shortcode: str, requested_index: int
+) -> tuple[bool, str]:
+    """Fail-closed audit of the requested carousel slot, without internet access.
+
+    The nth structured item must belong to this target shortcode; its transfer
+    must have produced exactly one ig_N file. Byte-level duplication against
+    a different carousel slot is rejected (avoids reporting the wrong repeated
+    slide as SUCCESS). It cannot prove semantic image correctness by itself.
+    """
+    if requested_index <= 1:
+        return True, "no explicit carousel index"
+    if requested_index > len(ordered_items):
+        return False, (f"requested img_index={requested_index} exceeds exact carousel "
+                       f"count={len(ordered_items)}, target={shortcode}")
+    expected_urls = []
+    for number, item in enumerate(ordered_items, 1):
+        if not isinstance(item, dict) or item.get("_target_shortcode") != shortcode:
+            return False, f"carousel slide {number} has no verified owner={shortcode}"
+        media_key = _media_key_from_url(str(item.get("src") or ""))
+        if not media_key:
+            return False, f"carousel slide {number} has no media identity"
+        expected_urls.append(media_key)
+    if len(set(expected_urls)) != len(expected_urls):
+        return False, "carousel source identities contain duplicated slides"
+
+    import glob
+    fingerprints = {}
+    for number in range(1, len(ordered_items) + 1):
+        paths = [p for p in glob.glob(os.path.join(temporary_root, f"ig_{number}.*"))
+                 if os.path.splitext(p)[1].lower() in _MEDIA_EXTS]
+        if len(paths) != 1:
+            return False, f"carousel slide {number} expected one output, got {len(paths)}"
+        path = paths[0]
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    h.update(block)
+            fingerprints[number] = h.hexdigest()
+        except OSError as exc:
+            return False, f"carousel slide {number} not readable: {exc}"
+    target_fingerprint = fingerprints[requested_index]
+    duplicates = [number for number, digest in fingerprints.items()
+                  if number != requested_index and digest == target_fingerprint]
+    if duplicates:
+        return False, (f"requested slide {requested_index} duplicates file bytes "
+                       f"of slide(s) {duplicates}; refuse false SUCCESS")
+    return True, (f"target={shortcode}, requested={requested_index}/{len(ordered_items)}, "
+                  f"source_key_sha256={hashlib.sha256(expected_urls[requested_index - 1].encode()).hexdigest()[:12]}, "
+                  f"file_sha256={target_fingerprint[:12]}")
+
+
+def _ig_v1244_fresh_exact_child_urls(page, captured_payloads: list, shortcode: str,
+                                     ordered_items: list[dict], failed_index: int,
+                                     attempted_urls: list[str]) -> list[str]:
+    """Get newly signed image URLs only from the same exact structured carousel.
+
+    No DOM/recommendation search: the refreshed parent shortcode, item count,
+    child order and each original media filename must all remain unchanged.
+    Never relax quality gates or change previously downloaded children.
+    """
+    if not (1 <= failed_index <= len(ordered_items)):
+        return []
+    old_keys = [_media_key_from_url(str(x.get("src") or "")) for x in ordered_items]
+    if not all(old_keys) or len(set(old_keys)) != len(old_keys):
+        return []
+    if any(x.get("_target_shortcode") != shortcode for x in ordered_items):
+        return []
+    if str(ordered_items[failed_index - 1].get("from") or "") != "authenticated-structured-json":
+        return []
+    old_tried = {_normalized_exact_media_url(x) for x in attempted_urls}
+
+    def from_payload(payload):
+        if not isinstance(payload, (dict, list)):
+            return []
+        fresh = _find_structured_media_in_payload(payload, shortcode)
+        if len(fresh) != len(ordered_items):
+            return []
+        keys = [_media_key_from_url(str(x.get("src") or "")) for x in fresh]
+        if keys != old_keys:
+            logger.warning(
+                f"IG v12.44 refreshed structured identity changed: "
+                f"target={shortcode}, slide={failed_index}; reject cross-post/slide substitution"
+            )
+            return []
+        fresh_item = fresh[failed_index - 1]
+        if str(fresh_item.get("type") or "").lower() != "image":
+            return []
+        new_urls = []
+        seen = set(old_tried)
+        for value in [fresh_item.get("src"), *(fresh_item.get("_alternate_image_urls") or [])]:
+            value = str(value or "").strip()
+            identity = _normalized_exact_media_url(value)
+            if (not value or identity in seen or
+                    _media_key_from_url(value) != old_keys[failed_index - 1] or
+                    not _looks_like_real_ig_media_url(value) or
+                    any(ext in value.lower() for ext in (".mp4", ".m4v", ".mov"))):
+                continue
+            seen.add(identity)
+            new_urls.append(value)
+        return new_urls
+
+    # First ask the currently authenticated session for a fresh exact post JSON.
+    try:
+        payload = _fetch_authenticated_media_info(page, shortcode)
+        urls = from_payload(payload)
+        if urls:
+            return urls
+    except Exception as exc:
+        logger.info(f"IG v12.44 exact child API refresh unavailable: {type(exc).__name__}")
+
+    # If the API is still stale, re-open the SAME target page once. The caller's
+    # already-downloaded ig_1..ig_N files remain untouched throughout this step.
+    try:
+        if not _is_target_shortcode_context(page, shortcode):
+            return []
+        before = len(captured_payloads)
+        page.goto(f"https://www.instagram.com/p/{shortcode}/",
+                  wait_until="domcontentloaded", timeout=35000)
+        page.wait_for_timeout(1000)
+        if not _is_target_shortcode_context(page, shortcode):
+            return []
+        for record in captured_payloads[before:]:
+            if isinstance(record, dict) and "payload" in record:
+                urls = from_payload(record["payload"])
+                if urls:
+                    return urls
+        for payload in _extract_json_scripts_from_page(page):
+            urls = from_payload(payload)
+            if urls:
+                return urls
+        return from_payload(_fetch_authenticated_media_info(page, shortcode))
+    except Exception as exc:
+        logger.warning(f"IG v12.44 exact child page refresh failed: {type(exc).__name__}: {str(exc)[:120]}")
+    return []
+
+
+def _ig_v1245_visible_exact_child_urls(context, shortcode: str,
+                                      ordered_items: list[dict], failed_index: int,
+                                      attempted_urls: tuple[str, ...],
+                                      harvested_media: dict) -> list[str]:
+    """Bounded, fail-closed *browser-rendered* recovery for one exact IG child.
+
+    Only called after the authenticated structured child candidates have failed.
+    The separately opened tab must show the same shortcode and the visible main
+    carousel media MUST have the exact original CDN filename for every traversed
+    slide. No whole-document performance or recommendation URL is accepted.
+    Browser responses can be cached into the existing exact-URL harvest; all
+    downloaded bytes still undergo the pre-existing type/geometry checks.
+    """
+    if not 1 <= failed_index <= len(ordered_items) <= _MAX_CAROUSEL_ITEMS:
+        return []
+    if any(x.get("_target_shortcode") != shortcode for x in ordered_items):
+        return []
+    keys = [_media_key_from_url(str(x.get("src") or "")) for x in ordered_items]
+    if not all(keys) or len(set(keys)) != len(keys):
+        return []
+    target_key = keys[failed_index - 1]
+    tried = {_normalized_exact_media_url(u) for u in attempted_urls}
+    tab = None
+    active = True
+
+    def on_response(response):
+        if not active:
+            return
+        # The existing listener already validates image bytes. Only the same
+        # image URL may later be selected; foreign tab resources are ignored.
+        try:
+            if _media_key_from_url(str(response.url or "")) == target_key:
+                _capture_playwright_response(response, harvested_media)
+        except Exception:
+            pass
+
+    try:
+        tab = context.new_page()
+        tab.on("response", on_response)
+        _goto_instagram_target_clean(
+            tab, f"https://www.instagram.com/p/{shortcode}/",
+            target_shortcode=shortcode, timeout=35000,
+        )
+        tab.wait_for_timeout(900)
+        if not _is_target_shortcode_context(tab, shortcode):
+            return []
+        try:
+            tab.evaluate("() => window.scrollTo(0, 0)")
+            tab.wait_for_timeout(400)
+        except Exception:
+            pass
+
+        def matching_visible_urls(expected_key):
+            # This helper already scopes to the active visible post and excludes
+            # linked recommendation tiles. No candidate is accepted by order alone.
+            items = _get_current_slide_main_media(tab)
+            if not items or _media_key_from_url(str(items[0].get("src") or "")) != expected_key:
+                return []
+            # Accept only URLs attached to the exact visible main image. srcset
+            # can expose a larger independently signed rendition than metadata.
+            raw = tab.evaluate(r"""
+            () => {
+              const matches=[];
+              const W=innerWidth,H=innerHeight;
+              for(const im of document.querySelectorAll('img')) {
+                const r=im.getBoundingClientRect(),s=getComputedStyle(im);
+                const ox=Math.max(0,Math.min(W,r.right)-Math.max(0,r.left));
+                const oy=Math.max(0,Math.min(H,r.bottom)-Math.max(0,r.top));
+                if (s.display==='none'||s.visibility==='hidden'||ox<180||oy<160||
+                    ox*oy<45000||r.left>=W*.70) continue;
+                const a=im.closest('a[href]');
+                if(a && /\/(?:p|reel|reels)\/[^/]+/.test(a.getAttribute('href')||'')) continue;
+                const urls=[im.currentSrc||'',im.src||'',im.getAttribute('src')||''];
+                const set=im.getAttribute('srcset')||'';
+                for(const part of set.split(',')) urls.push(part.trim().split(/\s+/)[0]||'');
+                matches.push({area:ox*oy,urls});
+              }
+              matches.sort((a,b)=>b.area-a.area);
+              return matches.slice(0,6);
+            }
+            """) or []
+            urls = [str(items[0].get("src") or "")]
+            for entry in raw:
+                for url in entry.get("urls") or []:
+                    if _media_key_from_url(str(url or "")) == expected_key:
+                        urls.append(str(url))
+            output=[]
+            seen=set(tried)
+            for url in urls:
+                norm=_normalized_exact_media_url(url)
+                if (norm in seen or _media_key_from_url(url)!=target_key or
+                        not _looks_like_real_ig_media_url(url) or
+                        any(x in url.lower() for x in ('.mp4','.m4v','.mov'))):
+                    continue
+                seen.add(norm)
+                output.append(url)
+            return output
+
+        # Prefer a direct indexed navigation ONLY if browser-visible source
+        # proves the exact media identity. Instagram often ignores img_index.
+        if failed_index > 1:
+            try:
+                tab.goto(f"https://www.instagram.com/p/{shortcode}/?img_index={failed_index}",
+                         wait_until="domcontentloaded", timeout=18000)
+                tab.wait_for_timeout(750)
+                if _is_target_shortcode_context(tab, shortcode):
+                    found=matching_visible_urls(target_key)
+                    if found:
+                        logger.info(f"IG v12.45 browser verified direct indexed child {failed_index}: candidates={len(found)}")
+                        return found
+            except Exception:
+                pass
+            _goto_instagram_target_clean(tab, f"https://www.instagram.com/p/{shortcode}/",
+                                          target_shortcode=shortcode, timeout=35000)
+            tab.evaluate("() => window.scrollTo(0, 0)")
+            tab.wait_for_timeout(300)
+
+        for index in range(1, failed_index+1):
+            if index>1:
+                # The same verified next transition used by the existing strict
+                # carousel walker, followed by an exact slide-identity check.
+                if not _click_next_ig_locked_keycheck(tab, shortcode):
+                    logger.info(f"IG v12.45 browser child walk stopped: index={index}")
+                    return []
+            if not _is_target_shortcode_context(tab, shortcode):
+                return []
+            found=matching_visible_urls(keys[index-1])
+            if index == failed_index:
+                logger.info(f"IG v12.45 browser exact child {index}/{len(keys)}: new_candidates={len(found)}")
+                return found
+            # Require matching visible media on intermediate steps, too.
+            if not _get_current_slide_main_media(tab) or _media_key_from_url(
+                str(_get_current_slide_main_media(tab)[0].get('src') or '')) != keys[index-1]:
+                logger.info(f"IG v12.45 browser child identity mismatch at index={index}")
+                return []
+    except Exception as exc:
+        logger.info(f"IG v12.45 exact browser recovery unavailable: {type(exc).__name__}: {str(exc)[:120]}")
+    finally:
+        active=False
+        if tab is not None:
+            try:
+                tab.remove_listener('response', on_response)
+            except Exception:
+                pass
+            try:
+                tab.close()
+            except Exception:
+                pass
+    return []
+
+
+
+def _ig_v1247_capture_target_page_image(context, item: dict, destination: str,
+                                        shortcode: str, slide_number: int) -> tuple[bool, str]:
+    """Save a response *already delivered to the verified Instagram post*.
+
+    Unlike opening a CDN link as a top-level tab, this preserves the actual
+    browser request made by Instagram itself. Both target post identity and
+    the active displayed child CDN identity must match before accepting any
+    captured body. All established type, geometry and identity guards apply.
+    """
+    if (str(item.get("from") or "") != "authenticated-structured-json"
+            or str(item.get("_target_shortcode") or "") != shortcode
+            or str(item.get("type") or "").lower() != "image"
+            or int(item.get("_carousel_slide_index") or 0) != slide_number):
+        return False, "not verified structured child"
+    target_key = _media_key_from_url(str(item.get("src") or ""))
+    if not target_key:
+        return False, "missing target media identity"
+    captured = []
+    tab = None
+    listener_active = True
+
+    def on_response(response):
+        if not listener_active or len(captured) >= 16:
+            return
+        try:
+            url = str(response.url or "")
+            if (response.status != 200 or
+                    _media_key_from_url(url) != target_key or
+                    not _looks_like_real_ig_media_url(url)):
+                return
+            ctype = str((response.headers or {}).get("content-type") or "").lower()
+            if not ctype.startswith("image/") or "svg" in ctype:
+                return
+            body = response.body()
+            if body and len(body) <= 25_000_000 and _is_probably_valid_media_body(
+                    body, media_url=url, content_type=ctype):
+                captured.append((url, ctype, body))
+        except Exception:
+            pass
+
+    try:
+        tab = context.new_page()
+        tab.on("response", on_response)
+        # The indexed URL is an optimization only; its query string is never
+        # considered proof that Instagram actually displayed this slide.
+        target_url = f"https://www.instagram.com/p/{shortcode}/"
+        if slide_number > 1:
+            target_url += f"?img_index={slide_number}"
+        tab.goto(target_url, wait_until="domcontentloaded", timeout=35000)
+        tab.wait_for_timeout(1100)
+        if not _is_target_shortcode_context(tab, shortcode):
+            return False, "post identity changed during target-page capture"
+        try:
+            tab.evaluate("() => window.scrollTo(0,0)")
+            tab.wait_for_timeout(250)
+        except Exception:
+            pass
+
+        def visible_matches():
+            visible = _get_current_slide_main_media(tab)
+            return bool(visible and _media_key_from_url(
+                str(visible[0].get("src") or "")) == target_key)
+
+        if not visible_matches():
+            # Instagram may ignore img_index; walk the actual carousel from
+            # slide one and verify the expected identity at every transition.
+            tab.goto(f"https://www.instagram.com/p/{shortcode}/",
+                     wait_until="domcontentloaded", timeout=35000)
+            tab.wait_for_timeout(750)
+            if not _is_target_shortcode_context(tab, shortcode):
+                return False, "post changed during carousel walk"
+            for index in range(2, slide_number + 1):
+                if not _click_next_ig_locked_keycheck(tab, shortcode):
+                    return False, f"unable to verify transition to slide {index}"
+            if not visible_matches():
+                return False, "visible carousel child does not match structured identity"
+
+        # Give deferred image requests a chance to finish; the response event
+        # captures bytes from the POST PAGE (not from another CDN navigation).
+        tab.wait_for_timeout(650)
+        logger.info(
+            f"IG v12.47 exact target-page response evidence: "
+            f"target={shortcode}, slide={slide_number}, responses={len(captured)}"
+        )
+        for url, ctype, body in sorted(captured, key=lambda r: len(r[2]), reverse=True):
+            try:
+                _write_media_body(destination, body, media_url=url, content_type=ctype)
+                type_ok, _ = _validate_downloaded_media_type(destination, item)
+                geometry_ok, geometry_reason = _validate_downloaded_media_geometry(destination, item)
+                if type_ok and geometry_ok:
+                    logger.info(
+                        f"IG v12.47 target-page response accepted: "
+                        f"target={shortcode}, slide={slide_number}, bytes={len(body)}"
+                    )
+                    return True, "exact target-page response validated"
+                logger.info(
+                    f"IG v12.47 target-page response rejected: "
+                    f"slide={slide_number}, reason={geometry_reason or 'image type mismatch'}"
+                )
+            finally:
+                if os.path.exists(destination):
+                    try:
+                        type_ok, _ = _validate_downloaded_media_type(destination, item)
+                        geometry_ok, _ = _validate_downloaded_media_geometry(destination, item)
+                        if not (type_ok and geometry_ok):
+                            os.remove(destination)
+                    except Exception:
+                        try:
+                            os.remove(destination)
+                        except OSError:
+                            pass
+        return False, f"no qualifying original image in {len(captured)} target-page responses"
+    except Exception as exc:
+        return False, f"target-page response capture unavailable: {type(exc).__name__}"
+    finally:
+        listener_active = False
+        if tab is not None:
+            try:
+                tab.remove_listener("response", on_response)
+            except Exception:
+                pass
+            try:
+                tab.close()
+            except Exception:
+                pass
+
+
+def _ig_v1246_browser_native_exact_image(context, item: dict, candidate_urls: list[str],
+                                         destination: str, shortcode: str,
+                                         slide_number: int) -> tuple[bool, str]:
+    """Isolated Chromium transport for an identity-proven failed image.
+
+    This is NOT broad-page harvesting. Each requested and returned CDN URL must
+    match the original structured child filename; bytes must pass the existing
+    image-type and geometry gates before destination can be used. No screenshots,
+    synthetic upscaling, 320px quality bypass, or foreign/recommendation media.
+    """
+    if (str(item.get('from') or '') != 'authenticated-structured-json'
+            or str(item.get('_target_shortcode') or '') != str(shortcode)
+            or str(item.get('type') or '').lower() != 'image'
+            or int(item.get('_carousel_slide_index') or 0) != slide_number):
+        return False, 'not a verified structured target image'
+    expected_key = _media_key_from_url(str(item.get('src') or ''))
+    if not expected_key:
+        return False, 'missing exact child identity'
+
+    urls = []
+    seen = set()
+    for value in candidate_urls or []:
+        value = str(value or '').strip()
+        if (not value or _media_key_from_url(value) != expected_key
+                or not _looks_like_real_ig_media_url(value)
+                or any(x in value.lower() for x in ('.mp4', '.m4v', '.mov'))):
+            continue
+        key = _normalized_exact_media_url(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(value)
+    # Bounded: prefer actual source and a transformed high-resolution candidate,
+    # not every already-failed CDN permutation. No token/query in diagnostics.
+    candidates = urls[:1] + [u for u in urls[1:] if 's1080' in u or 'p1080' in u][:2]
+    candidates = candidates[:3]
+    if not candidates:
+        return False, 'no same-child CDN candidates'
+
+    tab = None
+    failures = []
+    try:
+        tab = context.new_page()
+        for url in candidates:
+            try:
+                response = tab.goto(url, wait_until='commit', timeout=20000)
+                if response is None:
+                    failures.append('no navigation response')
+                    continue
+                if _media_key_from_url(str(response.url or '')) != expected_key:
+                    failures.append('response identity mismatch')
+                    continue
+                if int(response.status or 0) != 200:
+                    failures.append('HTTP ' + str(response.status))
+                    continue
+                ctype = str((response.headers or {}).get('content-type') or '').lower()
+                if not ctype.startswith('image/') or 'svg' in ctype:
+                    failures.append('non-raster response')
+                    continue
+                body = response.body()
+                if not body:
+                    failures.append('empty response body')
+                    continue
+                _write_media_body(destination, body, media_url=url, content_type=ctype)
+                type_ok, type_reason = _validate_downloaded_media_type(destination, item)
+                geometry_ok, geometry_reason = _validate_downloaded_media_geometry(destination, item)
+                if type_ok and geometry_ok:
+                    logger.info(
+                        f'IG v12.46 browser-native exact child accepted: '
+                        f'target={shortcode}, slide={slide_number}, bytes={len(body)}'
+                    )
+                    return True, 'browser-native exact source validated'
+                failures.append(type_reason or geometry_reason or 'image validation failed')
+            except Exception as exc:
+                failures.append(type(exc).__name__)
+            finally:
+                if os.path.exists(destination):
+                    # Keep the file only when it has already passed both gates.
+                    try:
+                        ok_type, _ = _validate_downloaded_media_type(destination, item)
+                        ok_geom, _ = _validate_downloaded_media_geometry(destination, item)
+                        if not (ok_type and ok_geom):
+                            os.remove(destination)
+                    except Exception:
+                        try:
+                            os.remove(destination)
+                        except OSError:
+                            pass
+    finally:
+        if tab is not None:
+            try:
+                tab.close()
+            except Exception:
+                pass
+    return False, 'browser-native source unavailable: ' + ', '.join(failures[:3])
+
+def _download_filtered_items_from_context(context, filtered, harvested_media, title: str, shortcode: str, referer: str, refresh_failed_image=None):
     """Write only media explicitly owned by the current shortcode.
 
     For structured still images, try candidates in true resolution order. If a
@@ -5496,6 +6135,16 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
     success_count = 0
 
     for i, item in enumerate(filtered, 1):
+        item = dict(item)
+        # v12.49: final carousel child only; siblings must already have passed
+        # all normal image/ownership gates. Mark only an authenticated original
+        # child, never a screenshot, page preview, or headless visual fallback.
+        item["_v1249_last_child_after_valid_siblings"] = bool(
+            i == len(filtered) and i >= 2 and success_count == i - 1
+            and item.get("from") == "authenticated-structured-json"
+            and item.get("_target_shortcode") == shortcode
+            and int(item.get("_carousel_slide_index") or 0) == i
+        )
         media_type = (item.get("type") or "image").lower()
         primary_url = item.get("src", "")
 
@@ -5608,6 +6257,32 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
 
                 candidate_errors.append(str(exc))
 
+                # v12.44: refresh exactly the failed image, once per task. Extend
+                # this existing attempt list without touching validated siblings.
+                if (media_type == "image" and
+                        candidate_index == len(candidate_urls) and
+                        refresh_failed_image is not None and
+                        item.get("from") == "authenticated-structured-json"):
+                    try:
+                        new_urls = refresh_failed_image(i, tuple(candidate_urls)) or []
+                        for fresh_url in new_urls:
+                            key = _normalized_exact_media_url(str(fresh_url or ""))
+                            if (fresh_url and key not in seen_candidates and
+                                    _media_key_from_url(fresh_url) == _media_key_from_url(primary_url)):
+                                seen_candidates.add(key)
+                                candidate_urls.append(fresh_url)
+                        if len(candidate_urls) > candidate_index:
+                            logger.info(
+                                f"IG v12.44 exact slide {i}/{len(filtered)} refreshed: "
+                                f"new_candidates={len(candidate_urls)-candidate_index}, "
+                                "prior valid slides preserved"
+                            )
+                    except Exception as refresh_exc:
+                        logger.warning(
+                            f"IG v12.44 exact slide {i} refresh unavailable: "
+                            f"{type(refresh_exc).__name__}: {str(refresh_exc)[:120]}"
+                        )
+
                 if media_type != "video" and candidate_index < len(candidate_urls):
                     logger.info(
                         f"IG 第 {i} 張圖片候選未通過品質 gate，改試下一個結構化高解析度 URL "
@@ -5626,7 +6301,30 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
                 break
 
         if not candidate_succeeded:
-            continue
+            # v12.46: distinct, bounded native Chromium transport for the same
+            # exact structured child. Earlier successfully validated slots remain.
+            if (media_type == 'image' and
+                    item.get('from') == 'authenticated-structured-json' and
+                    item.get('_target_shortcode') == shortcode):
+                native_dst = os.path.join(TEMP_DIR, f'ig_{i}.jpg')
+                # v12.47: prefer the exact Instagram post's own network response.
+                # Reopening a signed CDN URL as a top-level tab (v12.46) can
+                # 403 even when the same image loaded inside Instagram.
+                native_ok, native_reason = _ig_v1247_capture_target_page_image(
+                    context, item, native_dst, shortcode, i
+                )
+                if not native_ok:
+                    logger.info(f'IG v12.47 target-page recovery: {native_reason}')
+                    native_ok, native_reason = _ig_v1246_browser_native_exact_image(
+                        context, item, candidate_urls, native_dst, shortcode, i
+                    )
+                if native_ok:
+                    success_count += 1
+                    candidate_succeeded = True
+                else:
+                    logger.info(f'IG v12.46 exact child {i}/{len(filtered)} native transfer: {native_reason}')
+            if not candidate_succeeded:
+                continue
 
     if success_count <= 0:
         return "RETRY", (
@@ -5635,6 +6333,19 @@ def _download_filtered_items_from_context(context, filtered, harvested_media, ti
         )
 
     temp_files_after_capture = _list_media_files(TEMP_DIR)
+    # v12.43: A shared URL carrying ?img_index=N still downloads the full
+    # carousel, but the requested Nth slide must be present in the authoritative
+    # ordered list and match the written ig_N file before SUCCESS is allowed.
+    # Only applies to explicit img_index>1, preserving all normal post/reel paths.
+    requested_index = int(getattr(_DOWNLOAD_CONTEXT, "requested_img_index", 1) or 1)
+    if requested_index > 1:
+        slide_ok, slide_reason = _ig_v1243_audit_requested_carousel_slide(
+            filtered, TEMP_DIR, shortcode, requested_index
+        )
+        if not slide_ok:
+            logger.warning(f"IG v12.43 requested-slide integrity rejected: {slide_reason}")
+            return "RETRY", slide_reason
+        logger.info(f"IG v12.43 requested-slide integrity accepted: {slide_reason}")
     if success_count != len(filtered) or len(temp_files_after_capture) != len(filtered):
         return "RETRY", (
             f"IG 媒體完整性檢查失敗：expected={len(filtered)}, "
@@ -7459,7 +8170,9 @@ def _all_ig_image_candidates(node: dict) -> list[dict]:
     seen = set()
 
     def add(url, width=0, height=0, source_rank=0):
-        clean_url = html.unescape(unquote(str(url or "").strip()))
+        # Authenticated structured JSON has already parsed the string. Keep
+        # its original percent encoding (signed URL values are case-sensitive).
+        clean_url = html.unescape(str(url or "").strip())
         if not _looks_like_real_ig_media_url(clean_url):
             return
         if any(ext in clean_url.lower() for ext in [".mp4", ".m4v", ".mov"]):
@@ -7740,6 +8453,18 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
     try:
         variant_sources = [url] + deduped_alternates[:1]
         for base_url in variant_sources:
+            # A CDN URL with an IG signature or transformation token is a
+            # complete, server-issued URL. Rewriting its stp parameter gives
+            # a different unsigned request (usually HTTP 403), not a genuine
+            # high-resolution image. Use ONLY the explicit authenticated image
+            # candidates for that signed source. Keep legacy unsigned fallback.
+            try:
+                _params_v1248 = {key.lower() for key, _ in parse_qsl(
+                    urlparse(base_url).query, keep_blank_values=True)}
+            except Exception:
+                _params_v1248 = set()
+            if _params_v1248 & {'oh', 'oe', 'efg', 'ig_cache_key', 'stp', 'ccb'}:
+                continue
             for variant_url in _build_ig_original_image_url_variants(
                 base_url,
                 declared_width=int(width or primary.get("width") or 0),
@@ -7763,6 +8488,8 @@ def _ig_structured_node_to_media(node: dict, slide_index: int):
         "sourceHeight": int(primary.get("height") or height or 0),
         "_explicitMaxWidth": explicit_max_width,
         "_explicitMaxHeight": explicit_max_height,
+        "_v1249_original_width": int(node.get("original_width") or node.get("width") or 0),
+        "_v1249_original_height": int(node.get("original_height") or node.get("height") or 0),
         "_best_available_structured_image": best_available_structured,
         "_best_available_reason": (
             "exact-authenticated-structured-largest-candidate"
@@ -8125,6 +8852,8 @@ def _collect_ig_media_playwright_persistent_impl(
     # yt-dlp, which cannot see this profile's age/audience trust state.
     try:
         _DOWNLOAD_CONTEXT.persistent_profile_attempted = True
+        _DOWNLOAD_CONTEXT.carousel_partial_evidence = False
+        _DOWNLOAD_CONTEXT.carousel_required_count = 0
     except Exception:
         pass
 
@@ -8250,6 +8979,13 @@ def _collect_ig_media_playwright_persistent_impl(
             shortcode,
         )
 
+        if filtered and int(getattr(_DOWNLOAD_CONTEXT, "requested_img_index", 1) or 1) > len(filtered):
+            return "RETRY", (
+                f"IG requested img_index={_DOWNLOAD_CONTEXT.requested_img_index} "
+                f"is beyond the authenticated target {shortcode} "
+                f"structured carousel count={len(filtered)}; refuse wrong slide"
+            )
+
         if not filtered:
             logger.warning(
                 f"IG authenticated structured extraction returned 0: "
@@ -8279,6 +9015,19 @@ def _collect_ig_media_playwright_persistent_impl(
                 )
                 filtered = []
 
+            if not filtered and getattr(_DOWNLOAD_CONTEXT, "carousel_partial_evidence", False):
+                # v12.41: direct ?img_index=N may be ignored by IG and return
+                # slide one.  Try one fresh, sequentially verified walk instead
+                # of accepting that duplicate or cross-post recommendations.
+                try:
+                    filtered = _recover_ig_partial_carousel(
+                        context, shortcode, harvested_media,
+                        required_count=int(getattr(_DOWNLOAD_CONTEXT, "carousel_required_count", 0) or 0),
+                    )
+                except Exception as recovery_error:
+                    logger.warning(f"IG v12.41 sequential recovery failed: {recovery_error}")
+                    filtered = []
+
             if filtered:
                 logger.info(
                     f"IG exact visual carousel fallback accepted: "
@@ -8299,6 +9048,13 @@ def _collect_ig_media_playwright_persistent_impl(
                             "authenticated browser profile."
                         )
             else:
+                if getattr(_DOWNLOAD_CONTEXT, "carousel_partial_evidence", False):
+                    count = int(getattr(_DOWNLOAD_CONTEXT, "carousel_required_count", 0) or 0)
+                    return "RETRY", (
+                        f"IG target carousel {shortcode} was visible but the "
+                        f"verified slide collection is incomplete (expected={count or 'unknown'}). "
+                        "Keep RETRY; do not treat Instaloader GraphQL 401 as media permission denial."
+                    )
                 return "RETRY", (
                     f"IG authenticated browser opened the target post {shortcode}, "
                     "but no exact structured media and no exact visual media were "
@@ -8362,9 +9118,42 @@ def _collect_ig_media_playwright_persistent_impl(
 
         expected_count = len(filtered)
         logger.info(
-            f"IG persistent profile media count={expected_count}; "
+            f"IG v12.42 target-scoped media count={expected_count}; "
             f"network harvest={len(harvested_media)}, target={shortcode}"
         )
+
+        # v12.45: two bounded, distinct recovery sources per failing *structured*
+        # child: (1) authenticated JSON refresh, (2) verified browser-visible
+        # same media identity. Other children never restart or lose their bytes.
+        refresh_stage_v1245 = {}
+
+        def refresh_failed_child_v1245(slide_number, tried_urls):
+            if not (1 <= slide_number <= len(filtered)):
+                return []
+            stage = refresh_stage_v1245.get(slide_number, 0)
+            if stage >= 2:
+                return []
+            if stage == 0:
+                refresh_stage_v1245[slide_number] = 1
+                logger.info(
+                    f"IG v12.45 exact JSON child refresh: "
+                    f"target={shortcode}, slide={slide_number}/{len(filtered)}"
+                )
+                new_urls = _ig_v1244_fresh_exact_child_urls(
+                    page, structured_payloads, shortcode, filtered,
+                    slide_number, list(tried_urls),
+                )
+                if new_urls:
+                    return new_urls
+            refresh_stage_v1245[slide_number] = 2
+            logger.info(
+                f"IG v12.45 browser-visible exact child recovery: "
+                f"target={shortcode}, slide={slide_number}/{len(filtered)}"
+            )
+            return _ig_v1245_visible_exact_child_urls(
+                context, shortcode, filtered, slide_number,
+                tuple(tried_urls), harvested_media,
+            )
 
         return _download_filtered_items_from_context(
             context,
@@ -8373,6 +9162,7 @@ def _collect_ig_media_playwright_persistent_impl(
             title,
             shortcode,
             referer=url,
+            refresh_failed_image=refresh_failed_child_v1245,
         )
 
     except Exception as e:
@@ -8691,6 +9481,96 @@ def _attach_exact_visual_highres_variants(item: dict) -> dict:
     return item
 
 
+def _recover_ig_partial_carousel(context, shortcode: str, harvested_media: dict,
+                                  required_count: int = 0):
+    """One target-scoped fresh-page walk after ignored direct-index navigation.
+
+    Never infer an index solely from ?img_index=N. Each accepted slide requires
+    a verified carousel advance, unique CDN identity and the original shortcode.
+    A known expected count is an absolute minimum, never a success shortcut.
+    """
+    if required_count < 2 or required_count > _MAX_CAROUSEL_ITEMS:
+        logger.warning("IG v12.41 recovery skipped: no verified carousel total")
+        return []
+
+    recovery_page = context.new_page()
+    listener_active = True
+
+    def on_response(response):
+        if listener_active:
+            _capture_playwright_response(response, harvested_media)
+
+    recovery_page.on("response", on_response)
+    collected = []
+    seen = set()
+    try:
+        target_url = f"https://www.instagram.com/p/{shortcode}/"
+        try:
+            _goto_instagram_target_clean(
+                recovery_page, target_url,
+                target_shortcode=shortcode, timeout=45000,
+            )
+        except PlaywrightTimeoutError:
+            logger.info(f"IG v12.41 recovery navigation timeout: {shortcode}")
+        recovery_page.wait_for_timeout(1600)
+        if not _is_target_shortcode_context(recovery_page, shortcode):
+            return []
+        # Warmup scroll can push the target frame above the viewport. Restore
+        # the page scroll before locating the actual carousel arrow.
+        try:
+            recovery_page.evaluate("() => window.scrollTo(0, 0)")
+            recovery_page.wait_for_timeout(350)
+        except Exception:
+            pass
+        for slide_index in range(1, required_count + 1):
+            if slide_index > 1:
+                if not _click_next_ig_locked_keycheck(recovery_page, shortcode):
+                    logger.warning(
+                        f"IG v12.41 verified advance unavailable: "
+                        f"index={slide_index}/{required_count}, target={shortcode}"
+                    )
+                    return []
+            if not _is_target_shortcode_context(recovery_page, shortcode):
+                return []
+            current = _get_current_slide_main_media(recovery_page)
+            if not current:
+                return []
+            item = dict(current[0])
+            key = _media_key_from_url(item.get("src", ""))
+            if not key or key in seen:
+                logger.warning(
+                    f"IG v12.41 repeated carousel identity at "
+                    f"index={slide_index}/{required_count}, target={shortcode}"
+                )
+                return []
+            seen.add(key)
+            item["_carousel_slide_index"] = slide_index
+            item["_target_shortcode"] = shortcode
+            item["from"] = item.get("from") or "verified-sequential-recovery"
+            collected.append(_attach_exact_visual_highres_variants(item))
+
+        # Reject if any remaining arrow indicates more slides than the known
+        # expected count. Only a complete, target-owned sequence can progress.
+        if _is_strict_media_area_carousel_next(recovery_page):
+            logger.warning(f"IG v12.41 Next still present after {required_count} slides")
+            return []
+        logger.info(
+            f"IG v12.41 complete sequential recovery: "
+            f"{len(collected)}/{required_count}, target={shortcode}"
+        )
+        return _dedupe_media(collected, preserve_order=True)
+    finally:
+        listener_active = False
+        try:
+            recovery_page.remove_listener("response", on_response)
+        except Exception:
+            pass
+        try:
+            recovery_page.close()
+        except Exception:
+            pass
+
+
 def _collect_complete_post_carousel(
     context,
     page,
@@ -8769,6 +9649,10 @@ def _collect_complete_post_carousel(
         current = _get_current_slide_main_media(page)
         if not current:
             logger.warning(
+                f"IG v12.42 target slide has no verified main-post media; "
+                f"reject related-post candidates: index={slide_index}, target={shortcode}"
+            )
+            logger.warning(
                 f"IG carousel advanced but media unresolved: "
                 f"index={slide_index}, target={shortcode}"
             )
@@ -8793,6 +9677,8 @@ def _collect_complete_post_carousel(
 
         seen.add(key)
         collected.append(item)
+        if len(collected) >= 2:
+            _DOWNLOAD_CONTEXT.carousel_partial_evidence = True
 
         if detected > 1 and len(collected) >= detected:
             # Still perform no extra click. The detected count is accepted only
@@ -8890,6 +9776,11 @@ def _collect_complete_post_carousel(
         if detected <= 1 and first_probe_moved and len(collected) >= 2:
             refreshed_detected = _get_carousel_total_count(page)
             if refreshed_detected and len(collected) < refreshed_detected:
+                _DOWNLOAD_CONTEXT.carousel_required_count = max(
+                    int(getattr(_DOWNLOAD_CONTEXT, "carousel_required_count", 0) or 0),
+                    refreshed_detected,
+                )
+                _DOWNLOAD_CONTEXT.carousel_partial_evidence = bool(collected)
                 logger.warning(
                     f"IG v12.20 dot count proves incomplete carousel: "
                     f"collected={len(collected)}, detected={refreshed_detected}, "
@@ -9395,7 +10286,7 @@ def get_login_status() -> tuple[bool, str]:
 
 def download(url: str):
     logger.info(
-        "IG v12.40 pipeline active: authenticated transport recovery + listener cleanup + "
+        "IG v12.49 pipeline active: source-native verified carousel final image + "
         "v12.39 transport recovery + no-orphan synchronous task"
     )
     if _L is None:
@@ -9436,6 +10327,8 @@ def download(url: str):
     result_box = [(None, None)]
 
     def _run():
+        _DOWNLOAD_CONTEXT.carousel_partial_evidence = False
+        _DOWNLOAD_CONTEXT.carousel_required_count = 0
         # v12.33: threading.local() does not inherit values from the parent
         # thread.  Re-apply the profile owner here so move_files() writes
         # profile-expanded child downloads under downloads/<profile_id>/.

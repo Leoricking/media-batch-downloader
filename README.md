@@ -1,6 +1,6 @@
 # 🚀 Media Batch Downloader
 
-> Current documentation: GUI v12.24 + queue_manager v12.12 + Instagram v12.40 + Facebook v15.4
+> Current documented combination: GUI v12.24 + queue_manager v12.12 + Instagram v12.49 + Facebook v15.10（以實際安裝檔案為準；真實網站端到端驗收尚未全部完成）
 
 Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與批次下載的 Windows 桌面工具。
 
@@ -18,8 +18,8 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 |---|---:|---|
 | `downloader_GUI/main.py` | v12.24 | GUI、NO_ACCESS、篩選、右鍵複製、快捷開檔 |
 | `downloader_GUI/queue_manager.py` | v12.12 | NO_ACCESS 狀態、任務紀錄、checkpoint、失敗分類 |
-| `downloader_GUI/downloader/instagram.py` | v12.40 | authenticated transport recovery、listener cleanup、v12.39 transport recovery |
-| `downloader_GUI/downloader/facebook.py` | v15.4 | NO_ACCESS detection、exact-post recovery、exact-fbid、strict completeness |
+| `downloader_GUI/downloader/instagram.py` | v12.49 | 原貼文圖片身分、最佳可取得尺寸例外（嚴格限定）、完整 Carousel 驗證、登入來源恢復 |
+| `downloader_GUI/downloader/facebook.py` | v15.10 | canonical Reel yt-dlp 第一順位、v15.9 Network 診斷、NO_ACCESS、exact-post/FBID 與影片完整性檢查 |
 | `downloader_GUI/worker.py` | 現行穩定版 | 任務重試、冷卻、IG profile batch |
 
 ---
@@ -39,12 +39,16 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - Visual fallback 可偵測 pagination dot count。
 - 缺少 slide 時可使用精準 `?img_index=N` 補抓。
 - 不允許從推薦貼文或其他 shortcode 補數量。
-- 圖片會拒絕 320 / 480 / 640 等低解析度或裁切縮圖。
+- 預設拒絕 320 / 480 / 640 等低解析度或裁切縮圖；v12.49 僅對**原貼文、來源可驗證、前面張數均合格的多圖最後一張**，在結構化來源確實宣告其最佳可取得尺寸為 320×240 時，才允許保留原始位元組；不進行放大、插值或以縮圖冒充高解析度原圖。
 - Reel / Video 必須通過真實 MP4 與完整性驗證。
 - fragmented MP4 可使用 Range rebuild / fragment assembly recovery。
 - Browser network cache 可直接寫入媒體。
 - v12.40：exact media 已確認但 headless CDN 只剩 640px 或高解析 URL HTTP 403 時，改用已登入 IG Parser Profile recovery。
 - v12.40：關閉 Playwright context 前會清理 response listener，降低 `CancelledError` / `TargetClosedError`。
+- v12.43：明確 `img_index=N` 對應的來源身分、輸出檔案和重複內容檢查。
+- v12.44–v12.47：已登入結構化 Refresh、失敗單張 Recovery、可視圖片與目標貼文 Response 恢復；未能提供有效高解析度時不得假成功。
+- v12.48：保留 Instagram 簽章 CDN URL 的原始編碼，不自行生成假設性的高解析度 URL。
+- v12.49：當權威結構化資料證明最後一張原生圖只有 320×240 時，採用極窄的最佳可取得尺寸例外；非一般性縮圖放行。
 
 ## Facebook
 
@@ -60,6 +64,8 @@ Media Batch Downloader 是一套用於 Instagram / Facebook 連結預處理與�
 - v15.3+ 支援 exact-post structured zero-evidence recovery。
 - v15.4 新增 `NO_ACCESS`：內容存在，但目前 FB Parser 登入帳號沒有觀看權限。
 - Reel 保留 video integrity gate，不會把封面圖當影片成功。
+- v15.6–v15.9：目標 Reel 可視播放器、播放狀態、Request / Response 分類與分段流媒體診斷。
+- v15.10：在有已確認 numeric Reel ID 時，yt-dlp fallback 優先使用 `https://www.facebook.com/reel/<ID>`；仍要求身分及獨立完整影片驗證。
 
 ---
 
@@ -497,7 +503,7 @@ data/tasks_snapshot.tsv
 ## Instagram
 
 ```text
-IG v12.40 pipeline active
+IG v12.49 verified source-native best-available
 IG structured caption resolved
 IG structured account resolved
 IG authenticated structured extraction complete
@@ -514,7 +520,7 @@ IG 第 N 個影片完整 MP4 重建完成
 ## Facebook
 
 ```text
-FB v15.4 integrated pipeline active
+FB v15.9 integrated pipeline active
 authenticated share resolved
 effective target identity
 canonical post exact scope
@@ -555,11 +561,17 @@ FB Parser 已登入，目標 canonical post 也已辨識，但目前帳號沒有
 
 ## Instagram 401 一定是失敗嗎？
 
-不一定。v12.40 還會嘗試 Playwright → authenticated IG Parser Profile → browser response recovery。
+不一定。Instagram 下載流程仍可在 Instaloader GraphQL 401 時，改走 Playwright → authenticated IG Parser Profile → 驗證來源的 browser response recovery；若全部來源無效仍會回傳 `RETRY`。
 
-## 為什麼 640x640 不直接下載？
+## 為什麼 640×640 不直接下載？
 
-因為 Instagram 常把 640x640 當預覽或裁切版本，程式會繼續找 structured high-res candidate / authenticated response / browser cache。
+因為 Instagram 常把 640×640 當預覽或裁切版本，程式會繼續找 structured high-res candidate / authenticated response / browser cache。
+
+## 為什麼 `DNZeJIGMNv2` 的最後一張 320×240 可能可被接受？
+
+此案例的第三方 SaveClip 畫面顯示前 4 張約 1440px、最後一張 320×240；v12.48 log 也顯示第 5 張實際取得的是 320×240。**第三方結果不是 Instagram 的官方原始尺寸證明。** v12.49 仍要求已登入結構化媒體欄位與同張的來源身分符合條件，才能採用「最佳可取得原始圖」例外。若結構化欄位宣告有更大版本、媒體身分不符、前面任一張未完成，或最後一張缺失，仍不得標記 `SUCCESS`。
+
+> 已確認：v12.48 在真實環境為 4/5 且 `RETRY`。未確認：v12.49 在使用者帳號上是否能完成 5/5；不得把離線模擬視為實機驗收。
 
 ## 為什麼 Facebook 4/5 不算成功？
 
@@ -579,7 +591,30 @@ python .\main.py
 
 # 版本紀錄
 
-## 2026-11 Current Integrated Release
+## 2026-11 Documented Update（下載器 v12.49 / v15.10）
+
+### Instagram v12.49
+
+- 針對已登入結構化來源可驗證的最後一張 `320×240` 圖片新增嚴格的 best-available 判定。
+- 保留其他圖片的品質 Gate、目標 shortcode 歸屬、圖序、SHA-256 重複檢查與全數輸出驗證。
+- 相關真實案例：`DNZeJIGMNv2`（5 張），截至 v12.48 實測仍只有 4/5；v12.49 尚未經真實網站下載確認。
+
+### Instagram v12.48 / v12.47 / v12.46 / v12.45 / v12.44 / v12.43
+
+- v12.48：保留 CDN 簽章 URL 位元組，不自行變造尺寸 URL。
+- v12.47：原貼文頁面 Response 擷取與 Snapshot `Sessions_Encrypted` 排除。
+- v12.46：已登入 Chromium 原生圖片傳輸恢復。
+- v12.45：目標帖文可視圖片來源比對。
+- v12.44：失敗子圖片之精準 Refresh；保留已完成圖片。
+- v12.43：指定 `img_index` 的來源/輸出完整性檢查。
+
+### Facebook v15.10
+
+- 還原已曾成功的 canonical Reel URL 作為 yt-dlp 的第一順位，保留新版完整性與身分驗證。
+- 延續 v15.9 Network Response 分類、v15.4 NO_ACCESS 及多圖保護。
+- 對指定 Reel 的新版實機下載尚未完成驗收。
+
+## 2026-11 Earlier Integrated Release
 
 ### GUI v12.24
 
@@ -656,11 +691,11 @@ python .\main.py
 
 ```powershell
 git status
-git add -u
-git add README.md
-git status
-git commit -m "feat: add NO_ACCESS handling and improve downloader recovery"
+git add -- README.md
+git diff --cached --check
+git commit -m "docs: update README for IG v12.49 and FB v15.10"
+git pull --rebase origin main
 git push origin main
 ```
 
-若 repo 根目錄還有不需要的未追蹤 JPG，`git add -u` 不會把它們自動加入 commit。
+上述指令只 Stage `README.md`，不包含未追蹤 JPG；如果 `git pull --rebase` 發生衝突，先解決衝突再 Push，請勿強制推送。也不要在包含 Parser Chrome Profile 的專案目錄執行 `git clean -xfd`。
